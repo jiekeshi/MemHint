@@ -1,7 +1,4 @@
-"""Static analyzer adapters for CodeQL and Facebook Infer.
-
-TODO: Facebook Infer's adapter is not fully implemented yet.
-"""
+"""Static analyzer adapters for CodeQL and Facebook Infer."""
 
 import json
 import logging
@@ -105,30 +102,30 @@ class CodeQLAnalyzer:
 
     def _get_build_command(self, project_path: Path) -> str:
         """Determine appropriate build command for project."""
-        # # Check for Makefile
-        # if (project_path / "Makefile").exists():
-        #     return "make"
+        # Check for Makefile
+        if (project_path / "Makefile").exists():
+            return "make"
 
-        # # Check for CMakeLists.txt
-        # if (project_path / "CMakeLists.txt").exists():
-        #     build_dir = project_path / "build"
-        #     if build_dir.exists():
-        #         shutil.rmtree(build_dir)
-        #     build_dir.mkdir()
+        # Check for CMakeLists.txt
+        if (project_path / "CMakeLists.txt").exists():
+            build_dir = project_path / "build"
+            if build_dir.exists():
+                shutil.rmtree(build_dir)
+            build_dir.mkdir()
 
-        #     # Configure
-        #     result = subprocess.run(
-        #         ["cmake", ".."], cwd=str(build_dir), capture_output=True, timeout=120
-        #     )
-        #     if result.returncode == 0:
-        #         return "make -C build"
+            # Configure
+            result = subprocess.run(
+                ["cmake", ".."], cwd=str(build_dir), capture_output=True, timeout=120
+            )
+            if result.returncode == 0:
+                return "make -C build"
 
-        #     # Try in-source
-        #     result = subprocess.run(
-        #         ["cmake", "."], cwd=str(project_path), capture_output=True, timeout=120
-        #     )
-        #     if result.returncode == 0:
-        #         return "make"
+            # Try in-source
+            result = subprocess.run(
+                ["cmake", "."], cwd=str(project_path), capture_output=True, timeout=120
+            )
+            if result.returncode == 0:
+                return "make"
 
         # Direct compilation
         c_files = list(project_path.rglob("*.c"))
@@ -234,30 +231,44 @@ dependencies:
     def generate_custom_query(self, annotations: AnnotationSet, output_path: Path) -> None:
         """Generate comprehensive CodeQL query for memory safety.
 
-        Uses two sources of information:
-        1. Function annotations (allocators/deallocators)
-        2. Bug annotations (LLM-detected potential bugs) - used as hints
+        Detects:
+        1. Memory Leak - allocated memory not freed
+        2. Use-After-Free - memory accessed after being freed
+        3. Double-Free - memory freed twice
+        4. Null Dereference - pointer used without null check
+
+        Uses annotations to recognize custom allocators/deallocators/nullable functions.
         """
-        # Collect allocators and deallocators
+        # Collect function annotations
         alloc_funcs = []
         free_funcs = []
+        nullable_funcs = []  # Functions that may return NULL
 
-        # Collect LLM-detected bugs as hints for CodeQL
+        # Collect LLM bug hints (for logging/comments only)
         bug_hints = {
-            "leak_vars": [],      # Variables that might leak
-            "uaf_vars": [],       # Variables with potential UAF
-            "double_free_vars": [], # Variables with potential double-free
-            "suspect_functions": set(),  # Functions with potential bugs
+            "leak_vars": [],
+            "uaf_vars": [],
+            "double_free_vars": [],
+            "null_deref_vars": [],
+            "suspect_functions": set(),
         }
 
         for func_name, anns in annotations.annotations.items():
             for ann in anns:
+                # Function property annotations
                 if ann.annotation_type in (AnnotationType.ALLOC_SOURCE, AnnotationType.ARRAY_ALLOC):
                     if func_name not in ("main", "_main"):
                         alloc_funcs.append(func_name)
+                        # Allocators can return NULL, so they're also nullable
+                        if func_name not in nullable_funcs:
+                            nullable_funcs.append(func_name)
                 elif ann.annotation_type == AnnotationType.FREE_SINK:
                     free_funcs.append(func_name)
-                # Collect bug hints
+                elif ann.annotation_type in (AnnotationType.NULLABLE_RETURN, AnnotationType.MUST_CHECK_NULL):
+                    if func_name not in nullable_funcs:
+                        nullable_funcs.append(func_name)
+
+                # Bug hint annotations (for comments only)
                 elif ann.annotation_type == AnnotationType.POTENTIAL_LEAK:
                     bug_hints["leak_vars"].append((func_name, ann.target))
                     bug_hints["suspect_functions"].add(func_name)
@@ -267,27 +278,18 @@ dependencies:
                 elif ann.annotation_type == AnnotationType.DOUBLE_FREE:
                     bug_hints["double_free_vars"].append((func_name, ann.target))
                     bug_hints["suspect_functions"].add(func_name)
+                elif ann.annotation_type == AnnotationType.NULL_DEREF:
+                    bug_hints["null_deref_vars"].append((func_name, ann.target))
+                    bug_hints["suspect_functions"].add(func_name)
 
+        # Generate CodeQL lists
         alloc_list = ", ".join(f'"{f}"' for f in alloc_funcs) if alloc_funcs else '"__hint_none__"'
         free_list = ", ".join(f'"{f}"' for f in free_funcs) if free_funcs else '"__hint_none__"'
-
-        # Generate suspect function list for targeted analysis
-        suspect_list = ", ".join(f'"{f}"' for f in bug_hints["suspect_functions"]) if bug_hints["suspect_functions"] else '"__hint_none__"'
-
-        # Generate variable hints
-        leak_hints = " or ".join(
-            f'(f.getName() = "{func}" and v.getName() = "{var}")'
-            for func, var in bug_hints["leak_vars"]
-        ) if bug_hints["leak_vars"] else "none()"
-
-        uaf_hints = " or ".join(
-            f'(f.getName() = "{func}" and v.getName() = "{var}")'
-            for func, var in bug_hints["uaf_vars"]
-        ) if bug_hints["uaf_vars"] else "none()"
+        nullable_list = ", ".join(f'"{f}"' for f in nullable_funcs) if nullable_funcs else '"__hint_none__"'
 
         query = f'''/**
  * @name HINT Comprehensive Memory Safety Check
- * @description Detects memory leaks, use-after-free, and double-free
+ * @description Detects memory leaks, use-after-free, double-free, and null dereference
  * @kind problem
  * @problem.severity error
  * @precision medium
@@ -297,43 +299,64 @@ dependencies:
 import cpp
 
 //=============================================================================
-// Allocation and Deallocation Functions
+// HINT-Generated Function Classes
 //=============================================================================
 
+// Custom allocator functions (from HINT annotations)
 class CustomAlloc extends Function {{
   CustomAlloc() {{ this.getName() in [{alloc_list}] }}
 }}
 
+// Custom deallocator functions (from HINT annotations)
 class CustomFree extends Function {{
   CustomFree() {{ this.getName() in [{free_list}] }}
 }}
 
+// Custom nullable functions (from HINT annotations)
+class CustomNullable extends Function {{
+  CustomNullable() {{ this.getName() in [{nullable_list}] }}
+}}
+
+// Any allocator (standard + custom)
 class AnyAlloc extends Function {{
   AnyAlloc() {{
-    this.getName() in ["malloc", "calloc", "realloc", "strdup", "strndup", "aligned_alloc"]
+    this.getName() in ["malloc", "calloc", "realloc", "strdup", "strndup", "aligned_alloc", "memalign", "pvalloc", "valloc"]
     or this instanceof CustomAlloc
   }}
 }}
 
+// Any deallocator (standard + custom)
 class AnyFree extends Function {{
   AnyFree() {{
-    this.getName() in ["free", "cfree", "g_free"]
+    this.getName() in ["free", "cfree", "g_free", "delete"]
     or this instanceof CustomFree
   }}
 }}
 
+// Any function that may return NULL
+class AnyNullable extends Function {{
+  AnyNullable() {{
+    // Standard library functions that may return NULL
+    this.getName() in ["malloc", "calloc", "realloc", "fopen", "fgets", "gets",
+                       "strdup", "strndup", "getenv", "bsearch", "strchr", "strrchr",
+                       "strstr", "strpbrk", "memchr", "tmpfile", "freopen",
+                       "aligned_alloc", "memalign", "pvalloc", "valloc"]
+    or this instanceof CustomNullable
+  }}
+}}
+
 //=============================================================================
-// Helper predicates
+// Helper Predicates
 //=============================================================================
 
-// Get the variable that receives an allocation (handles both init and assignment)
-Variable getAllocatedVar(FunctionCall allocCall) {{
-  // Case 1: int *p = malloc(...)
-  result.getInitializer().getExpr() = allocCall
+// Get the variable that receives a function call result
+Variable getResultVar(FunctionCall call) {{
+  // Case 1: int *p = func(...)
+  result.getInitializer().getExpr() = call
   or
-  // Case 2: p = malloc(...)
+  // Case 2: p = func(...)
   exists(AssignExpr assign |
-    assign.getRValue() = allocCall and
+    assign.getRValue() = call and
     result = assign.getLValue().(VariableAccess).getTarget()
   )
 }}
@@ -347,7 +370,7 @@ predicate isFreedInFunc(Variable v, Function f) {{
   )
 }}
 
-// Check if variable is returned
+// Check if variable is returned from function
 predicate isReturnedFromFunc(Variable v, Function f) {{
   exists(ReturnStmt ret |
     ret.getEnclosingFunction() = f and
@@ -355,8 +378,9 @@ predicate isReturnedFromFunc(Variable v, Function f) {{
   )
 }}
 
-// Check if variable escapes
+// Check if variable escapes (stored globally or passed to unknown function)
 predicate varEscapes(Variable v) {{
+  // Assigned to global or field
   exists(AssignExpr a |
     a.getRValue().(VariableAccess).getTarget() = v and
     (
@@ -369,26 +393,34 @@ predicate varEscapes(Variable v) {{
   exists(FunctionCall fc |
     fc.getAnArgument().(VariableAccess).getTarget() = v and
     not fc.getTarget() instanceof AnyFree and
-    not fc.getTarget().getName() in ["printf", "fprintf", "sprintf", "snprintf", "puts", "fputs"]
+    not fc.getTarget().getName() in ["printf", "fprintf", "sprintf", "snprintf",
+                                      "puts", "fputs", "fwrite", "memcpy", "memmove",
+                                      "memset", "memcmp", "strlen", "strcmp", "strncmp"]
   )
 }}
 
 //=============================================================================
-// Use-After-Free Detection
+// Pointer Dereference Detection
 //=============================================================================
 
-// A dereference of a pointer variable
 class PointerDeref extends Expr {{
   Variable ptrVar;
 
   PointerDeref() {{
+    // *p
     (
       this instanceof PointerDereferenceExpr and
       ptrVar = this.(PointerDereferenceExpr).getOperand().(VariableAccess).getTarget()
-    ) or (
+    )
+    or
+    // p[i]
+    (
       this instanceof ArrayExpr and
       ptrVar = this.(ArrayExpr).getArrayBase().(VariableAccess).getTarget()
-    ) or (
+    )
+    or
+    // p->field
+    (
       this instanceof PointerFieldAccess and
       ptrVar = this.(PointerFieldAccess).getQualifier().(VariableAccess).getTarget()
     )
@@ -397,7 +429,10 @@ class PointerDeref extends Expr {{
   Variable getPtrVar() {{ result = ptrVar }}
 }}
 
-// Free call
+//=============================================================================
+// Free Call Detection
+//=============================================================================
+
 class FreeCall extends FunctionCall {{
   Variable freedVar;
 
@@ -409,24 +444,64 @@ class FreeCall extends FunctionCall {{
   Variable getFreedVar() {{ result = freedVar }}
 }}
 
-// Simple heuristic: deref after free by line number
-predicate useAfterFreeSimple(FreeCall freeCall, PointerDeref deref, Variable v) {{
+//=============================================================================
+// Bug Detection Predicates
+//=============================================================================
+
+// Use-After-Free: dereference after free (same function, by line number)
+predicate useAfterFree(FreeCall freeCall, PointerDeref deref, Variable v) {{
   freeCall.getFreedVar() = v and
   deref.getPtrVar() = v and
   freeCall.getEnclosingFunction() = deref.getEnclosingFunction() and
   freeCall.getLocation().getStartLine() < deref.getLocation().getStartLine()
 }}
 
-//=============================================================================
-// Double-Free Detection
-//=============================================================================
-
-predicate doubleFreeSimple(FreeCall f1, FreeCall f2, Variable v) {{
+// Double-Free: two frees of same variable (same function, by line number)
+predicate doubleFree(FreeCall f1, FreeCall f2, Variable v) {{
   f1.getFreedVar() = v and
   f2.getFreedVar() = v and
   f1 != f2 and
   f1.getEnclosingFunction() = f2.getEnclosingFunction() and
   f1.getLocation().getStartLine() < f2.getLocation().getStartLine()
+}}
+
+// Null Dereference: dereference without null check
+predicate isNullChecked(Variable v, PointerDeref deref) {{
+  // Check if there's an if-statement checking this variable before the deref
+  exists(IfStmt ifStmt, VariableAccess checkAccess |
+    // The condition checks our variable
+    checkAccess = ifStmt.getCondition().getAChild*() and
+    checkAccess.getTarget() = v and
+    // The deref is inside the then-branch (protected path)
+    ifStmt.getThen().getAChild*() = deref
+  )
+  or
+  // Early return pattern: if (!p) return;
+  exists(IfStmt ifStmt, ReturnStmt ret |
+    ifStmt.getCondition().getAChild*().(VariableAccess).getTarget() = v and
+    ifStmt.getThen().getAChild*() = ret and
+    ifStmt.getLocation().getStartLine() < deref.getLocation().getStartLine() and
+    ifStmt.getEnclosingFunction() = deref.getEnclosingFunction()
+  )
+  or
+  // Ternary check: p ? *p : default
+  exists(ConditionalExpr cond |
+    cond.getCondition().getAChild*().(VariableAccess).getTarget() = v and
+    cond.getThen().getAChild*() = deref
+  )
+}}
+
+predicate nullDeref(FunctionCall nullableCall, PointerDeref deref, Variable v) {{
+  // Call to function that may return NULL
+  nullableCall.getTarget() instanceof AnyNullable and
+  v = getResultVar(nullableCall) and
+  // Dereferenced in same function
+  deref.getPtrVar() = v and
+  nullableCall.getEnclosingFunction() = deref.getEnclosingFunction() and
+  // Deref comes after the call
+  nullableCall.getLocation().getStartLine() < deref.getLocation().getStartLine() and
+  // Not protected by null check
+  not isNullChecked(v, deref)
 }}
 
 //=============================================================================
@@ -435,11 +510,11 @@ predicate doubleFreeSimple(FreeCall f1, FreeCall f2, Variable v) {{
 
 from Expr loc, string issue, string detail, Function f
 where
-  // Memory Leak
+  // Memory Leak: allocated but not freed
   (
     exists(FunctionCall allocCall, Variable v |
       allocCall.getTarget() instanceof AnyAlloc and
-      v = getAllocatedVar(allocCall) and
+      v = getResultVar(allocCall) and
       f = allocCall.getEnclosingFunction() and
       not isFreedInFunc(v, f) and
       not isReturnedFromFunc(v, f) and
@@ -450,49 +525,62 @@ where
     )
   )
   or
-  // Use-After-Free
+  // Use-After-Free: dereferenced after being freed
   (
     exists(FreeCall freeCall, PointerDeref deref, Variable v |
-      useAfterFreeSimple(freeCall, deref, v) and
+      useAfterFree(freeCall, deref, v) and
       f = freeCall.getEnclosingFunction() and
       loc = deref and
       issue = "Use-After-Free" and
-      detail = "'" + v.getName() + "' dereferenced after free at line " + freeCall.getLocation().getStartLine().toString()
+      detail = "'" + v.getName() + "' used after free at line " + freeCall.getLocation().getStartLine().toString()
     )
   )
   or
-  // Double-Free
+  // Double-Free: freed twice
   (
     exists(FreeCall f1, FreeCall f2, Variable v |
-      doubleFreeSimple(f1, f2, v) and
+      doubleFree(f1, f2, v) and
       f = f1.getEnclosingFunction() and
       loc = f2 and
       issue = "Double-Free" and
-      detail = "'" + v.getName() + "' freed again (first at line " + f1.getLocation().getStartLine().toString() + ")"
+      detail = "'" + v.getName() + "' freed again (first free at line " + f1.getLocation().getStartLine().toString() + ")"
+    )
+  )
+  or
+  // Null Dereference: used without null check after nullable call
+  (
+    exists(FunctionCall nullableCall, PointerDeref deref, Variable v |
+      nullDeref(nullableCall, deref, v) and
+      f = nullableCall.getEnclosingFunction() and
+      loc = deref and
+      issue = "Null Dereference" and
+      detail = "'" + v.getName() + "' may be NULL (from " + nullableCall.getTarget().getName() + " at line " + nullableCall.getLocation().getStartLine().toString() + ")"
     )
   )
 select loc, issue + ": " + detail
 '''
 
-        # Add LLM hints section if available
+        # Add LLM hints as comments (for reference only)
         if bug_hints["suspect_functions"]:
             hint_comment = f'''
 // =============================================================================
-// LLM-detected suspect locations (prioritize these in analysis):
-// Functions: {list(bug_hints["suspect_functions"])}
+// LLM Bug Hints (for reference - not used in detection logic):
+// Suspect functions: {list(bug_hints["suspect_functions"])}
 // Potential leaks: {bug_hints["leak_vars"]}
 // Potential UAF: {bug_hints["uaf_vars"]}
 // Potential double-free: {bug_hints["double_free_vars"]}
+// Potential null-deref: {bug_hints["null_deref_vars"]}
 // =============================================================================
 '''
             query = query.replace("import cpp", f"import cpp\n{hint_comment}")
 
         output_path.write_text(query)
-        logger.info(f"Generated query: {output_path}")
+        logger.info(f"Generated CodeQL query: {output_path}")
         logger.info(f"  Custom allocators: {alloc_funcs}")
         logger.info(f"  Custom deallocators: {free_funcs}")
+        logger.info(f"  Nullable functions: {nullable_funcs}")
         if bug_hints["suspect_functions"]:
-            logger.info(f"  LLM suspect functions: {bug_hints['suspect_functions']}")
+            logger.info(f"  LLM suspect functions: {list(bug_hints['suspect_functions'])}")
 
 
 class InferAnalyzer:
