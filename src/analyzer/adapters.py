@@ -102,30 +102,30 @@ class CodeQLAnalyzer:
 
     def _get_build_command(self, project_path: Path) -> str:
         """Determine appropriate build command for project."""
-        # Check for Makefile
-        if (project_path / "Makefile").exists():
-            return "make"
+        # # Check for Makefile
+        # if (project_path / "Makefile").exists():
+        #     return "make"
 
-        # Check for CMakeLists.txt
-        if (project_path / "CMakeLists.txt").exists():
-            build_dir = project_path / "build"
-            if build_dir.exists():
-                shutil.rmtree(build_dir)
-            build_dir.mkdir()
+        # # Check for CMakeLists.txt
+        # if (project_path / "CMakeLists.txt").exists():
+        #     build_dir = project_path / "build"
+        #     if build_dir.exists():
+        #         shutil.rmtree(build_dir)
+        #     build_dir.mkdir()
 
-            # Configure
-            result = subprocess.run(
-                ["cmake", ".."], cwd=str(build_dir), capture_output=True, timeout=120
-            )
-            if result.returncode == 0:
-                return "make -C build"
+        #     # Configure
+        #     result = subprocess.run(
+        #         ["cmake", ".."], cwd=str(build_dir), capture_output=True, timeout=120
+        #     )
+        #     if result.returncode == 0:
+        #         return "make -C build"
 
-            # Try in-source
-            result = subprocess.run(
-                ["cmake", "."], cwd=str(project_path), capture_output=True, timeout=120
-            )
-            if result.returncode == 0:
-                return "make"
+        #     # Try in-source
+        #     result = subprocess.run(
+        #         ["cmake", "."], cwd=str(project_path), capture_output=True, timeout=120
+        #     )
+        #     if result.returncode == 0:
+        #         return "make"
 
         # Direct compilation
         c_files = list(project_path.rglob("*.c"))
