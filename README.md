@@ -15,34 +15,6 @@ Hint uses LLMs to automatically generate memory management annotations for C/C++
 | **Buffer Overflow** | Writing beyond buffer bounds | ? not sure, did I write the query?|
 | **Uninitialized Read** | Reading uninitialized memory | ? not sure, did I write the query?|
 
-## Annotation Types
-
-Hint generates the following annotation types:
-
-### Allocation Annotations
-- `ALLOC_SOURCE` - Function returns newly allocated heap memory
-- `ARRAY_ALLOC` - Function allocates array (like calloc)
-- `REALLOC` - Function reallocates memory
-
-### Deallocation Annotations
-- `FREE_SINK` - Function frees memory at specified argument
-
-### Ownership Annotations
-- `OWNERSHIP_TRANSFER` - Ownership transferred to callee
-- `OWNERSHIP_RETURN` - Ownership transferred to caller
-- `OWNERSHIP_ARG_OUT` - Ownership via output parameter
-
-### Null Safety Annotations
-- `MUST_CHECK_NULL` - Return value must be null-checked
-- `NULLABLE_RETURN` - May return NULL
-- `NONNULL_ARG` - Argument must not be NULL
-
-### Negative Annotations (prevent false positives)
-- `STATIC_BUFFER` - Returns static/global buffer
-- `BORROWED_REF` - Returns borrowed reference
-- `NOT_ALLOC` - Explicitly not an allocator
-
-
 ## Installation
 
 I only tried this on MacOS:
