@@ -5,7 +5,15 @@ import logging
 import os
 import time
 
-from openai import OpenAI
+try:
+    import vertexai
+    from vertexai.generative_models import GenerativeModel
+
+    VERTEX_AI_AVAILABLE = True
+except ImportError:  # pragma: no cover - environment may not have Vertex SDK
+    vertexai = None
+    GenerativeModel = None
+    VERTEX_AI_AVAILABLE = False
 
 from src.core.models import (
     FunctionInfo, Annotation, AnnotationType, AnnotationSet, CounterExample
@@ -137,29 +145,100 @@ Return JSON:
 
 
 class LLMClient:
-    """OpenAI API client."""
+    """Gemini LLM client using service account / ADC (no API key)."""
 
-    def __init__(self, api_key: str = None, model: str = "gpt-4o", base_url: str = None):
-        self.client = OpenAI(
-            api_key=api_key or os.getenv("OPENAI_API_KEY"),
-            base_url=base_url,
-        )
-        self.model = model
+    def __init__(
+        self,
+        api_key: str = None,  # kept for compatibility; ignored
+        model: str = "gemini-2.5-pro",
+        base_url: str = None,  # kept for compatibility; unused
+        project_id: str | None = None,
+        location: str = "us-central1",
+        max_retries: int = 3,
+    ):
+        """Initialize Gemini client via Vertex AI using ADC / service account.
+
+        Authentication flows:
+        - Recommended: set GOOGLE_APPLICATION_CREDENTIALS to the service account JSON.
+        - Or run under a GCP environment with default service account.
+
+        Args:
+            api_key: Ignored (present for backwards compatibility).
+            model: Gemini model name, e.g. "gemini-2.5-pro".
+            base_url: Unused for Vertex AI; kept for compatibility.
+            project_id: Optional explicit GCP project (fallback when key file missing project_id).
+            location: Vertex AI region (default us-central1).
+            max_retries: How many retries when calling Gemini.
+        """
+        self.model_name = model or "gemini-2.5-pro"
+        self.location = location
+        self.max_retries = max_retries
+        self.explicit_project = project_id or os.getenv("GOOGLE_CLOUD_PROJECT")
+
+        # Ensure GOOGLE_APPLICATION_CREDENTIALS is set up front for clearer error early.
+        self.credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if not self.credentials_path:
+            raise ValueError(
+                "GOOGLE_APPLICATION_CREDENTIALS must point to a service account JSON file."
+            )
 
     def query(self, prompt: str) -> dict:
-        """Send query and parse JSON response."""
-        for attempt in range(3):
+        """Send query, prefer Vertex AI when service account credentials are configured."""
+        content = self._call_by_vertex_ai(prompt)
+        if not content:
+            return {}
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            logger.warning("LLM response was not valid JSON. Raw content: %s", content[:200])
+            return {}
+
+    def _call_by_vertex_ai(self, prompt: str) -> str | None:
+        """Use Vertex AI SDK to call Gemini with service account credentials."""
+        if not VERTEX_AI_AVAILABLE:
+            raise ImportError(
+                "google-cloud-aiplatform is not installed. "
+                "Install it with: pip install google-cloud-aiplatform>=1.38"
+            )
+
+        if not os.path.exists(self.credentials_path):
+            raise FileNotFoundError(
+                f"Service account key file not found: {self.credentials_path}\n"
+                "Please check the path and try again."
+            )
+
+        project_id = self.explicit_project
+        if not project_id:
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"},
+                with open(self.credentials_path, "r", encoding="utf-8") as f:
+                    creds_data = json.load(f)
+                project_id = creds_data.get("project_id")
+            except Exception as exc:  # pragma: no cover
+                raise ValueError(
+                    f"Failed to read project_id from service account file: {exc}"
+                ) from exc
+
+        if not project_id:
+            raise ValueError("GCP project_id not found. Set GOOGLE_CLOUD_PROJECT or include in key.")
+
+        # Initialize Vertex AI for every call to ensure fresh config if env changes.
+        vertexai.init(project=project_id, location=self.location)
+        model = GenerativeModel(self.model_name)
+
+        for attempt in range(self.max_retries):
+            try:
+                response = model.generate_content(
+                    prompt,
+                    generation_config={
+                        "response_mime_type": "application/json",
+                    },
                 )
-                return json.loads(response.choices[0].message.content)
-            except Exception as e:
-                logger.warning(f"LLM query failed (attempt {attempt + 1}): {e}")
-                time.sleep(1)
-        return {}
+                return response.text
+            except Exception as exc:
+                logger.warning("Vertex AI call failed (attempt %d): %s", attempt + 1, exc)
+                if attempt < self.max_retries - 1:
+                    time.sleep(1)
+        return None
 
 
 class AnnotationGenerator:

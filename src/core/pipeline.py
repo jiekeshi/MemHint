@@ -43,7 +43,7 @@ class Pipeline:
     def __init__(
         self,
         api_key: str = None,
-        model: str = "gpt-5.2",
+        model: str = "gemini-2.5-pro",
         analyzer_type: str = "codeql",
         max_iterations: int = 3,
         issue_types: list[MemoryIssueType] = None

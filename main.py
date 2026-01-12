@@ -76,7 +76,7 @@ def main():
                         help="Static analyzer to use (default: codeql)")
     parser.add_argument("--issues", "-i", nargs="+", metavar="TYPE",
                         help="Issue types to detect (default: all)")
-    parser.add_argument("--model", default="gpt-5.2", help="LLM model (default: gpt-5.2)")
+    parser.add_argument("--model", default="gemini-2.5-pro", help="LLM model (default: gemini-2.5-pro)")
     parser.add_argument("--api-key", help="OpenAI API key (or set OPENAI_API_KEY)")
     parser.add_argument("--max-iterations", type=int, default=5,
                         help="Max CEGAR iterations (default: 5)")
