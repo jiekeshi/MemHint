@@ -46,7 +46,8 @@ class Pipeline:
         model: str = "gemini-2.5-pro",
         analyzer_type: str = "codeql",
         max_iterations: int = 3,
-        issue_types: list[MemoryIssueType] = None
+        issue_types: list[MemoryIssueType] = None,
+        use_merge: bool = False,
     ):
         self.parser = CodeParser()
         self.llm = LLMClient(api_key=api_key, model=model)
@@ -54,6 +55,7 @@ class Pipeline:
         self.analyzer = create_analyzer(analyzer_type)
         self.constraint_validator = AnnotationValidator()
         self.max_iterations = max_iterations
+        self.use_merge = use_merge
 
         # Default to all issue types
         self.issue_types = issue_types or [
@@ -114,63 +116,75 @@ class Pipeline:
             logger.info("Phase 3: Validating annotations with Z3...")
             self._validate_annotations_with_z3()
 
-        # Phase 4: Merge relevant code
-        logger.info("Phase 4: Merging code with dependency tracking...")
-        merger = CodeMerger(llm_client=self.llm)
-        merged = merger.merge(self.annotations, self.functions, project_path)
+        if self.use_merge:
+            # Phase 4: Merge relevant code
+            logger.info("Phase 4: Merging code with dependency tracking...")
+            merger = CodeMerger(llm_client=self.llm)
+            merged = merger.merge(self.annotations, self.functions, project_path)
 
-        logger.info(f"Merged {len(merged.included_functions)} functions, {len(merged.included_types)} types")
-
-        # Save merged code
-        merged_file = output_dir / "merged_analysis.c"
-        merged_file.write_text(merged.code)
-        logger.info(f"Wrote merged code: {merged_file}")
-
-        # Save location map
-        location_map_file = output_dir / "location_map.json"
-        map_data = {
-            str(line): {
-                "file": loc.file_path,
-                "line": loc.start_line,
-                "function": loc.function_name,
-            }
-            for line, loc in merged.location_map.items()
-        }
-        location_map_file.write_text(json.dumps(map_data, indent=2))
-
-        # Phase 5: Run analyzer on merged code
-        analyzer_name = type(self.analyzer).__name__
-        logger.info(f"Phase 5: Running {analyzer_name} on merged code...")
-
-        # Create temp directory with merged file
-        temp_dir = Path(tempfile.mkdtemp())
-        shutil.copy(merged_file, temp_dir / "merged_analysis.c")
-
-        try:
-            warnings = self.analyzer.analyze(temp_dir, self.annotations, self.issue_types)
-            logger.info(f"{analyzer_name} found {len(warnings)} warnings")
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-        # Phase 6: Map results to original locations
-        logger.info("Phase 6: Mapping to original locations...")
-        mapped_warnings = []
-        for warning in warnings:
-            original_loc = CodeMerger.map_result_to_original(
-                warning.line_number, merged.location_map
+            logger.info(
+                f"Merged {len(merged.included_functions)} functions, {len(merged.included_types)} types"
             )
-            if original_loc:
-                mapped_warnings.append(Warning(
-                    file_path=original_loc.file_path,
-                    line_number=original_loc.start_line,
-                    function_name=original_loc.function_name or warning.function_name,
-                    warning_type=warning.warning_type,
-                    message=warning.message,
-                    issue_type=warning.issue_type,
-                    trace=warning.trace,
-                ))
-            else:
-                mapped_warnings.append(warning)
+
+            # Save merged code
+            merged_file = output_dir / "merged_analysis.c"
+            merged_file.write_text(merged.code)
+            logger.info(f"Wrote merged code: {merged_file}")
+
+            # Save location map
+            location_map_file = output_dir / "location_map.json"
+            map_data = {
+                str(line): {
+                    "file": loc.file_path,
+                    "line": loc.start_line,
+                    "function": loc.function_name,
+                }
+                for line, loc in merged.location_map.items()
+            }
+            location_map_file.write_text(json.dumps(map_data, indent=2))
+
+            # Phase 5: Run analyzer on merged code
+            analyzer_name = type(self.analyzer).__name__
+            logger.info(f"Phase 5: Running {analyzer_name} on merged code (merged file)...")
+
+            # Create temp directory with merged file
+            temp_dir = Path(tempfile.mkdtemp())
+            shutil.copy(merged_file, temp_dir / "merged_analysis.c")
+
+            try:
+                warnings = self.analyzer.analyze(temp_dir, self.annotations, self.issue_types)
+                logger.info(f"{analyzer_name} found {len(warnings)} warnings")
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+            # Phase 6: Map results to original locations
+            logger.info("Phase 6: Mapping to original locations (from merged file)...")
+            mapped_warnings = []
+            for warning in warnings:
+                original_loc = CodeMerger.map_result_to_original(
+                    warning.line_number, merged.location_map
+                )
+                if original_loc:
+                    mapped_warnings.append(Warning(
+                        file_path=original_loc.file_path,
+                        line_number=original_loc.start_line,
+                        function_name=original_loc.function_name or warning.function_name,
+                        warning_type=warning.warning_type,
+                        message=warning.message,
+                        issue_type=warning.issue_type,
+                        trace=warning.trace,
+                    ))
+                else:
+                    mapped_warnings.append(warning)
+        else:
+            # No merge: run analyzer directly on original project
+            analyzer_name = type(self.analyzer).__name__
+            logger.info(
+                f"Phase 4: Skipping merge (use_merge=False), running {analyzer_name} on original project..."
+            )
+            warnings = self.analyzer.analyze(project_path, self.annotations, self.issue_types)
+            logger.info(f"{analyzer_name} found {len(warnings)} warnings")
+            mapped_warnings = warnings
 
         # Phase 7: Filter with Z3
         logger.info("Phase 7: Z3 path feasibility filtering...")
