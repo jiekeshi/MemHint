@@ -277,32 +277,32 @@ class Pipeline:
             if len(conflicts) > 5:
                 logger.info(f"  ... and {len(conflicts) - 5} more")
 
-    def _validate_annotations_with_llm(self) -> None:
-        """Additional LLM-based semantic validation."""
-        to_remove = []
+    # def _validate_annotations_with_llm(self) -> None:
+    #     """Additional LLM-based semantic validation."""
+    #     to_remove = []
 
-        for func_name, anns in tqdm(
-            list(self.annotations.annotations.items()),
-            desc="LLM validation"
-        ):
-            if func_name not in self.functions:
-                continue
-            func = self.functions[func_name]
+    #     for func_name, anns in tqdm(
+    #         list(self.annotations.annotations.items()),
+    #         desc="LLM validation"
+    #     ):
+    #         if func_name not in self.functions:
+    #             continue
+    #         func = self.functions[func_name]
 
-            for ann in anns:
-                # Validate allocation annotations (most prone to false positives)
-                if ann.annotation_type in (AnnotationType.ALLOC_SOURCE, AnnotationType.ARRAY_ALLOC):
-                    is_valid, reason = self.generator.validate(func, ann)
-                    if not is_valid:
-                        logger.debug(f"LLM removing invalid annotation {func_name}: {reason}")
-                        to_remove.append((func_name, ann.annotation_type))
-                        self.conflicts.append(f"LLM CONFLICT: {func_name} - {reason}")
+    #         for ann in anns:
+    #             # Validate allocation annotations (most prone to false positives)
+    #             if ann.annotation_type in (AnnotationType.ALLOC_SOURCE, AnnotationType.ARRAY_ALLOC):
+    #                 is_valid, reason = self.generator.validate(func, ann)
+    #                 if not is_valid:
+    #                     logger.debug(f"LLM removing invalid annotation {func_name}: {reason}")
+    #                     to_remove.append((func_name, ann.annotation_type))
+    #                     self.conflicts.append(f"LLM CONFLICT: {func_name} - {reason}")
 
-        for func_name, ann_type in to_remove:
-            self.annotations.remove(func_name, ann_type)
+    #     for func_name, ann_type in to_remove:
+    #         self.annotations.remove(func_name, ann_type)
 
-        if to_remove:
-            logger.info(f"LLM validation removed {len(to_remove)} annotations")
+    #     if to_remove:
+    #         logger.info(f"LLM validation removed {len(to_remove)} annotations")
 
     def _filter_warnings_with_z3(
         self, warnings: list[Warning], project_path: Path
