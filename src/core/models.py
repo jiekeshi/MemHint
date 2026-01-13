@@ -76,16 +76,16 @@ class MemoryIssueType(Enum):
     HEAP_OVERFLOW = auto()         # Heap buffer overflow
 
 
-class ConflictType(Enum):
-    """Types of conflicts found during validation."""
-    FALSE_ALLOC = auto()
-    FALSE_FREE = auto()
-    MISSING_FREE = auto()
-    OWNERSHIP_TRANSFER = auto()
-    PATH_INFEASIBLE = auto()
-    STATIC_BUFFER = auto()
-    NULL_CHECK_EXISTS = auto()
-    BORROWED_REFERENCE = auto()
+# class ConflictType(Enum):
+#     """Types of conflicts found during validation."""
+#     FALSE_ALLOC = auto()
+#     FALSE_FREE = auto()
+#     MISSING_FREE = auto()
+#     OWNERSHIP_TRANSFER = auto()
+#     PATH_INFEASIBLE = auto()
+#     STATIC_BUFFER = auto()
+#     NULL_CHECK_EXISTS = auto()
+#     BORROWED_REFERENCE = auto()
 
 
 @dataclass
@@ -125,15 +125,15 @@ class Annotation:
             AnnotationType.NULL_DEREF,
         )
 
-    def to_codeql_kind(self) -> str:
-        """Convert to CodeQL model kind."""
-        mapping = {
-            AnnotationType.ALLOC_SOURCE: "alloc",
-            AnnotationType.ARRAY_ALLOC: "alloc",
-            AnnotationType.FREE_SINK: "free",
-            AnnotationType.REALLOC: "realloc",
-        }
-        return mapping.get(self.annotation_type, "")
+    # def to_codeql_kind(self) -> str:
+    #     """Convert to CodeQL model kind."""
+    #     mapping = {
+    #         AnnotationType.ALLOC_SOURCE: "alloc",
+    #         AnnotationType.ARRAY_ALLOC: "alloc",
+    #         AnnotationType.FREE_SINK: "free",
+    #         AnnotationType.REALLOC: "realloc",
+    #     }
+    #     return mapping.get(self.annotation_type, "")
 
 
 @dataclass
@@ -175,9 +175,9 @@ class AnnotationSet:
                      for a in ([ann] if isinstance(ann, Annotation) else ann)
                      if a.annotation_type in alloc_types})
 
-    def get_free_functions(self) -> list[str]:
-        """Get all deallocation function names."""
-        return [fn for fn, _ in self.get_by_type(AnnotationType.FREE_SINK)]
+    # def get_free_functions(self) -> list[str]:
+    #     """Get all deallocation function names."""
+    #     return [fn for fn, _ in self.get_by_type(AnnotationType.FREE_SINK)]
 
     def to_json(self) -> dict:
         """Export as generic JSON format."""
@@ -211,7 +211,31 @@ class AnnotationSet:
         return result
 
     def to_codeql_model(self) -> str:
-        """Export as CodeQL model extension YAML."""
+        """Export as CodeQL model extension YAML.
+        
+        Supported AnnotationType values:
+        - ALLOC_SOURCE: Allocation functions (added to summaryModel and sourceModel)
+        - ARRAY_ALLOC: Array allocation functions (added to summaryModel and sourceModel)
+        - REALLOC: Reallocation functions (added to reallocExpr)
+        - FREE_SINK: Deallocation functions (added to sinkModel)
+        - FREE_RETURN: Free and return functions (added to sinkModel)
+        - OWNERSHIP_TRANSFER: Ownership transfer to callee (added to summaryModel)
+        - OWNERSHIP_RETURN: Ownership transfer to caller via return (added to summaryModel)
+        - OWNERSHIP_ARG_OUT: Ownership transfer via output parameter (added to summaryModel)
+        - NULLABLE_RETURN: May return NULL (added to summaryModel)
+        - NONNULL_RETURN: Never returns NULL (added to summaryModel)
+        - NONNULL_ARG: Argument must not be NULL (added to summaryModel)
+        - MUST_CHECK_NULL: Return value must be null-checked (added to summaryModel)
+        - NO_ESCAPE: Memory doesn't escape function scope (added to summaryModel)
+        - ESCAPE_RETURN: Memory escapes via return value (added to summaryModel)
+        - ESCAPE_ARG: Memory escapes via argument (added to summaryModel)
+        - STATIC_BUFFER: Returns static/global buffer (added to summaryModel)
+        - STACK_BUFFER: Returns stack buffer (added to summaryModel)
+        - BORROWED_REF: Returns borrowed reference (added to summaryModel)
+        
+        Note: Bug detection annotations (POTENTIAL_LEAK, USE_AFTER_FREE, DOUBLE_FREE, NULL_DEREF)
+        and negative annotations (NOT_ALLOC, NOT_FREE) are not exported to CodeQL models.
+        """
         lines = ["extensions:"]
 
         # Allocation functions - using summaryModel for custom allocators
@@ -263,6 +287,179 @@ class AnnotationSet:
             ])
             for func_name, _ in realloc_funcs:
                 lines.append(f'      - ["{func_name}"]')
+
+        # Free return functions - sinkModel (frees and returns)
+        free_return_funcs = self.get_by_type(AnnotationType.FREE_RETURN)
+        if free_return_funcs:
+            lines.extend([
+                "  - addsTo:",
+                "      pack: codeql/cpp-all",
+                "      extensible: sinkModel",
+                "    data:",
+            ])
+            for func_name, ann in free_return_funcs:
+                arg_idx = int(ann.target[3:]) if ann.target.startswith("arg") else 0
+                lines.append(f'      - ["", "", False, "{func_name}", "", "", "Argument[{arg_idx}]", "free", "manual"]')
+
+        # Ownership transfer functions - summaryModel
+        ownership_transfer_funcs = self.get_by_type(AnnotationType.OWNERSHIP_TRANSFER)
+        if ownership_transfer_funcs:
+            lines.extend([
+                "  - addsTo:",
+                "      pack: codeql/cpp-all",
+                "      extensible: summaryModel",
+                "    data:",
+            ])
+            for func_name, ann in ownership_transfer_funcs:
+                arg_idx = int(ann.target[3:]) if ann.target.startswith("arg") else 0
+                lines.append(f'      - ["", "", False, "{func_name}", "", "", "Argument[{arg_idx}]", "ReturnValue", "taint"]')
+
+        # Ownership return functions - summaryModel
+        ownership_return_funcs = self.get_by_type(AnnotationType.OWNERSHIP_RETURN)
+        if ownership_return_funcs:
+            lines.extend([
+                "  - addsTo:",
+                "      pack: codeql/cpp-all",
+                "      extensible: summaryModel",
+                "    data:",
+            ])
+            for func_name, _ in ownership_return_funcs:
+                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
+
+        # Ownership arg out functions - summaryModel
+        ownership_arg_out_funcs = self.get_by_type(AnnotationType.OWNERSHIP_ARG_OUT)
+        if ownership_arg_out_funcs:
+            lines.extend([
+                "  - addsTo:",
+                "      pack: codeql/cpp-all",
+                "      extensible: summaryModel",
+                "    data:",
+            ])
+            for func_name, ann in ownership_arg_out_funcs:
+                arg_idx = int(ann.target[3:]) if ann.target.startswith("arg") else 0
+                lines.append(f'      - ["", "", False, "{func_name}", "", "", "Argument[{arg_idx}]", "Argument[{arg_idx}]", "taint"]')
+
+        # Nullable return functions - summaryModel
+        nullable_return_funcs = self.get_by_type(AnnotationType.NULLABLE_RETURN)
+        if nullable_return_funcs:
+            lines.extend([
+                "  - addsTo:",
+                "      pack: codeql/cpp-all",
+                "      extensible: summaryModel",
+                "    data:",
+            ])
+            for func_name, _ in nullable_return_funcs:
+                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
+
+        # Nonnull return functions - summaryModel
+        nonnull_return_funcs = self.get_by_type(AnnotationType.NONNULL_RETURN)
+        if nonnull_return_funcs:
+            lines.extend([
+                "  - addsTo:",
+                "      pack: codeql/cpp-all",
+                "      extensible: summaryModel",
+                "    data:",
+            ])
+            for func_name, _ in nonnull_return_funcs:
+                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
+
+        # Nonnull arg functions - summaryModel
+        nonnull_arg_funcs = self.get_by_type(AnnotationType.NONNULL_ARG)
+        if nonnull_arg_funcs:
+            lines.extend([
+                "  - addsTo:",
+                "      pack: codeql/cpp-all",
+                "      extensible: summaryModel",
+                "    data:",
+            ])
+            for func_name, ann in nonnull_arg_funcs:
+                arg_idx = int(ann.target[3:]) if ann.target.startswith("arg") else 0
+                lines.append(f'      - ["", "", False, "{func_name}", "", "", "Argument[{arg_idx}]", "Argument[{arg_idx}]", "taint"]')
+
+        # Must check null functions - summaryModel
+        must_check_null_funcs = self.get_by_type(AnnotationType.MUST_CHECK_NULL)
+        if must_check_null_funcs:
+            lines.extend([
+                "  - addsTo:",
+                "      pack: codeql/cpp-all",
+                "      extensible: summaryModel",
+                "    data:",
+            ])
+            for func_name, _ in must_check_null_funcs:
+                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
+
+        # No escape functions - summaryModel
+        no_escape_funcs = self.get_by_type(AnnotationType.NO_ESCAPE)
+        if no_escape_funcs:
+            lines.extend([
+                "  - addsTo:",
+                "      pack: codeql/cpp-all",
+                "      extensible: summaryModel",
+                "    data:",
+            ])
+            for func_name, _ in no_escape_funcs:
+                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
+
+        # Escape return functions - summaryModel
+        escape_return_funcs = self.get_by_type(AnnotationType.ESCAPE_RETURN)
+        if escape_return_funcs:
+            lines.extend([
+                "  - addsTo:",
+                "      pack: codeql/cpp-all",
+                "      extensible: summaryModel",
+                "    data:",
+            ])
+            for func_name, _ in escape_return_funcs:
+                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
+
+        # Escape arg functions - summaryModel
+        escape_arg_funcs = self.get_by_type(AnnotationType.ESCAPE_ARG)
+        if escape_arg_funcs:
+            lines.extend([
+                "  - addsTo:",
+                "      pack: codeql/cpp-all",
+                "      extensible: summaryModel",
+                "    data:",
+            ])
+            for func_name, ann in escape_arg_funcs:
+                arg_idx = int(ann.target[3:]) if ann.target.startswith("arg") else 0
+                lines.append(f'      - ["", "", False, "{func_name}", "", "", "Argument[{arg_idx}]", "Argument[{arg_idx}]", "taint"]')
+
+        # Static buffer functions - summaryModel (prevent false positives)
+        static_buffer_funcs = self.get_by_type(AnnotationType.STATIC_BUFFER)
+        if static_buffer_funcs:
+            lines.extend([
+                "  - addsTo:",
+                "      pack: codeql/cpp-all",
+                "      extensible: summaryModel",
+                "    data:",
+            ])
+            for func_name, _ in static_buffer_funcs:
+                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
+
+        # Stack buffer functions - summaryModel (prevent false positives)
+        stack_buffer_funcs = self.get_by_type(AnnotationType.STACK_BUFFER)
+        if stack_buffer_funcs:
+            lines.extend([
+                "  - addsTo:",
+                "      pack: codeql/cpp-all",
+                "      extensible: summaryModel",
+                "    data:",
+            ])
+            for func_name, _ in stack_buffer_funcs:
+                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
+
+        # Borrowed ref functions - summaryModel (prevent false positives)
+        borrowed_ref_funcs = self.get_by_type(AnnotationType.BORROWED_REF)
+        if borrowed_ref_funcs:
+            lines.extend([
+                "  - addsTo:",
+                "      pack: codeql/cpp-all",
+                "      extensible: summaryModel",
+                "    data:",
+            ])
+            for func_name, _ in borrowed_ref_funcs:
+                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
 
         return "\n".join(lines)
 
