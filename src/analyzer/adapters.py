@@ -127,7 +127,28 @@ class CodeQLAnalyzer:
             else:
                 return "make"
 
-        # Check for CMakeLists.txt
+        # Check for CMakeLists.txt in lint subdirectory (following README pattern)
+        lint_dir = project_path / "lint"
+        if lint_dir.exists() and (lint_dir / "CMakeLists.txt").exists():
+            # Check if cmake is available before trying to use it
+            if which("cmake") is None:
+                logger.warning("CMakeLists.txt found in lint/ but 'cmake' command not available, skipping CMake detection")
+            else:
+                build_dir = lint_dir / "build"
+                if build_dir.exists():
+                    # Try using existing build directory
+                    if (build_dir / "Makefile").exists():
+                        return "make -C lint/build"
+                else:
+                    build_dir.mkdir(parents=True)
+                    # Try configuring from lint/build directory
+                    result = subprocess.run(
+                        ["cmake", ".."], cwd=str(build_dir), capture_output=True, timeout=120
+                    )
+                    if result.returncode == 0:
+                        return "make -C lint/build"
+
+        # Check for CMakeLists.txt in project root
         if (project_path / "CMakeLists.txt").exists():
             # Check if cmake is available before trying to use it
             if which("cmake") is None:
@@ -317,6 +338,9 @@ dependencies:
                     bug_hints["suspect_functions"].add(func_name)
 
         # Generate CodeQL lists
+        # alloc_funcs=[]
+        # free_funcs=[]
+        # nullable_funcs=[]
         alloc_list = ", ".join(f'"{f}"' for f in alloc_funcs) if alloc_funcs else '"__hint_none__"'
         free_list = ", ".join(f'"{f}"' for f in free_funcs) if free_funcs else '"__hint_none__"'
         nullable_list = ", ".join(f'"{f}"' for f in nullable_funcs) if nullable_funcs else '"__hint_none__"'
