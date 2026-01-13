@@ -80,6 +80,11 @@ def main():
     parser.add_argument("--api-key", help="OpenAI API key (or set OPENAI_API_KEY)")
     parser.add_argument("--max-iterations", type=int, default=5,
                         help="Max CEGAR iterations (default: 5)")
+    parser.add_argument(
+        "--merge",
+        action="store_true",
+        help="Enable code merging; merge code into single file before analysis",
+    )
 
     args = parser.parse_args()
 
@@ -108,6 +113,7 @@ def main():
         analyzer_type=args.analyzer,
         max_iterations=args.max_iterations,
         issue_types=issue_types,
+        use_merge=args.merge,
     )
 
     result = pipeline.analyze(project_path, output_dir)
