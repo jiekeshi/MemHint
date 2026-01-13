@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import shutil
 from pathlib import Path
+from shutil import which
 
 from src.core.models import Warning, AnnotationSet, MemoryIssueType, AnnotationType
 
@@ -72,22 +73,35 @@ class CodeQLAnalyzer:
         """Create CodeQL database."""
         logger.info(f"Project: {project_path}")
 
-        # Determine build command
-        build_cmd = self._get_build_command(project_path)
-        if not build_cmd:
-            logger.error("Could not determine build command")
-            return False
+        # Check for compile_commands.json first (preferred method)
+        compile_commands = project_path / "compile_commands.json"
+        if compile_commands.exists():
+            logger.info("Using compile_commands.json for database creation")
+            cmd = [
+                self.binary, "database", "create",
+                str(db_path),
+                f"--source-root={project_path}",
+                "--language=cpp",
+                "--overwrite",
+                f"--compilation-database={compile_commands}",
+            ]
+        else:
+            # Determine build command
+            build_cmd = self._get_build_command(project_path)
+            if not build_cmd:
+                logger.error("Could not determine build command")
+                return False
 
-        logger.info(f"Build command: {build_cmd}")
+            logger.info(f"Build command: {build_cmd}")
 
-        cmd = [
-            self.binary, "database", "create",
-            str(db_path),
-            f"--source-root={project_path}",
-            "--language=cpp",
-            "--overwrite",
-            f"--command={build_cmd}",
-        ]
+            cmd = [
+                self.binary, "database", "create",
+                str(db_path),
+                f"--source-root={project_path}",
+                "--language=cpp",
+                "--overwrite",
+                f"--command={build_cmd}",
+            ]
 
         result = subprocess.run(
             cmd, timeout=self.timeout, capture_output=True, cwd=str(project_path)
@@ -101,39 +115,59 @@ class CodeQLAnalyzer:
         return True
 
     def _get_build_command(self, project_path: Path) -> str:
-        """Determine appropriate build command for project."""
-        # # Check for Makefile
-        # if (project_path / "Makefile").exists():
-        #     return "make"
+        """Determine appropriate build command for project.
+        
+        When analyzing original project (not merged), try to detect build system.
+        When analyzing merged file, use direct compilation.
+        """
+        # Check for Makefile
+        if (project_path / "Makefile").exists():
+            if which("make") is None:
+                logger.warning("Makefile found but 'make' command not available, skipping make detection")
+            else:
+                return "make"
 
-        # # Check for CMakeLists.txt
-        # if (project_path / "CMakeLists.txt").exists():
-        #     build_dir = project_path / "build"
-        #     if build_dir.exists():
-        #         shutil.rmtree(build_dir)
-        #     build_dir.mkdir()
+        # Check for CMakeLists.txt
+        if (project_path / "CMakeLists.txt").exists():
+            # Check if cmake is available before trying to use it
+            if which("cmake") is None:
+                logger.warning("CMakeLists.txt found but 'cmake' command not available, skipping CMake detection")
+            else:
+                build_dir = project_path / "build"
+                if build_dir.exists():
+                    # Try using existing build directory
+                    if (build_dir / "Makefile").exists():
+                        return "make -C build"
+                else:
+                    build_dir.mkdir()
+                    # Try configuring
+                    result = subprocess.run(
+                        ["cmake", ".."], cwd=str(build_dir), capture_output=True, timeout=120
+                    )
+                    if result.returncode == 0:
+                        return "make -C build"
 
-        #     # Configure
-        #     result = subprocess.run(
-        #         ["cmake", ".."], cwd=str(build_dir), capture_output=True, timeout=120
-        #     )
-        #     if result.returncode == 0:
-        #         return "make -C build"
+                # Try in-source build
+                result = subprocess.run(
+                    ["cmake", "."], cwd=str(project_path), capture_output=True, timeout=120
+                )
+                if result.returncode == 0:
+                    return "make"
 
-        #     # Try in-source
-        #     result = subprocess.run(
-        #         ["cmake", "."], cwd=str(project_path), capture_output=True, timeout=120
-        #     )
-        #     if result.returncode == 0:
-        #         return "make"
-
-        # Direct compilation
+        # Fallback: Direct compilation (for merged files or simple projects)
+        # Note: compile_commands.json is handled separately in _create_database()
         c_files = list(project_path.rglob("*.c"))
         cpp_files = list(project_path.rglob("*.cpp"))
 
         if c_files or cpp_files:
             files = [str(f.relative_to(project_path)) for f in (c_files + cpp_files)[:30]]
-            compiler = "clang" if cpp_files else "clang"  # Use clang for better compatibility
+            # Determine compiler based on file types
+            if cpp_files and not c_files:
+                compiler = "clang++"
+            elif c_files and not cpp_files:
+                compiler = "clang"
+            else:
+                compiler = "clang++"  # Default to clang++ for mixed C/C++
             return f"{compiler} -I. -c -fsyntax-only {' '.join(files)}"
 
         return None
