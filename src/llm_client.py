@@ -184,7 +184,7 @@ class LLMClient:
 
     def query(self, prompt: str) -> dict:
         """Send query, prefer Vertex AI when service account credentials are configured."""
-        content = self._call_by_vertex_ai(prompt)
+        content = self._call_by_vertex_ai(prompt, response_mime="application/json")
         if not content:
             return {}
         try:
@@ -193,7 +193,11 @@ class LLMClient:
             logger.warning("LLM response was not valid JSON. Raw content: %s", content[:200])
             return {}
 
-    def _call_by_vertex_ai(self, prompt: str) -> str | None:
+    def generate_text(self, prompt: str) -> str:
+        """Return raw text (used for code fixes)."""
+        return self._call_by_vertex_ai(prompt, response_mime="text/plain") or ""
+
+    def _call_by_vertex_ai(self, prompt: str, response_mime: str) -> str | None:
         """Use Vertex AI SDK to call Gemini with service account credentials."""
         if not VERTEX_AI_AVAILABLE:
             raise ImportError(
@@ -230,7 +234,7 @@ class LLMClient:
                 response = model.generate_content(
                     prompt,
                     generation_config={
-                        "response_mime_type": "application/json",
+                        "response_mime_type": response_mime,
                     },
                 )
                 return response.text
