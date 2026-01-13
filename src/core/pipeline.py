@@ -91,23 +91,28 @@ class Pipeline:
         self.functions = self.parser.parse_project(project_path)
         logger.info(f"Found {len(self.functions)} functions")
 
-        # Phase 2: Generate annotations with LLM
-        logger.info("Phase 2: Generating annotations with LLM...")
-        self._generate_annotations()
+        annotations_file = output_dir / "annotations.json"
+        if annotations_file.exists():
+            logger.info(f"annotations.json found in {output_dir}, reusing existing annotations")
+            self.annotations = self._load_annotations_from_file(annotations_file)
+        else:
+            # Phase 2: Generate annotations with LLM
+            logger.info("Phase 2: Generating annotations with LLM...")
+            self._generate_annotations()
 
-        func_annotations = sum(
-            1 for anns in self.annotations.annotations.values()
-            for ann in anns if not ann.is_bug_annotation()
-        )
-        bug_hints = sum(
-            1 for anns in self.annotations.annotations.values()
-            for ann in anns if ann.is_bug_annotation()
-        )
-        logger.info(f"Generated {func_annotations} function annotations, {bug_hints} bug hints")
+            func_annotations = sum(
+                1 for anns in self.annotations.annotations.values()
+                for ann in anns if not ann.is_bug_annotation()
+            )
+            bug_hints = sum(
+                1 for anns in self.annotations.annotations.values()
+                for ann in anns if ann.is_bug_annotation()
+            )
+            logger.info(f"Generated {func_annotations} function annotations, {bug_hints} bug hints")
 
-        # Phase 3: Validate with Z3
-        logger.info("Phase 3: Validating annotations with Z3...")
-        self._validate_annotations_with_z3()
+            # Phase 3: Validate with Z3
+            logger.info("Phase 3: Validating annotations with Z3...")
+            self._validate_annotations_with_z3()
 
         # Phase 4: Merge relevant code
         logger.info("Phase 4: Merging code with dependency tracking...")
@@ -182,6 +187,52 @@ class Pipeline:
             iterations=1,
             spurious_filtered=len(warnings) - len(confirmed_bugs),
         )
+
+    def _load_annotations_from_file(self, file_path: Path) -> AnnotationSet:
+        """Load annotations.json produced by a previous run."""
+        data = json.loads(Path(file_path).read_text())
+        loaded = AnnotationSet()
+
+        # Function annotations
+        for func_name, anns in data.get("functions", {}).items():
+            for ann in anns:
+                ann_type_name = ann.get("type")
+                if not ann_type_name:
+                    continue
+                try:
+                    ann_type = AnnotationType[ann_type_name]
+                except KeyError:
+                    logger.warning(f"Unknown annotation type in file: {ann_type_name}")
+                    continue
+                loaded.add(Annotation(
+                    function_name=func_name,
+                    annotation_type=ann_type,
+                    target=ann.get("target", ""),
+                    reason=ann.get("reason", "")
+                ))
+
+        # Bug hints
+        for hint in data.get("bug_hints", []):
+            ann_type_name = hint.get("type")
+            func_name = hint.get("function", "")
+            if not ann_type_name or not func_name:
+                continue
+            try:
+                ann_type = AnnotationType[ann_type_name]
+            except KeyError:
+                logger.warning(f"Unknown bug hint type in file: {ann_type_name}")
+                continue
+            loaded.add(Annotation(
+                function_name=func_name,
+                annotation_type=ann_type,
+                target=hint.get("target", ""),
+                line_number=hint.get("line"),
+                confidence=hint.get("confidence", 1.0),
+                reason=hint.get("reason", "")
+            ))
+
+        logger.info(f"Loaded annotations from {file_path}")
+        return loaded
 
     def _generate_annotations(self) -> None:
         """Generate comprehensive memory safety annotations using LLM."""
