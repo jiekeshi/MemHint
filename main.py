@@ -1,17 +1,19 @@
 """
-Paper -- "Hint: Guiding Static Analysis with LLM-Assisted Memory-Semantics Annotation"
+HINT: LLM-Assisted Memory-Semantics Annotation for Static Analysis
 
-Uses CEGAR (Counterexample-Guided Abstraction Refinement) approach:
-1. LLM generates memory safety annotations
-2. Z3 constraint solver validates annotations
-3. CodeQL performs static analysis with validated annotations
+Pipeline flow:
+1. Parse source code (tree-sitter)
+2. LLM generates memory safety hints (ALLOCATOR, DEALLOCATOR, NULLABLE, etc.)
+3. Z3 validates hints consistency
+4. CodeQL scans with hint-based model extensions
+5. Z3 filters false positives by path feasibility
 
 Supports detection of:
-- Memory leaks
-- Double-free
-- Use-after-free
-- Null pointer dereference
-- Buffer overflow
+1. Memory leaks (allocation without free on some feasible path)
+2. Double-free (two frees on same pointer on some feasible path)
+3. Use-after-free (use of pointer after free on some feasible path)
+4. Null pointer dereference (dereference when pointer might be NULL)
+5. Buffer overflow (access beyond buffer bounds)
 
 Usage:
     python main.py --project /path/to/code
@@ -28,7 +30,7 @@ from src.core.models import MemoryIssueType
 from src.core.pipeline import Pipeline
 
 
-ISSUE_TYPE_MAP = {
+BUG_TYPE_MAP = {
     "leak": MemoryIssueType.MEMORY_LEAK,
     "memory-leak": MemoryIssueType.MEMORY_LEAK,
     "double-free": MemoryIssueType.DOUBLE_FREE,
@@ -42,6 +44,7 @@ ISSUE_TYPE_MAP = {
 
 
 def setup_logging(level: str = "INFO", log_file: str = None):
+    """Configure logging."""
     handlers = [logging.StreamHandler(sys.stdout)]
     if log_file:
         handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
@@ -52,42 +55,54 @@ def setup_logging(level: str = "INFO", log_file: str = None):
     )
 
 
-def parse_issue_types(issue_strs: list[str]) -> list[MemoryIssueType]:
-    """Parse issue type strings to enum values."""
-    if not issue_strs:
+def parse_bug_types(type_strs: list[str]) -> list[MemoryIssueType]:
+    """Parse bug type strings to enum values."""
+    if not type_strs:
         return None
 
     types = []
-    for s in issue_strs:
+    for s in type_strs:
         s_lower = s.lower()
-        if s_lower in ISSUE_TYPE_MAP:
-            types.append(ISSUE_TYPE_MAP[s_lower])
+        if s_lower in BUG_TYPE_MAP:
+            types.append(BUG_TYPE_MAP[s_lower])
         else:
-            print(f"Warning: Unknown issue type '{s}', skipping")
+            print(f"Warning: Unknown bug type '{s}', skipping")
     return types if types else None
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Hint: Guiding Static Analysis with LLM-Assisted Memory-Semantics Annotation")
+    parser = argparse.ArgumentParser(
+        description="HINT: LLM-Assisted Memory-Semantics Annotation for Static Analysis"
+    )
 
-    parser.add_argument("--project", "-p", required=True, help="Project path to analyze")
-    parser.add_argument("--output", "-o", default="./output", help="Output directory")
-    parser.add_argument("--analyzer", choices=["codeql", "infer"], default="codeql",
-                        help="Static analyzer to use (default: codeql)")
-    parser.add_argument("--issues", "-i", nargs="+", metavar="TYPE",
-                        help="Issue types to detect (default: all)")
-    parser.add_argument("--model", default="gemini-2.5-pro", help="LLM model (default: gemini-2.5-pro)")
-    parser.add_argument("--api-key", help="API key for LLM access")
-    parser.add_argument("--max-iterations", type=int, default=5,
-                        help="Max CEGAR iterations (default: 5)")
     parser.add_argument(
-        "--merge",
-        action="store_true",
-        help="Enable code merging; merge code into single file before analysis",
+        "--project", "-p", required=True,
+        help="Project path to analyze"
+    )
+    parser.add_argument(
+        "--output", "-o", default="./output",
+        help="Output directory (default: ./output)"
+    )
+    parser.add_argument(
+        "--analyzer", choices=["codeql", "infer"], default="codeql",
+        help="Static analyzer to use (default: codeql)"
+    )
+    parser.add_argument(
+        "--issues", "-i", nargs="+", metavar="TYPE",
+        help="Bug types to detect: leak, double-free, uaf, null, overflow (default: all)"
+    )
+    parser.add_argument(
+        "--model", default="gemini-2.5-pro",
+        help="LLM model (default: gemini-2.5-pro)"
+    )
+    parser.add_argument(
+        "--max-iterations", type=int, default=3,
+        help="Max CEGAR iterations (default: 3)"
     )
 
     args = parser.parse_args()
 
+    # Setup output and logging
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -96,35 +111,39 @@ def main():
     setup_logging("INFO", str(log_file))
     logger = logging.getLogger(__name__)
 
+    # Validate project path
     project_path = Path(args.project)
     if not project_path.exists():
         logger.error(f"Project not found: {project_path}")
         sys.exit(1)
 
-    issue_types = parse_issue_types(args.issues)
-    if issue_types:
-        logger.info(f"Detecting: {[t.name for t in issue_types]}")
+    # Parse bug types
+    bug_types = parse_bug_types(args.issues)
+    if bug_types:
+        logger.info(f"Detecting: {[t.name for t in bug_types]}")
     else:
-        logger.info("Detecting: all memory safety issues")
+        logger.info("Detecting: all memory safety bugs")
 
+    # Run pipeline
     pipeline = Pipeline(
-        api_key=args.api_key,
         model=args.model,
         analyzer_type=args.analyzer,
         max_iterations=args.max_iterations,
-        issue_types=issue_types,
-        use_merge=args.merge,
+        issue_types=bug_types,
     )
 
     result = pipeline.analyze(project_path, output_dir)
 
-    print("\n" + "=" * 50)
+    # Print summary
+    print("\n" + "=" * 60)
     print(result.summary())
-    print(f"Results saved to: {output_dir}")
-    print(f"  - memory_safety_bugs.json")
-    print(f"  - final_annotations.json")
-    print(f"  - validation_conflicts.txt")
-    print(f"  - report.md")
+    print(f"\nResults saved to: {output_dir}")
+    print(f"  - hints.json              (LLM-generated hints)")
+    print(f"  - codeql_model.yml        (CodeQL model extension)")
+    print(f"  - memory_safety_bugs.json (confirmed bugs)")
+    print(f"  - filtered_warnings.json  (Z3-filtered false positives)")
+    print(f"  - report.md               (human-readable report)")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

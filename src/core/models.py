@@ -1,92 +1,81 @@
 """Core data structures for HINT pipeline - Memory Safety Analysis.
 
-TODO: Add more issue types? But I think these are sufficient for now and a few not used yet.
+We define memory safety hints that guide static analyzers:
+- ALLOCATOR: Returns newly allocated heap memory
+- DEALLOCATOR: Frees memory at argument N
+- NULLABLE: May return NULL
+- WRITES_BUFFER: Writes to buffer argument
+- SIZE_PARAM: Parameter specifies buffer size
+
+Pipeline flow:
+1. LLM generates Hints (function semantics)
+2. Z3 validates Hints (filter impossible annotations)
+3. CodeQL + Hints scans for bugs
+4. Z3 filters spurious warnings (path feasibility)
+
+LLM's role: Annotate functions with memory safety hints
+Static Analyzer's role: Detect bugs based on these hints
+Z3's role: Validate hints and filter infeasible warnings
 """
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from typing import Optional
 
 
-class AnnotationType(Enum):
-    """Memory-related annotation types for static analysis."""
+# =============================================================================
+# Memory Safety Hint Types (LLM generates these)
+# =============================================================================
 
-    # === Allocation ===
-    ALLOC_SOURCE = auto()        # Returns newly allocated heap memory
-    REALLOC = auto()             # Reallocates memory (like realloc)
-    ARRAY_ALLOC = auto()         # Allocates array (like calloc)
+class HintType(Enum):
+    """Memory safety hints for static analysis.
 
-    # === Deallocation ===
-    FREE_SINK = auto()           # Frees memory at argument N
-    FREE_RETURN = auto()         # Frees and returns (like realloc failure path)
+    These describe FUNCTION SEMANTICS, not bugs.
+    LLM identifies these patterns in custom/wrapper functions.
 
-    # === Ownership Transfer ===
-    OWNERSHIP_TRANSFER = auto()  # Ownership transferred to callee
-    OWNERSHIP_RETURN = auto()    # Ownership transferred to caller via return
-    OWNERSHIP_ARG_OUT = auto()   # Ownership transferred via output parameter
+    Examples:
+        ALLOCATOR: my_malloc, create_buffer, pool_alloc
+        DEALLOCATOR: my_free, destroy_buffer, pool_release
+        NULLABLE: find_element, lookup_config (may return NULL)
+        WRITES_BUFFER: my_strcpy, fill_data
+        SIZE_PARAM: my_strncpy's 'n' parameter
+    """
+    # Memory management (for detecting leak/UAF/double-free)
+    ALLOCATOR = auto()        # Returns newly allocated heap memory
+    DEALLOCATOR = auto()      # Frees memory at argument N
 
-    # === Null Safety ===
-    MUST_CHECK_NULL = auto()     # Return value must be null-checked before use
-    NULLABLE_RETURN = auto()     # May return NULL
-    NONNULL_RETURN = auto()      # Never returns NULL
-    NONNULL_ARG = auto()         # Argument must not be NULL
+    # Nullability (for detecting null-deref)
+    NULLABLE = auto()         # May return NULL
 
-    # === Memory Properties ===
-    NO_ESCAPE = auto()           # Memory doesn't escape function scope
-    ESCAPE_RETURN = auto()       # Memory escapes via return value
-    ESCAPE_ARG = auto()          # Memory escapes via argument (stored elsewhere)
-
-    # === Negative Annotations (prevent false positives) ===
-    NOT_ALLOC = auto()           # Explicitly NOT an allocator
-    NOT_FREE = auto()            # Explicitly NOT a deallocator
-    STATIC_BUFFER = auto()       # Returns static/global buffer (not heap)
-    STACK_BUFFER = auto()        # Returns stack buffer (dangerous)
-    BORROWED_REF = auto()        # Returns borrowed reference (don't free)
-
-    # === Bug Detection Annotations (LLM-detected potential bugs) ===
-    POTENTIAL_LEAK = auto()      # LLM detected potential memory leak
-    USE_AFTER_FREE = auto()      # LLM detected potential use-after-free
-    DOUBLE_FREE = auto()         # LLM detected potential double-free
-    NULL_DEREF = auto()          # LLM detected potential null dereference
+    # Buffer safety (for detecting overflow)
+    WRITES_BUFFER = auto()    # Writes to buffer argument
+    SIZE_PARAM = auto()       # Parameter specifies buffer size
 
 
 class MemoryIssueType(Enum):
-    """Types of memory safety issues that can be detected."""
-
-    # Resource management
-    MEMORY_LEAK = auto()           # Allocated memory never freed
-    RESOURCE_LEAK = auto()         # File handle, socket, etc. not closed
-
-    # Use after invalidation
-    USE_AFTER_FREE = auto()        # Accessing freed memory
-    DOUBLE_FREE = auto()           # Freeing already freed memory
-    USE_AFTER_RETURN = auto()      # Using pointer to stack after return
-
-    # Null pointer
-    NULL_DEREFERENCE = auto()      # Dereferencing NULL pointer
-    POTENTIAL_NULL_DEREF = auto()  # May dereference NULL on some paths
-
-    # Uninitialized
-    UNINITIALIZED_READ = auto()    # Reading uninitialized memory
-    UNINITIALIZED_PTR = auto()     # Using uninitialized pointer
-
-    # Buffer issues
-    BUFFER_OVERFLOW = auto()       # Writing beyond buffer bounds
-    BUFFER_UNDERFLOW = auto()      # Writing before buffer start
-    STACK_OVERFLOW = auto()        # Stack buffer overflow
-    HEAP_OVERFLOW = auto()         # Heap buffer overflow
+    """Types of memory safety bugs that CodeQL detects."""
+    MEMORY_LEAK = auto()        # Allocated memory never freed
+    USE_AFTER_FREE = auto()     # Accessing freed memory
+    DOUBLE_FREE = auto()        # Freeing already freed memory
+    NULL_DEREFERENCE = auto()   # Dereferencing NULL pointer
+    BUFFER_OVERFLOW = auto()    # Writing beyond buffer bounds
 
 
-# class ConflictType(Enum):
-#     """Types of conflicts found during validation."""
-#     FALSE_ALLOC = auto()
-#     FALSE_FREE = auto()
-#     MISSING_FREE = auto()
-#     OWNERSHIP_TRANSFER = auto()
-#     PATH_INFEASIBLE = auto()
-#     STATIC_BUFFER = auto()
-#     NULL_CHECK_EXISTS = auto()
-#     BORROWED_REFERENCE = auto()
+# Mapping: Which hints help detect which bugs
+HINT_TO_BUGS = {
+    HintType.ALLOCATOR: [MemoryIssueType.MEMORY_LEAK, MemoryIssueType.USE_AFTER_FREE,
+                         MemoryIssueType.DOUBLE_FREE, MemoryIssueType.NULL_DEREFERENCE],
+    HintType.DEALLOCATOR: [MemoryIssueType.MEMORY_LEAK, MemoryIssueType.USE_AFTER_FREE,
+                           MemoryIssueType.DOUBLE_FREE],
+    HintType.NULLABLE: [MemoryIssueType.NULL_DEREFERENCE],
+    HintType.WRITES_BUFFER: [MemoryIssueType.BUFFER_OVERFLOW],
+    HintType.SIZE_PARAM: [MemoryIssueType.BUFFER_OVERFLOW],
+}
 
+
+# =============================================================================
+# Function Information (from parsing)
+# =============================================================================
 
 @dataclass
 class FunctionInfo:
@@ -100,373 +89,206 @@ class FunctionInfo:
     callers: set[str] = field(default_factory=set)
     arg_names: list[str] = field(default_factory=list)
     arg_types: list[str] = field(default_factory=list)
-    return_expressions: set[str] = field(default_factory=set)
     return_type: str = ""
+    return_expressions: set[str] = field(default_factory=set)  # Return statements in function
 
+
+# =============================================================================
+# Hints (LLM generates these)
+# =============================================================================
 
 @dataclass
-class Annotation:
-    """A memory annotation for a function."""
+class Hint:
+    """A memory safety hint for a function.
+
+    This describes function SEMANTICS, not bugs.
+    LLM generates these to help CodeQL understand custom functions.
+    """
     function_name: str
-    annotation_type: AnnotationType
-    target: str  # "return", "arg0", "arg1", variable name, etc.
-    arg_index: int = -1  # For multi-arg annotations
-    confidence: float = 1.0
+    hint_type: HintType
+    target: str = "return"    # "return", "arg0", "arg1", etc.
+    arg_index: int = -1       # For DEALLOCATOR/WRITES_BUFFER/SIZE_PARAM: which argument
     reason: str = ""
-    line_number: int = None  # For bug annotations: which line
-    condition: str = ""  # For bug annotations: under what condition
-
-    def is_bug_annotation(self) -> bool:
-        """Check if this is a bug detection annotation (vs function property)."""
-        return self.annotation_type in (
-            AnnotationType.POTENTIAL_LEAK,
-            AnnotationType.USE_AFTER_FREE,
-            AnnotationType.DOUBLE_FREE,
-            AnnotationType.NULL_DEREF,
-        )
-
-    # def to_codeql_kind(self) -> str:
-    #     """Convert to CodeQL model kind."""
-    #     mapping = {
-    #         AnnotationType.ALLOC_SOURCE: "alloc",
-    #         AnnotationType.ARRAY_ALLOC: "alloc",
-    #         AnnotationType.FREE_SINK: "free",
-    #         AnnotationType.REALLOC: "realloc",
-    #     }
-    #     return mapping.get(self.annotation_type, "")
 
 
 @dataclass
-class AnnotationSet:
-    """Collection of annotations."""
-    annotations: dict[str, list[Annotation]] = field(default_factory=dict)
+class HintSet:
+    """Collection of memory safety hints for a codebase."""
+    hints: dict[str, list[Hint]] = field(default_factory=dict)
 
-    def add(self, ann: Annotation) -> None:
-        if ann.function_name not in self.annotations:
-            self.annotations[ann.function_name] = []
+    def add(self, hint: Hint) -> None:
+        """Add a hint, avoiding duplicates."""
+        func_name = hint.function_name
+        if func_name not in self.hints:
+            self.hints[func_name] = []
         # Avoid duplicates
-        for existing in self.annotations[ann.function_name]:
-            if existing.annotation_type == ann.annotation_type and existing.target == ann.target:
+        for existing in self.hints[func_name]:
+            if existing.hint_type == hint.hint_type and existing.target == hint.target:
                 return
-        self.annotations[ann.function_name].append(ann)
+        self.hints[func_name].append(hint)
 
-    def remove(self, func_name: str, ann_type: AnnotationType) -> bool:
-        if func_name in self.annotations:
-            orig_len = len(self.annotations[func_name])
-            self.annotations[func_name] = [
-                a for a in self.annotations[func_name] if a.annotation_type != ann_type
+    def remove(self, func_name: str, hint_type: HintType) -> bool:
+        """Remove hints of a specific type from a function."""
+        if func_name in self.hints:
+            orig_len = len(self.hints[func_name])
+            self.hints[func_name] = [
+                h for h in self.hints[func_name] if h.hint_type != hint_type
             ]
-            return len(self.annotations[func_name]) < orig_len
+            return len(self.hints[func_name]) < orig_len
         return False
 
-    def get_by_type(self, ann_type: AnnotationType) -> list[tuple[str, Annotation]]:
-        """Get all annotations of a specific type."""
+    def get_by_type(self, hint_type: HintType) -> list[tuple[str, Hint]]:
+        """Get all functions with a specific hint type."""
         result = []
-        for func_name, anns in self.annotations.items():
-            for ann in anns:
-                if ann.annotation_type == ann_type:
-                    result.append((func_name, ann))
+        for func_name, hints in self.hints.items():
+            for h in hints:
+                if h.hint_type == hint_type:
+                    result.append((func_name, h))
         return result
 
-    def get_alloc_functions(self) -> list[str]:
-        """Get all allocation function names."""
-        alloc_types = {AnnotationType.ALLOC_SOURCE, AnnotationType.ARRAY_ALLOC, AnnotationType.REALLOC}
-        return list({fn for fn, ann in self.annotations.items()
-                     for a in ([ann] if isinstance(ann, Annotation) else ann)
-                     if a.annotation_type in alloc_types})
+    def get_allocators(self) -> list[str]:
+        """Get all allocator function names."""
+        return [fn for fn, _ in self.get_by_type(HintType.ALLOCATOR)]
 
-    # def get_free_functions(self) -> list[str]:
-    #     """Get all deallocation function names."""
-    #     return [fn for fn, _ in self.get_by_type(AnnotationType.FREE_SINK)]
+    def get_deallocators(self) -> list[tuple[str, int]]:
+        """Get all deallocator function names with their freed argument index."""
+        result = []
+        for fn, h in self.get_by_type(HintType.DEALLOCATOR):
+            arg_idx = h.arg_index if h.arg_index >= 0 else 0
+            result.append((fn, arg_idx))
+        return result
+
+    def get_nullable_functions(self) -> list[str]:
+        """Get all functions that may return NULL (including allocators)."""
+        nullable = set()
+        for fn, _ in self.get_by_type(HintType.NULLABLE):
+            nullable.add(fn)
+        # Allocators implicitly may return NULL
+        nullable.update(self.get_allocators())
+        return list(nullable)
+
+    def get_buffer_writers(self) -> list[tuple[str, int]]:
+        """Get functions that write to buffer with their buffer argument index."""
+        result = []
+        for fn, h in self.get_by_type(HintType.WRITES_BUFFER):
+            arg_idx = h.arg_index if h.arg_index >= 0 else 0
+            result.append((fn, arg_idx))
+        return result
+
+    def get_size_params(self) -> list[tuple[str, int]]:
+        """Get functions with size parameter and the parameter index."""
+        result = []
+        for fn, h in self.get_by_type(HintType.SIZE_PARAM):
+            arg_idx = h.arg_index if h.arg_index >= 0 else -1
+            result.append((fn, arg_idx))
+        return result
 
     def to_json(self) -> dict:
-        """Export as generic JSON format."""
-        result = {
-            "functions": {},
-            "bug_hints": []
-        }
-
-        for func_name, anns in self.annotations.items():
-            func_anns = []
-            for ann in anns:
-                if ann.is_bug_annotation():
-                    result["bug_hints"].append({
-                        "function": func_name,
-                        "type": ann.annotation_type.name,
-                        "target": ann.target,
-                        "line": ann.line_number,
-                        "confidence": ann.confidence,
-                        "reason": ann.reason,
-                    })
-                else:
-                    func_anns.append({
-                        "type": ann.annotation_type.name,
-                        "target": ann.target,
-                        "reason": ann.reason,
-                    })
-
-            if func_anns:
-                result["functions"][func_name] = func_anns
-
+        """Export as JSON format."""
+        result = {"hints": {}}
+        for func_name, hints in self.hints.items():
+            result["hints"][func_name] = [
+                {
+                    "type": h.hint_type.name,
+                    "target": h.target,
+                    "arg_index": h.arg_index,
+                    "reason": h.reason,
+                }
+                for h in hints
+            ]
         return result
+
+    @classmethod
+    def from_json(cls, data: dict) -> "HintSet":
+        """Import from JSON format."""
+        hint_set = cls()
+        for func_name, hints in data.get("hints", {}).items():
+            for h in hints:
+                hint_set.add(Hint(
+                    function_name=func_name,
+                    hint_type=HintType[h["type"]],
+                    target=h.get("target", "return"),
+                    arg_index=h.get("arg_index", -1),
+                    reason=h.get("reason", ""),
+                ))
+        return hint_set
 
     def to_codeql_model(self) -> str:
         """Export as CodeQL model extension YAML.
-        
-        Supported AnnotationType values:
-        - ALLOC_SOURCE: Allocation functions (added to summaryModel and sourceModel)
-        - ARRAY_ALLOC: Array allocation functions (added to summaryModel and sourceModel)
-        - REALLOC: Reallocation functions (added to reallocExpr)
-        - FREE_SINK: Deallocation functions (added to sinkModel)
-        - FREE_RETURN: Free and return functions (added to sinkModel)
-        - OWNERSHIP_TRANSFER: Ownership transfer to callee (added to summaryModel)
-        - OWNERSHIP_RETURN: Ownership transfer to caller via return (added to summaryModel)
-        - OWNERSHIP_ARG_OUT: Ownership transfer via output parameter (added to summaryModel)
-        - NULLABLE_RETURN: May return NULL (added to summaryModel)
-        - NONNULL_RETURN: Never returns NULL (added to summaryModel)
-        - NONNULL_ARG: Argument must not be NULL (added to summaryModel)
-        - MUST_CHECK_NULL: Return value must be null-checked (added to summaryModel)
-        - NO_ESCAPE: Memory doesn't escape function scope (added to summaryModel)
-        - ESCAPE_RETURN: Memory escapes via return value (added to summaryModel)
-        - ESCAPE_ARG: Memory escapes via argument (added to summaryModel)
-        - STATIC_BUFFER: Returns static/global buffer (added to summaryModel)
-        - STACK_BUFFER: Returns stack buffer (added to summaryModel)
-        - BORROWED_REF: Returns borrowed reference (added to summaryModel)
-        
-        Note: Bug detection annotations (POTENTIAL_LEAK, USE_AFTER_FREE, DOUBLE_FREE, NULL_DEREF)
-        and negative annotations (NOT_ALLOC, NOT_FREE) are not exported to CodeQL models.
+
+        Generates data extensions for CodeQL to recognize custom functions:
+        - ALLOCATOR -> sourceModel (allocation kind)
+        - DEALLOCATOR -> sinkModel (deallocation kind)
+        - NULLABLE -> sourceModel (nullable kind)
         """
         lines = ["extensions:"]
 
-        # Allocation functions - using summaryModel for custom allocators
-        alloc_funcs = (self.get_by_type(AnnotationType.ALLOC_SOURCE) +
-                       self.get_by_type(AnnotationType.ARRAY_ALLOC))
-        if alloc_funcs:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: summaryModel",
-                "    data:",
-            ])
-            for func_name, _ in alloc_funcs:
-                # Format: [namespace, type, subtypes, name, signature, ext, input, output, kind]
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
-
-        # Also add to sourceModel for allocation tracking
-        if alloc_funcs:
+        # Allocators -> sourceModel
+        allocators = self.get_allocators()
+        if allocators:
             lines.extend([
                 "  - addsTo:",
                 "      pack: codeql/cpp-all",
                 "      extensible: sourceModel",
                 "    data:",
             ])
-            for func_name, _ in alloc_funcs:
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "ReturnValue", "alloc", "manual"]')
+            for func_name in allocators:
+                lines.append(f'      - ["", "", false, "{func_name}", "", "", "ReturnValue", "allocation", "manual"]')
 
-        # Free functions - sinkModel
-        free_funcs = self.get_by_type(AnnotationType.FREE_SINK)
-        if free_funcs:
+        # Deallocators -> sinkModel
+        deallocators = self.get_deallocators()
+        if deallocators:
             lines.extend([
                 "  - addsTo:",
                 "      pack: codeql/cpp-all",
                 "      extensible: sinkModel",
                 "    data:",
             ])
-            for func_name, ann in free_funcs:
-                arg_idx = int(ann.target[3:]) if ann.target.startswith("arg") else 0
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "Argument[{arg_idx}]", "free", "manual"]')
+            for func_name, arg_idx in deallocators:
+                lines.append(f'      - ["", "", false, "{func_name}", "", "", "Argument[{arg_idx}]", "deallocation", "manual"]')
 
-        # Realloc functions
-        realloc_funcs = self.get_by_type(AnnotationType.REALLOC)
-        if realloc_funcs:
+        # Nullable functions -> sourceModel
+        nullable_only = [fn for fn, _ in self.get_by_type(HintType.NULLABLE)]
+        if nullable_only:
             lines.extend([
                 "  - addsTo:",
                 "      pack: codeql/cpp-all",
-                "      extensible: reallocExpr",
+                "      extensible: sourceModel",
                 "    data:",
             ])
-            for func_name, _ in realloc_funcs:
-                lines.append(f'      - ["{func_name}"]')
-
-        # Free return functions - sinkModel (frees and returns)
-        free_return_funcs = self.get_by_type(AnnotationType.FREE_RETURN)
-        if free_return_funcs:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: sinkModel",
-                "    data:",
-            ])
-            for func_name, ann in free_return_funcs:
-                arg_idx = int(ann.target[3:]) if ann.target.startswith("arg") else 0
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "Argument[{arg_idx}]", "free", "manual"]')
-
-        # Ownership transfer functions - summaryModel
-        ownership_transfer_funcs = self.get_by_type(AnnotationType.OWNERSHIP_TRANSFER)
-        if ownership_transfer_funcs:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: summaryModel",
-                "    data:",
-            ])
-            for func_name, ann in ownership_transfer_funcs:
-                arg_idx = int(ann.target[3:]) if ann.target.startswith("arg") else 0
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "Argument[{arg_idx}]", "ReturnValue", "taint"]')
-
-        # Ownership return functions - summaryModel
-        ownership_return_funcs = self.get_by_type(AnnotationType.OWNERSHIP_RETURN)
-        if ownership_return_funcs:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: summaryModel",
-                "    data:",
-            ])
-            for func_name, _ in ownership_return_funcs:
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
-
-        # Ownership arg out functions - summaryModel
-        ownership_arg_out_funcs = self.get_by_type(AnnotationType.OWNERSHIP_ARG_OUT)
-        if ownership_arg_out_funcs:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: summaryModel",
-                "    data:",
-            ])
-            for func_name, ann in ownership_arg_out_funcs:
-                arg_idx = int(ann.target[3:]) if ann.target.startswith("arg") else 0
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "Argument[{arg_idx}]", "Argument[{arg_idx}]", "taint"]')
-
-        # Nullable return functions - summaryModel
-        nullable_return_funcs = self.get_by_type(AnnotationType.NULLABLE_RETURN)
-        if nullable_return_funcs:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: summaryModel",
-                "    data:",
-            ])
-            for func_name, _ in nullable_return_funcs:
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
-
-        # Nonnull return functions - summaryModel
-        nonnull_return_funcs = self.get_by_type(AnnotationType.NONNULL_RETURN)
-        if nonnull_return_funcs:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: summaryModel",
-                "    data:",
-            ])
-            for func_name, _ in nonnull_return_funcs:
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
-
-        # Nonnull arg functions - summaryModel
-        nonnull_arg_funcs = self.get_by_type(AnnotationType.NONNULL_ARG)
-        if nonnull_arg_funcs:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: summaryModel",
-                "    data:",
-            ])
-            for func_name, ann in nonnull_arg_funcs:
-                arg_idx = int(ann.target[3:]) if ann.target.startswith("arg") else 0
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "Argument[{arg_idx}]", "Argument[{arg_idx}]", "taint"]')
-
-        # Must check null functions - summaryModel
-        must_check_null_funcs = self.get_by_type(AnnotationType.MUST_CHECK_NULL)
-        if must_check_null_funcs:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: summaryModel",
-                "    data:",
-            ])
-            for func_name, _ in must_check_null_funcs:
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
-
-        # No escape functions - summaryModel
-        no_escape_funcs = self.get_by_type(AnnotationType.NO_ESCAPE)
-        if no_escape_funcs:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: summaryModel",
-                "    data:",
-            ])
-            for func_name, _ in no_escape_funcs:
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
-
-        # Escape return functions - summaryModel
-        escape_return_funcs = self.get_by_type(AnnotationType.ESCAPE_RETURN)
-        if escape_return_funcs:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: summaryModel",
-                "    data:",
-            ])
-            for func_name, _ in escape_return_funcs:
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
-
-        # Escape arg functions - summaryModel
-        escape_arg_funcs = self.get_by_type(AnnotationType.ESCAPE_ARG)
-        if escape_arg_funcs:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: summaryModel",
-                "    data:",
-            ])
-            for func_name, ann in escape_arg_funcs:
-                arg_idx = int(ann.target[3:]) if ann.target.startswith("arg") else 0
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "Argument[{arg_idx}]", "Argument[{arg_idx}]", "taint"]')
-
-        # Static buffer functions - summaryModel (prevent false positives)
-        static_buffer_funcs = self.get_by_type(AnnotationType.STATIC_BUFFER)
-        if static_buffer_funcs:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: summaryModel",
-                "    data:",
-            ])
-            for func_name, _ in static_buffer_funcs:
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
-
-        # Stack buffer functions - summaryModel (prevent false positives)
-        stack_buffer_funcs = self.get_by_type(AnnotationType.STACK_BUFFER)
-        if stack_buffer_funcs:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: summaryModel",
-                "    data:",
-            ])
-            for func_name, _ in stack_buffer_funcs:
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
-
-        # Borrowed ref functions - summaryModel (prevent false positives)
-        borrowed_ref_funcs = self.get_by_type(AnnotationType.BORROWED_REF)
-        if borrowed_ref_funcs:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: summaryModel",
-                "    data:",
-            ])
-            for func_name, _ in borrowed_ref_funcs:
-                lines.append(f'      - ["", "", False, "{func_name}", "", "", "", "ReturnValue", "taint"]')
+            for func_name in nullable_only:
+                lines.append(f'      - ["", "", false, "{func_name}", "", "", "ReturnValue", "nullable", "manual"]')
 
         return "\n".join(lines)
 
+    def summary(self) -> str:
+        """Return a summary of hints."""
+        n_alloc = len(self.get_allocators())
+        n_dealloc = len(self.get_deallocators())
+        n_nullable = len(self.get_nullable_functions())
+        n_buf_write = len(self.get_buffer_writers())
+        n_size = len(self.get_size_params())
+
+        parts = []
+        if n_alloc: parts.append(f"{n_alloc} allocators")
+        if n_dealloc: parts.append(f"{n_dealloc} deallocators")
+        if n_nullable: parts.append(f"{n_nullable} nullable")
+        if n_buf_write: parts.append(f"{n_buf_write} buffer writers")
+        if n_size: parts.append(f"{n_size} size params")
+
+        return f"Hints: {len(self.hints)} functions ({', '.join(parts) if parts else 'none'})"
+
+    def __len__(self) -> int:
+        return len(self.hints)
+
+
+# =============================================================================
+# Analysis Results (CodeQL generates these, Z3 filters them)
+# =============================================================================
 
 @dataclass
 class Warning:
-    """A warning from static analyzer."""
+    """A warning from static analyzer (CodeQL/Infer)."""
     file_path: str
     line_number: int
     function_name: str
@@ -478,34 +300,26 @@ class Warning:
 
 
 @dataclass
-class CounterExample:
-    """Counter-example for spurious warning."""
-    warning: Warning
-    conflict_type: ConflictType
-    reason: str
-    blamed_annotation: Annotation = None
-
-
-@dataclass
 class Evidence:
-    """Evidence for confirmed bug."""
+    """Evidence for a confirmed bug (after Z3 validation)."""
     warning: Warning
-    concrete_trace: list[str]
-    leak_point: str
+    concrete_trace: list[str] = field(default_factory=list)
+    root_cause: str = ""
     suggested_fix: str = ""
+    z3_validated: bool = True
 
 
 @dataclass
 class AnalysisResult:
     """Final analysis result."""
     confirmed_bugs: list[Evidence]
-    final_annotations: AnnotationSet
-    iterations: int
-    spurious_filtered: int
+    hints: HintSet
+    iterations: int = 1
+    spurious_filtered: int = 0
 
     def bugs_by_type(self) -> dict[MemoryIssueType, list[Evidence]]:
-        """Group bugs by issue type."""
-        result = {}
+        """Group bugs by type."""
+        result: dict[MemoryIssueType, list[Evidence]] = {}
         for bug in self.confirmed_bugs:
             t = bug.warning.issue_type
             if t not in result:
@@ -514,17 +328,38 @@ class AnalysisResult:
         return result
 
     def summary(self) -> str:
+        """Return analysis summary."""
         by_type = self.bugs_by_type()
-        type_str = "\n".join(f"  - {t.name}: {len(bugs)}" for t, bugs in by_type.items())
-        if not type_str:
-            type_str = "  None"
+        type_lines = [f"  - {t.name}: {len(bugs)}" for t, bugs in by_type.items()]
+        type_str = "\n".join(type_lines) if type_lines else "  None"
 
         return f"""
 === HINT Analysis Result ===
 Total bugs: {len(self.confirmed_bugs)}
 By type:
 {type_str}
-Annotations generated: {len(self.final_annotations.annotations)}
-CEGAR iterations: {self.iterations}
+{self.hints.summary()}
+Iterations: {self.iterations}
 Spurious warnings filtered: {self.spurious_filtered}
 """
+
+
+# =============================================================================
+# Validation Results (Z3 generates these)
+# =============================================================================
+
+@dataclass
+class ValidationResult:
+    """Result of Z3 validation for a hint or warning."""
+    is_valid: bool
+    reason: str
+    counterexample: Optional[dict] = None  # Variable assignments if invalid
+
+
+@dataclass
+class PathFeasibilityResult:
+    """Result of Z3 path feasibility check for a warning."""
+    is_feasible: bool
+    reason: str
+    path_condition: Optional[str] = None
+    variable_assignments: Optional[dict] = None

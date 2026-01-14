@@ -1,443 +1,368 @@
-"""LLM client for memory safety annotation generation."""
+"""LLM-based Memory Safety Hint Generator.
+
+This module generates memory safety hints (NOT bugs) using LLM.
+Hints describe function SEMANTICS that help CodeQL understand custom functions.
+
+Hint Types:
+- ALLOCATOR: Function returns newly allocated heap memory
+- DEALLOCATOR: Function frees memory passed as argument
+- NULLABLE: Function may return NULL
+- WRITES_BUFFER: Function writes to buffer argument
+- SIZE_PARAM: Parameter specifies buffer size
+"""
 
 import json
 import logging
 import os
+import re
 import time
 
-try:
-    import vertexai
-    from vertexai.generative_models import GenerativeModel
-
-    VERTEX_AI_AVAILABLE = True
-except ImportError:  # pragma: no cover - environment may not have Vertex SDK
-    vertexai = None
-    GenerativeModel = None
-    VERTEX_AI_AVAILABLE = False
-
-from src.core.models import (
-    FunctionInfo, Annotation, AnnotationType, AnnotationSet, CounterExample
-)
+from src.core.models import FunctionInfo, Hint, HintType, HintSet
 
 logger = logging.getLogger(__name__)
 
 
-# Prompt 1: Function-level annotations (allocator/deallocator identification)
-PROMPT_FUNC_ANNOTATION = """You are a memory safety expert analyzing C/C++ code.
+# =============================================================================
+# Prompt Template for Hint Generation
+# =============================================================================
 
-Analyze this function for memory management patterns:
+HINT_GENERATION_PROMPT = """You are a memory safety expert analyzing C/C++ code.
+
+Analyze this function and identify its MEMORY SEMANTICS (not bugs):
 
 Function: {func_name}
+Return type: {return_type}
+Parameters: {parameters}
+
 ```c
 {code}
 ```
 
 {context}
 
-Identify:
-1. **Is this function an ALLOCATOR?** (returns newly allocated heap memory to caller)
-   - Direct: malloc, calloc, realloc, new
-   - Wrapper that returns allocated memory
-   - NOT an allocator if it just uses malloc internally without returning it
+Identify if this function has any of these semantics:
 
-2. **Is this function a DEALLOCATOR?** (frees memory passed as argument)
-   - Direct: free, delete
-   - Wrapper that frees its argument
+1. **ALLOCATOR**: Returns newly allocated heap memory to caller
+   - Direct allocation: calls malloc/calloc/realloc/new and returns result
+   - Wrapper: wraps another allocator function
+   - NOT allocator if: returns static buffer, struct field, or doesn't return allocated memory
 
-3. **Ownership semantics**:
-   - Does it transfer ownership to caller via return?
-   - Does it take ownership of an argument?
+2. **DEALLOCATOR**: Frees memory passed as argument
+   - Direct: calls free/delete on an argument
+   - Wrapper: wraps another deallocator function
+   - Specify which argument index (0-based) is freed
 
-4. **Null safety**:
-   - Can return NULL?
-   - Requires non-null arguments?
+3. **NULLABLE**: May return NULL
+   - Explicit: has code path that returns NULL/0/nullptr
+   - Implicit: returns result of function that may return NULL
 
-Return JSON:
+4. **WRITES_BUFFER**: Writes to a buffer argument
+   - Like strcpy, memcpy, sprintf, etc.
+   - Specify which argument is the destination buffer
+
+5. **SIZE_PARAM**: Has parameter that specifies buffer size
+   - Like strncpy's 'n' parameter
+   - Specify which parameter is the size
+
+Return JSON (only include applicable hints):
 {{
-    "is_allocator": true/false,
-    "allocation_type": "malloc"|"calloc"|"wrapper"|null,
-    "is_deallocator": true/false,
-    "freed_arg_index": 0|1|2|null,
-    "may_return_null": true/false,
-    "transfers_ownership_to_caller": true/false,
-    "reasoning": "brief explanation"
+    "hints": [
+        {{"type": "ALLOCATOR", "target": "return", "reason": "wraps malloc"}},
+        {{"type": "DEALLOCATOR", "target": "arg0", "arg_index": 0, "reason": "calls free on first arg"}},
+        {{"type": "NULLABLE", "target": "return", "reason": "returns NULL on error"}},
+        {{"type": "WRITES_BUFFER", "target": "arg0", "arg_index": 0, "reason": "copies to dest buffer"}},
+        {{"type": "SIZE_PARAM", "target": "arg2", "arg_index": 2, "reason": "specifies max bytes"}}
+    ]
 }}
+
+If no hints apply, return {{"hints": []}}
 """
 
-# Prompt 2: Bug detection (hints only, not merged with analyzer results)
-PROMPT_BUG_DETECTION = """You are a memory safety expert. Analyze this function for MEMORY BUGS:
 
-```c
-{code}
-```
+# =============================================================================
+# Known Functions (Heuristic Fallback)
+# =============================================================================
 
-Look for these specific bugs:
+KNOWN_ALLOCATORS = {
+    "malloc", "calloc", "realloc", "strdup", "strndup",
+    "aligned_alloc", "memalign", "posix_memalign",
+    "g_malloc", "g_malloc0", "g_new", "g_new0",
+    "kmalloc", "kzalloc", "vmalloc",
+    "xmalloc", "xcalloc", "xrealloc",
+}
 
-1. **MEMORY LEAK**: Allocated memory that may not be freed on some path
-2. **USE-AFTER-FREE**: Memory accessed after being freed
-3. **DOUBLE-FREE**: Memory freed more than once
-4. **NULL-DEREFERENCE**: Pointer used without null check
+KNOWN_DEALLOCATORS = {
+    "free", "cfree", "g_free", "kfree", "vfree", "xfree",
+}
 
-Return JSON:
-{{
-    "bugs": [
-        {{
-            "type": "MEMORY_LEAK"|"USE_AFTER_FREE"|"DOUBLE_FREE"|"NULL_DEREFERENCE",
-            "variable": "variable_name",
-            "alloc_line": line_number_or_null,
-            "free_line": line_number_or_null,
-            "use_line": line_number_or_null,
-            "condition": "when bug occurs",
-            "confidence": 0.0-1.0,
-            "explanation": "why this is a bug"
-        }}
-    ],
-    "is_safe": true/false
-}}
-"""
+KNOWN_BUFFER_WRITERS = {
+    "strcpy": 0, "strncpy": 0, "strcat": 0, "strncat": 0,
+    "sprintf": 0, "snprintf": 0, "vsprintf": 0, "vsnprintf": 0,
+    "memcpy": 0, "memmove": 0, "memset": 0,
+    "gets": 0, "fgets": 0, "read": 1, "recv": 1,
+}
 
-# Prompt 3: Validate annotation
-PROMPT_VALIDATE = """Verify memory annotation for function `{func_name}`:
+KNOWN_SIZE_PARAMS = {
+    "strncpy": 2, "strncat": 2, "snprintf": 1, "vsnprintf": 1,
+    "memcpy": 2, "memmove": 2, "memset": 2,
+    "fgets": 1, "read": 2, "recv": 2,
+}
 
-Annotation: {annotation_type} on {target}
-```c
-{code}
-```
 
-Check for FALSE POSITIVES:
-1. Returns field of input structure (borrowed, not new allocation)
-2. Returns static/global buffer
-3. Returns cached/pooled memory (not caller's responsibility)
-4. Memory managed by container/arena
-5. Reference counted object
-
-Return JSON:
-{{
-    "is_valid": true/false,
-    "false_positive_reason": "struct_field"|"static_buffer"|"cached"|"container"|"refcount"|null,
-    "explanation": "reason"
-}}
-"""
-
-# Prompt 3: Refine annotation based on conflict
-PROMPT_REFINE = """Refine annotation based on symbolic execution conflict:
-
-Function: {func_name}
-Current annotation: {annotation_type} on {target}
-Conflict type: {conflict_type}
-Conflict reason: {conflict_reason}
-
-```c
-{code}
-```
-
-What should happen to this annotation?
-
-Return JSON:
-{{
-    "action": "remove"|"modify"|"keep",
-    "new_annotation_type": "ALLOC_SOURCE"|"FREE_SINK"|"STATIC_BUFFER"|"BORROWED_REF"|null,
-    "new_target": "return"|"arg0"|etc|null,
-    "confidence": 0.0-1.0,
-    "explanation": "reason"
-}}
-"""
-
+# =============================================================================
+# LLM Client
+# =============================================================================
 
 class LLMClient:
-    """Gemini LLM client using service account / ADC (no API key)."""
+    """LLM client for hint generation using Vertex AI."""
 
     def __init__(
         self,
-        api_key: str = None,  # kept for compatibility; ignored
         model: str = "gemini-2.5-pro",
-        base_url: str = None,  # kept for compatibility; unused
-        project_id: str | None = None,
+        project_id: str = None,
         location: str = "us-central1",
         max_retries: int = 3,
     ):
-        """Initialize Gemini client via Vertex AI using ADC / service account.
-
-        Authentication flows:
-        - Recommended: set GOOGLE_APPLICATION_CREDENTIALS to the service account JSON.
-        - Or run under a GCP environment with default service account.
-
-        Args:
-            api_key: Ignored (present for backwards compatibility).
-            model: Gemini model name, e.g. "gemini-2.5-pro".
-            base_url: Unused for Vertex AI; kept for compatibility.
-            project_id: Optional explicit GCP project (fallback when key file missing project_id).
-            location: Vertex AI region (default us-central1).
-            max_retries: How many retries when calling Gemini.
-        """
-        self.model_name = model or "gemini-2.5-pro"
+        self.model_name = model
         self.location = location
         self.max_retries = max_retries
-        self.explicit_project = project_id or os.getenv("GOOGLE_CLOUD_PROJECT")
+        self.project_id = project_id or os.getenv("GOOGLE_CLOUD_PROJECT")
+        self._client = None
 
-        # Ensure GOOGLE_APPLICATION_CREDENTIALS is set up front for clearer error early.
-        self.credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        if not self.credentials_path:
-            raise ValueError(
-                "GOOGLE_APPLICATION_CREDENTIALS must point to a service account JSON file."
-            )
+    def _init_client(self):
+        """Initialize Vertex AI client lazily."""
+        if self._client is not None:
+            return True
+
+        try:
+            import vertexai
+            from vertexai.generative_models import GenerativeModel
+
+            credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            if not credentials_path:
+                logger.warning("GOOGLE_APPLICATION_CREDENTIALS not set")
+                return False
+
+            # Get project ID from credentials if not set
+            if not self.project_id and credentials_path:
+                try:
+                    with open(credentials_path) as f:
+                        creds = json.load(f)
+                        self.project_id = creds.get("project_id")
+                except Exception:
+                    pass
+
+            if not self.project_id:
+                logger.warning("GCP project ID not found")
+                return False
+
+            vertexai.init(project=self.project_id, location=self.location)
+            self._client = GenerativeModel(self.model_name)
+            return True
+
+        except ImportError:
+            logger.warning("google-cloud-aiplatform not installed")
+            return False
+        except Exception as e:
+            logger.warning(f"Failed to init Vertex AI: {e}")
+            return False
 
     def query(self, prompt: str) -> dict:
-        """Send query, prefer Vertex AI when service account credentials are configured."""
-        content = self._call_by_vertex_ai(prompt, response_mime="application/json")
-        if not content:
+        """Query LLM and return JSON response."""
+        if not self._init_client():
             return {}
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            logger.warning("LLM response was not valid JSON. Raw content: %s", content[:200])
-            return {}
-
-    def generate_text(self, prompt: str) -> str:
-        """Return raw text (used for code fixes)."""
-        return self._call_by_vertex_ai(prompt, response_mime="text/plain") or ""
-
-    def _call_by_vertex_ai(self, prompt: str, response_mime: str) -> str | None:
-        """Use Vertex AI SDK to call Gemini with service account credentials."""
-        if not VERTEX_AI_AVAILABLE:
-            raise ImportError(
-                "google-cloud-aiplatform is not installed. "
-                "Install it with: pip install google-cloud-aiplatform>=1.38"
-            )
-
-        if not os.path.exists(self.credentials_path):
-            raise FileNotFoundError(
-                f"Service account key file not found: {self.credentials_path}\n"
-                "Please check the path and try again."
-            )
-
-        project_id = self.explicit_project
-        if not project_id:
-            try:
-                with open(self.credentials_path, "r", encoding="utf-8") as f:
-                    creds_data = json.load(f)
-                project_id = creds_data.get("project_id")
-            except Exception as exc:  # pragma: no cover
-                raise ValueError(
-                    f"Failed to read project_id from service account file: {exc}"
-                ) from exc
-
-        if not project_id:
-            raise ValueError("GCP project_id not found. Set GOOGLE_CLOUD_PROJECT or include in key.")
-
-        # Initialize Vertex AI for every call to ensure fresh config if env changes.
-        vertexai.init(project=project_id, location=self.location)
-        model = GenerativeModel(self.model_name)
 
         for attempt in range(self.max_retries):
             try:
-                response = model.generate_content(
+                response = self._client.generate_content(
                     prompt,
-                    generation_config={
-                        "response_mime_type": response_mime,
-                    },
+                    generation_config={"response_mime_type": "application/json"}
                 )
-                return response.text
-            except Exception as exc:
-                logger.warning("Vertex AI call failed (attempt %d): %s", attempt + 1, exc)
+                return json.loads(response.text)
+            except Exception as e:
+                logger.debug(f"LLM query failed (attempt {attempt+1}): {e}")
                 if attempt < self.max_retries - 1:
                     time.sleep(1)
-        return None
+        return {}
 
 
-class AnnotationGenerator:
-    """Generate memory safety annotations using LLM.
+# =============================================================================
+# Hint Generator
+# =============================================================================
 
-    The LLM generates two types of annotations:
-    1. Function-level properties (allocator/deallocator/ownership)
-       - Used by static analyzers to understand custom memory functions
-    2. Bug detection hints (potential leaks/UAF/double-free)
-       - Logged for reference but NOT merged with analyzer results
-       - Static analyzer is the sole source of truth for bugs
+class HintGenerator:
+    """Generate memory safety hints using LLM with heuristic fallback.
+
+    The generator:
+    1. Uses heuristics for known functions (fast, reliable)
+    2. Uses LLM for unknown functions (slower, more flexible)
+    3. Combines both for comprehensive coverage
     """
 
-    def __init__(self, client: LLMClient):
-        self.client = client
+    def __init__(self, llm_client: LLMClient = None):
+        self.llm = llm_client
 
-    def generate(
-        self, func: FunctionInfo, all_funcs: dict[str, FunctionInfo], max_context: int = 8000
-    ) -> list[Annotation]:
-        """Generate all annotations for a function.
+    def generate_hints(
+        self,
+        functions: dict[str, FunctionInfo]
+    ) -> HintSet:
+        """Generate hints for all functions in codebase.
 
-        Returns both function annotations and bug hints.
-        Bug hints are marked with is_bug_annotation() = True.
+        Args:
+            functions: Dict of function name -> FunctionInfo
+
+        Returns:
+            HintSet with all generated hints
         """
-        annotations = []
+        hint_set = HintSet()
 
-        # Part 1: Function-level annotations (used by static analyzer)
-        func_anns = self._generate_func_annotations(func, all_funcs, max_context)
-        annotations.extend(func_anns)
-
-        # Part 2: Bug detection hints (for reference/logging only)
-        bug_hints = self._detect_bugs(func)
-        annotations.extend(bug_hints)
-
-        return annotations
-
-    def _generate_func_annotations(
-        self, func: FunctionInfo, all_funcs: dict[str, FunctionInfo], max_context: int
-    ) -> list[Annotation]:
-        """Generate function-level annotations (allocator/deallocator)."""
-        # Build callee context
-        context_parts = []
-        for callee in func.callees:
-            if callee in all_funcs:
-                context_parts.append(all_funcs[callee].code)
-        context = "\n\n".join(context_parts)[:max_context]
-        context_str = f"Called functions:\n```c\n{context}\n```" if context else ""
-
-        prompt = PROMPT_FUNC_ANNOTATION.format(
-            func_name=func.name, code=func.code, context=context_str
-        )
-        result = self.client.query(prompt)
-
-        annotations = []
-
-        # Allocator annotation
-        if result.get("is_allocator") and func.name not in ("main", "_main", "wmain"):
-            annotations.append(Annotation(
-                function_name=func.name,
-                annotation_type=AnnotationType.ALLOC_SOURCE,
-                target="return",
-                reason=f"allocation_type: {result.get('allocation_type')}"
-            ))
-
-        # Deallocator annotation
-        if result.get("is_deallocator"):
-            arg_idx = result.get("freed_arg_index", 0)
-            annotations.append(Annotation(
-                function_name=func.name,
-                annotation_type=AnnotationType.FREE_SINK,
-                target=f"arg{arg_idx}",
-                reason="deallocator function"
-            ))
-
-        # Null return annotation
-        if result.get("may_return_null"):
-            annotations.append(Annotation(
-                function_name=func.name,
-                annotation_type=AnnotationType.MUST_CHECK_NULL,
-                target="return",
-                reason="may return null"
-            ))
-
-        # Ownership transfer
-        if result.get("transfers_ownership_to_caller"):
-            annotations.append(Annotation(
-                function_name=func.name,
-                annotation_type=AnnotationType.OWNERSHIP_RETURN,
-                target="return",
-                reason="transfers ownership"
-            ))
-
-        return annotations
-
-    def _detect_bugs(self, func: FunctionInfo) -> list[Annotation]:
-        """Detect potential memory bugs in function.
-
-        These are hints only - NOT merged with static analyzer results.
-        The static analyzer is the sole source of truth for bugs.
-        """
-        prompt = PROMPT_BUG_DETECTION.format(code=func.code)
-        result = self.client.query(prompt)
-
-        annotations = []
-
-        bugs = result.get("bugs", [])
-        for bug in bugs:
-            bug_type = bug.get("type", "")
-            variable = bug.get("variable", "")
-            confidence = bug.get("confidence", 0.5)
-
-            # Only report high-confidence bugs
-            if confidence < 0.6:
+        for func_name, func in functions.items():
+            # Skip main and test functions
+            if func_name in ("main", "_main", "wmain") or "test" in func_name.lower():
                 continue
 
-            # Map bug type to annotation type
-            ann_type = None
-            if bug_type == "MEMORY_LEAK":
-                ann_type = AnnotationType.POTENTIAL_LEAK
-            elif bug_type == "USE_AFTER_FREE":
-                ann_type = AnnotationType.USE_AFTER_FREE
-            elif bug_type == "DOUBLE_FREE":
-                ann_type = AnnotationType.DOUBLE_FREE
-            elif bug_type == "NULL_DEREFERENCE":
-                ann_type = AnnotationType.NULL_DEREF
+            hints = self._generate_for_function(func, functions)
 
-            if ann_type:
-                annotations.append(Annotation(
+            for hint in hints:
+                hint_set.add(hint)
+
+        return hint_set
+
+    def _generate_for_function(
+        self,
+        func: FunctionInfo,
+        all_functions: dict[str, FunctionInfo],
+    ) -> list[Hint]:
+        """Generate hints for a single function."""
+        hints = []
+
+        # First, apply heuristics (fast and reliable)
+        heuristic_hints = self._heuristic_hints(func)
+        hints.extend(heuristic_hints)
+
+        # Then, optionally use LLM for additional analysis
+        if self.llm:
+            llm_hints = self._llm_hints(func, all_functions)
+            # Merge, avoiding duplicates
+            for llm_hint in llm_hints:
+                existing = next(
+                    (h for h in hints
+                     if h.hint_type == llm_hint.hint_type and h.target == llm_hint.target),
+                    None
+                )
+                if not existing:
+                    hints.append(llm_hint)
+
+        return hints
+
+    def _heuristic_hints(self, func: FunctionInfo) -> list[Hint]:
+        """Generate hints using heuristics for known patterns."""
+        hints = []
+        code_lower = func.code.lower()
+
+        # Check if function wraps known allocator
+        for alloc in KNOWN_ALLOCATORS:
+            if f"{alloc}(" in func.code and func.return_type and '*' in func.return_type:
+                # Check if it returns the allocation result
+                if f"return" in code_lower:
+                    hints.append(Hint(
+                        function_name=func.name,
+                        hint_type=HintType.ALLOCATOR,
+                        target="return",
+                        reason=f"Wraps {alloc} and returns pointer"
+                    ))
+                    # Allocators are implicitly nullable
+                    hints.append(Hint(
+                        function_name=func.name,
+                        hint_type=HintType.NULLABLE,
+                        target="return",
+                        reason="Allocator may return NULL"
+                    ))
+                    break
+
+        # Check if function wraps known deallocator
+        for dealloc in KNOWN_DEALLOCATORS:
+            for i, arg_name in enumerate(func.arg_names):
+                if f"{dealloc}({arg_name})" in func.code or f"{dealloc}( {arg_name} )" in func.code:
+                    hints.append(Hint(
+                        function_name=func.name,
+                        hint_type=HintType.DEALLOCATOR,
+                        target=f"arg{i}",
+                        arg_index=i,
+                        reason=f"Calls {dealloc} on argument {arg_name}"
+                    ))
+                    break
+
+        # Check for NULL return
+        if func.return_type and '*' in func.return_type:
+            if re.search(r'return\s+(NULL|0|nullptr)\s*;', func.code):
+                hints.append(Hint(
                     function_name=func.name,
-                    annotation_type=ann_type,
-                    target=variable,
-                    reason=bug.get("explanation", ""),
-                    line_number=bug.get("use_line") or bug.get("free_line") or bug.get("alloc_line"),
-                    confidence=confidence,
-                    condition=bug.get("condition", "")
+                    hint_type=HintType.NULLABLE,
+                    target="return",
+                    reason="Explicitly returns NULL"
                 ))
 
-        return annotations
+        # Check for known buffer writers
+        for writer, buf_idx in KNOWN_BUFFER_WRITERS.items():
+            if f"{writer}(" in func.code:
+                hints.append(Hint(
+                    function_name=func.name,
+                    hint_type=HintType.WRITES_BUFFER,
+                    target=f"arg{buf_idx}",
+                    arg_index=buf_idx,
+                    reason=f"Calls buffer writer {writer}"
+                ))
 
-    def validate(
-        self, func: FunctionInfo, ann: Annotation
-    ) -> tuple[bool, str]:
-        """Validate an annotation."""
-        prompt = PROMPT_VALIDATE.format(
-            func_name=func.name,
-            annotation_type=ann.annotation_type.name,
-            target=ann.target,
-            code=func.code
-        )
-        result = self.client.query(prompt)
-        return result.get("is_valid", True), result.get("explanation", "")
+        return hints
 
-    def refine(self, ann: Annotation, func: FunctionInfo, cex: CounterExample) -> tuple[str, AnnotationType, str]:
-        """Refine annotation based on counter-example. Returns (action, new_type, new_target)."""
-        prompt = PROMPT_REFINE.format(
+    def _llm_hints(
+        self,
+        func: FunctionInfo,
+        all_functions: dict[str, FunctionInfo],
+    ) -> list[Hint]:
+        """Generate hints using LLM."""
+        if not self.llm:
+            return []
+
+        # Build context from callees
+        context_parts = []
+        for callee in list(func.callees)[:5]:  # Limit context size
+            if callee in all_functions:
+                callee_code = all_functions[callee].code
+                if len(callee_code) < 500:  # Only include small functions
+                    context_parts.append(f"// Called function:\n{callee_code}")
+        context = "\n\n".join(context_parts) if context_parts else ""
+        context_str = f"Context (called functions):\n{context}" if context else ""
+
+        # Format parameters
+        params = list(zip(func.arg_types, func.arg_names))
+        params_str = ", ".join(f"{t} {n}" for t, n in params) if params else "void"
+
+        prompt = HINT_GENERATION_PROMPT.format(
             func_name=func.name,
-            annotation_type=ann.annotation_type.name,
-            target=ann.target,
-            conflict_type=cex.conflict_type.name,
-            conflict_reason=cex.reason,
+            return_type=func.return_type or "void",
+            parameters=params_str,
             code=func.code,
+            context=context_str,
         )
-        result = self.client.query(prompt)
 
-        action = result.get("action", "keep")
-        new_type_str = result.get("new_annotation_type")
-        new_type = None
-        if new_type_str:
+        result = self.llm.query(prompt)
+        hints = []
+
+        for h in result.get("hints", []):
+            hint_type_str = h.get("type", "")
             try:
-                new_type = AnnotationType[new_type_str]
+                hint_type = HintType[hint_type_str]
             except KeyError:
-                pass
-        new_target = result.get("new_target", ann.target)
+                continue
 
-        return action, new_type, new_target
+            hints.append(Hint(
+                function_name=func.name,
+                hint_type=hint_type,
+                target=h.get("target", "return"),
+                arg_index=h.get("arg_index", -1),
+                reason=h.get("reason", "LLM analysis"),
+            ))
 
-    def analyze_issue(self, code: str, issue_type: str, location: str, message: str) -> dict:
-        """Analyze a potential memory safety issue."""
-        prompt = f"""Analyze this code for a potential {issue_type} bug:
-
-```c
-{code}
-```
-
-Warning location: {location}
-Message: {message}
-
-Is this a real bug or false positive?
-
-Return JSON:
-{{
-    "is_real_bug": true/false,
-    "confidence": 0.0-1.0,
-    "explanation": "analysis",
-    "suggested_fix": "how to fix"
-}}
-"""
-        return self.client.query(prompt)
+        return hints

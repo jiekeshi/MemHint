@@ -1,4 +1,17 @@
-"""Static analyzer adapters for CodeQL and Facebook Infer."""
+"""Static analyzer adapters for CodeQL and Facebook Infer.
+
+关键理解：
+- DoubleFree.ql, UseAfterFree.ql 使用 DeallocationExpr 来识别 free 操作
+- DeallocationExpr 是通过 DeallocationFunction 派生的
+- 如果 FunctionCall.getTarget() instanceof DeallocationFunction，那这个 call 就是 DeallocationExpr
+- 所以扩展 DeallocationFunction 就能让这些 queries 识别自定义 deallocators
+
+- MemoryNeverFreed.ql, MemoryMayNotBeFreed.ql 使用 AllocationExpr
+- AllocationExpr 是通过 AllocationFunction 派生的
+- 扩展 AllocationFunction 就能让这些 queries 识别自定义 allocators
+
+- MissingNullTest.ql 检查 null 返回值，可能需要不同的机制
+"""
 
 import json
 import logging
@@ -8,37 +21,42 @@ import shutil
 from pathlib import Path
 from shutil import which
 
-from src.core.models import Warning, AnnotationSet, MemoryIssueType, AnnotationType
+from src.core.models import Warning, HintSet, MemoryIssueType
+
 
 logger = logging.getLogger(__name__)
 
 CODEQL_ISSUE_MAP = {
+    # Memory leak queries
     "memory-never-freed": MemoryIssueType.MEMORY_LEAK,
     "memory-may-not-be-freed": MemoryIssueType.MEMORY_LEAK,
+    "cpp/memory-never-freed": MemoryIssueType.MEMORY_LEAK,
+    "cpp/memory-may-not-be-freed": MemoryIssueType.MEMORY_LEAK,
+    # Double free
     "double-free": MemoryIssueType.DOUBLE_FREE,
+    "cpp/double-free": MemoryIssueType.DOUBLE_FREE,
+    # Use after free
     "use-after-free": MemoryIssueType.USE_AFTER_FREE,
+    "cpp/use-after-free": MemoryIssueType.USE_AFTER_FREE,
+    # Null dereference
     "null-dereference": MemoryIssueType.NULL_DEREFERENCE,
-    "hint-memory": MemoryIssueType.MEMORY_LEAK,
+    "missing-null-test": MemoryIssueType.NULL_DEREFERENCE,
+    "cpp/missing-null-test": MemoryIssueType.NULL_DEREFERENCE,
 }
 
 
 class CodeQLAnalyzer:
-    """CodeQL analyzer with C/C++ model extension support.
-
-    This analyzer uses CodeQL's model extension mechanism to define custom
-    allocation and deallocation functions, then runs the built-in memory
-    leak detection queries (MemoryNeverFreed.ql and MemoryMayNotBeFreed.ql).
-    """
+    """CodeQL analyzer with C/C++ model extension support."""
 
     def __init__(self, binary: str = "codeql", timeout: int = 600):
         self.binary = binary
         self.timeout = timeout
 
     def analyze(
-        self, project_path: Path, annotations: AnnotationSet = None,
+        self, project_path: Path, hints: HintSet = None,
         issue_types: list[MemoryIssueType] = None
     ) -> list[Warning]:
-        """Run CodeQL analysis with model extensions for custom allocators/deallocators."""
+        """Run CodeQL analysis with model extensions."""
         output_dir = Path(tempfile.mkdtemp())
         db_path = output_dir / "codeql-db"
         results_path = output_dir / "results.sarif"
@@ -51,21 +69,22 @@ class CodeQLAnalyzer:
                 logger.error("Failed to create database")
                 return []
 
-            # Step 2: Generate model pack with custom allocator/deallocator models
-            if annotations and len(annotations.annotations) > 0:
-                logger.info("Step 2: Generating model pack with custom models...")
-                self._setup_model_pack(model_pack_dir, annotations)
+            # Step 2: Generate library pack with custom models
+            has_custom_models = False
+            if hints and len(hints.hints) > 0:
+                logger.info("Step 2: Generating model pack...")
+                has_custom_models = self._setup_model_pack(model_pack_dir, hints)
 
-                # Step 3: Run built-in memory queries with model pack
-                logger.info("Step 3: Running memory leak queries with custom models...")
-                if self._run_memory_queries_with_models(db_path, model_pack_dir, results_path):
-                    return self._parse_sarif(results_path)
+            # Step 3: Run queries
+            if has_custom_models:
+                logger.info("Step 3: Running queries with custom models...")
+                success = self._run_memory_queries_with_models(db_path, model_pack_dir, results_path)
+            else:
+                logger.info("Step 3: Running queries without custom models...")
+                success = self._run_memory_queries(db_path, results_path)
 
-            # Fallback: Run built-in queries without custom models
-            logger.info("Running built-in memory queries (no custom models)...")
-            if self._run_memory_queries(db_path, results_path):
+            if success:
                 return self._parse_sarif(results_path)
-
             return []
 
         except Exception as e:
@@ -74,7 +93,6 @@ class CodeQLAnalyzer:
             traceback.print_exc()
             return []
         finally:
-            # Cleanup
             if output_dir.exists():
                 shutil.rmtree(output_dir, ignore_errors=True)
 
@@ -82,10 +100,9 @@ class CodeQLAnalyzer:
         """Create CodeQL database."""
         logger.info(f"Project: {project_path}")
 
-        # Check for compile_commands.json first (preferred method)
         compile_commands = project_path / "compile_commands.json"
         if compile_commands.exists():
-            logger.info("Using compile_commands.json for database creation")
+            logger.info("Using compile_commands.json")
             cmd = [
                 self.binary, "database", "create",
                 str(db_path),
@@ -95,14 +112,12 @@ class CodeQLAnalyzer:
                 f"--compilation-database={compile_commands}",
             ]
         else:
-            # Determine build command
             build_cmd = self._get_build_command(project_path)
             if not build_cmd:
                 logger.error("Could not determine build command")
                 return False
 
             logger.info(f"Build command: {build_cmd}")
-
             cmd = [
                 self.binary, "database", "create",
                 str(db_path),
@@ -124,134 +139,67 @@ class CodeQLAnalyzer:
         return True
 
     def _get_build_command(self, project_path: Path) -> str:
-        """Determine appropriate build command for project.
+        """Determine appropriate build command."""
+        if (project_path / "Makefile").exists() and which("make"):
+            return "make"
 
-        When analyzing original project (not merged), try to detect build system.
-        When analyzing merged file, use direct compilation.
-        """
-        # Check for Makefile
-        if (project_path / "Makefile").exists():
-            if which("make") is None:
-                logger.warning("Makefile found but 'make' command not available, skipping make detection")
-            else:
-                return "make"
-
-        # Check for CMakeLists.txt in lint subdirectory (following README pattern)
         lint_dir = project_path / "lint"
-        if lint_dir.exists() and (lint_dir / "CMakeLists.txt").exists():
-            # Check if cmake is available before trying to use it
-            if which("cmake") is None:
-                logger.warning("CMakeLists.txt found in lint/ but 'cmake' command not available, skipping CMake detection")
-            else:
-                build_dir = lint_dir / "build"
-                if build_dir.exists():
-                    # Try using existing build directory
-                    if (build_dir / "Makefile").exists():
-                        return "make -C lint/build"
-                else:
-                    build_dir.mkdir(parents=True)
-                    # Try configuring from lint/build directory
-                    result = subprocess.run(
-                        ["cmake", ".."], cwd=str(build_dir), capture_output=True, timeout=120
-                    )
-                    if result.returncode == 0:
-                        return "make -C lint/build"
+        if lint_dir.exists() and (lint_dir / "CMakeLists.txt").exists() and which("cmake"):
+            build_dir = lint_dir / "build"
+            build_dir.mkdir(parents=True, exist_ok=True)
+            if not (build_dir / "Makefile").exists():
+                subprocess.run(["cmake", ".."], cwd=str(build_dir), capture_output=True, timeout=120)
+            if (build_dir / "Makefile").exists():
+                return "make -C lint/build"
 
-        # Check for CMakeLists.txt in project root
-        if (project_path / "CMakeLists.txt").exists():
-            # Check if cmake is available before trying to use it
-            if which("cmake") is None:
-                logger.warning("CMakeLists.txt found but 'cmake' command not available, skipping CMake detection")
-            else:
-                build_dir = project_path / "build"
-                if build_dir.exists():
-                    # Try using existing build directory
-                    if (build_dir / "Makefile").exists():
-                        return "make -C build"
-                else:
-                    build_dir.mkdir()
-                    # Try configuring
-                    result = subprocess.run(
-                        ["cmake", ".."], cwd=str(build_dir), capture_output=True, timeout=120
-                    )
-                    if result.returncode == 0:
-                        return "make -C build"
+        if (project_path / "CMakeLists.txt").exists() and which("cmake"):
+            build_dir = project_path / "build"
+            build_dir.mkdir(exist_ok=True)
+            if not (build_dir / "Makefile").exists():
+                subprocess.run(["cmake", ".."], cwd=str(build_dir), capture_output=True, timeout=120)
+            if (build_dir / "Makefile").exists():
+                return "make -C build"
 
-                # Try in-source build
-                result = subprocess.run(
-                    ["cmake", "."], cwd=str(project_path), capture_output=True, timeout=120
-                )
-                if result.returncode == 0:
-                    return "make"
-
-        # Fallback: Direct compilation (for merged files or simple projects)
-        # Note: compile_commands.json is handled separately in _create_database()
         c_files = list(project_path.rglob("*.c"))
         cpp_files = list(project_path.rglob("*.cpp"))
-
         if c_files or cpp_files:
             files = [str(f.relative_to(project_path)) for f in (c_files + cpp_files)[:30]]
-            # Determine compiler based on file types
-            if cpp_files and not c_files:
-                compiler = "clang++"
-            elif c_files and not cpp_files:
-                compiler = "clang"
-            else:
-                compiler = "clang++"  # Default to clang++ for mixed C/C++
+            compiler = "clang++" if cpp_files else "clang"
             return f"{compiler} -I. -c -fsyntax-only {' '.join(files)}"
 
         return None
 
-    def _setup_model_pack(self, model_pack_dir: Path, annotations: AnnotationSet) -> None:
-        """Create a CodeQL model pack with custom allocation/deallocation/nullable models.
+    def _setup_model_pack(self, model_pack_dir: Path, hints: HintSet) -> bool:
+        """Create a CodeQL library pack with custom allocation/deallocation models.
 
-        This creates a library pack that extends AllocationFunction, DeallocationFunction,
-        and adds nullable function models to recognize custom functions from annotations.
+        Returns True if models were created successfully.
         """
         model_pack_dir.mkdir(parents=True, exist_ok=True)
 
-        # Collect function annotations
-        alloc_funcs = []
-        free_funcs = []
-        nullable_funcs = []  # Functions that may return NULL
+        # Collect function hints
+        alloc_funcs = [f for f in hints.get_allocators() if f not in ("main", "_main")]
+        free_funcs = [fn for fn, _ in hints.get_deallocators()]
+        nullable_funcs = hints.get_nullable_functions()
 
-        for func_name, anns in annotations.annotations.items():
-            for ann in anns:
-                if ann.annotation_type in (AnnotationType.ALLOC_SOURCE, AnnotationType.ARRAY_ALLOC,):
-                    if func_name not in ("main", "_main") and func_name not in alloc_funcs:
-                        alloc_funcs.append(func_name)
-                        # Allocators can return NULL, so they're also nullable
-                        if func_name not in nullable_funcs:
-                            nullable_funcs.append(func_name)
-                elif ann.annotation_type == AnnotationType.FREE_SINK:
-                    if func_name not in free_funcs:
-                        free_funcs.append(func_name)
-                elif ann.annotation_type in (AnnotationType.NULLABLE_RETURN, AnnotationType.MUST_CHECK_NULL, AnnotationType.OWNERSHIP_RETURN):
-                    if func_name not in nullable_funcs:
-                        nullable_funcs.append(func_name)
+        logger.info(f"Allocators ({len(alloc_funcs)}): {alloc_funcs[:10]}...")
+        logger.info(f"Deallocators ({len(free_funcs)}): {free_funcs[:10]}...")
+        logger.info(f"Nullable ({len(nullable_funcs)}): {nullable_funcs[:10]}...")
 
-        # Create qlpack.yml for the model pack
+        if not alloc_funcs and not free_funcs:
+            logger.warning("No custom allocators or deallocators found")
+            return False
+
+        # Create qlpack.yml - LIBRARY pack that extends codeql/cpp-all
         qlpack_content = """name: hint/memory-models
 version: 0.0.1
 library: true
-dependencies:
+extensionTargets:
   codeql/cpp-all: "*"
-dataExtensions:
-  - models/**/*.yml
 """
         (model_pack_dir / "qlpack.yml").write_text(qlpack_content)
 
-        # Create models directory
-        models_dir = model_pack_dir / "models"
-        models_dir.mkdir(exist_ok=True)
-
-        # Generate the model extension YAML file
-        # Note: For memory leak queries, we need to extend AllocationFunction and DeallocationFunction
-        # This is done via a library (.qll) file that gets imported by the queries
-        self._generate_model_extension_library(model_pack_dir, alloc_funcs, free_funcs, nullable_funcs)
-
-        # Also generate a data extension file for dataflow models (if needed by some queries)
-        self._generate_data_extension(models_dir, alloc_funcs, free_funcs, nullable_funcs)
+        # Generate the .qll file
+        self._generate_model_library(model_pack_dir, alloc_funcs, free_funcs, nullable_funcs)
 
         # Install dependencies
         logger.info("Installing model pack dependencies...")
@@ -259,32 +207,71 @@ dataExtensions:
             [self.binary, "pack", "install", str(model_pack_dir)],
             capture_output=True, timeout=300
         )
+
+        stdout = result.stdout.decode()
+        stderr = result.stderr.decode()
+
         if result.returncode != 0:
-            logger.warning(f"Pack install warning: {result.stderr.decode()[:500]}")
+            logger.error(f"Pack install failed!")
+            logger.error(f"stdout: {stdout}")
+            logger.error(f"stderr: {stderr}")
+            return False
 
-        logger.info(f"Model pack created with {len(alloc_funcs)} allocators, {len(free_funcs)} deallocators, {len(nullable_funcs)} nullable functions")
+        logger.info(f"Pack install successful")
+        logger.debug(f"stdout: {stdout}")
 
-    def _generate_model_extension_library(
-        self, model_pack_dir: Path, alloc_funcs: list[str], free_funcs: list[str], nullable_funcs: list[str] = None
+        return True
+
+    def _generate_model_library(
+        self, model_pack_dir: Path,
+        alloc_funcs: list[str],
+        free_funcs: list[str],
+        nullable_funcs: list[str] = None
     ) -> None:
-        """Generate a CodeQL library (.qll) file that extends AllocationFunction, DeallocationFunction,
-        and models nullable functions.
+        """Generate CodeQL library extending AllocationFunction and DeallocationFunction.
 
-        This allows the built-in MemoryNeverFreed.ql, MemoryMayNotBeFreed.ql, and MissingNullTest.ql queries
-        to recognize our custom allocators, deallocators, and nullable functions.
+        Key insight:
+        - Queries like DoubleFree.ql check: fc instanceof DeallocationExpr
+        - DeallocationExpr is satisfied when fc.getTarget() instanceof DeallocationFunction
+        - So extending DeallocationFunction makes our custom deallocators recognized
+
+        Same logic applies to AllocationFunction -> AllocationExpr for memory leak queries.
+
+        For MissingNullTest.ql:
+        - It checks AllocationExpr and verifies null check before dereference
+        - Since AllocationExpr is derived from AllocationFunction, our custom allocators
+          will also be checked for missing null tests
+        - The predicate requiresDealloc() indicates memory that could fail (return NULL)
         """
         if nullable_funcs is None:
             nullable_funcs = []
 
-        # Generate the list of function names for CodeQL
-        alloc_names = ", ".join(f'"{f}"' for f in alloc_funcs) if alloc_funcs else '"__hint_no_custom_alloc__"'
-        free_names = ", ".join(f'"{f}"' for f in free_funcs) if free_funcs else '"__hint_no_custom_free__"'
-        nullable_names = ", ".join(f'"{f}"' for f in nullable_funcs) if nullable_funcs else '"__hint_no_custom_nullable__"'
+        # Build the function name lists for CodeQL IN clause
+        # Need at least one item to avoid syntax error
+        if alloc_funcs:
+            alloc_names = ", ".join(f'"{f}"' for f in alloc_funcs)
+        else:
+            alloc_names = '"__no_custom_allocator__"'
 
+        if free_funcs:
+            free_names = ", ".join(f'"{f}"' for f in free_funcs)
+        else:
+            free_names = '"__no_custom_deallocator__"'
+
+        # Generate .qll content
         qll_content = f'''/**
- * @name HINT Custom Memory Models
- * @description Extends CodeQL's built-in allocation, deallocation, and nullable models
- *              with custom functions identified by LLM annotations.
+ * HINT Custom Memory Models
+ *
+ * Extends CodeQL's built-in AllocationFunction and DeallocationFunction
+ * with custom functions identified by LLM annotations.
+ *
+ * This enables built-in queries like:
+ * - MemoryNeverFreed.ql (uses AllocationExpr)
+ * - MemoryMayNotBeFreed.ql (uses AllocationExpr)
+ * - DoubleFree.ql (uses DeallocationExpr)
+ * - UseAfterFree.ql (uses DeallocationExpr)
+ * - MissingNullTest.ql (uses AllocationExpr - checks null before dereference)
+ * to recognize our custom allocators and deallocators.
  */
 
 import cpp
@@ -292,194 +279,100 @@ private import semmle.code.cpp.models.interfaces.Allocation
 private import semmle.code.cpp.models.interfaces.Deallocation
 
 /**
- * Custom allocation functions identified by HINT/LLM annotations.
- * These functions allocate memory that must be freed.
+ * Custom allocation functions from LLM annotations.
+ *
+ * When a FunctionCall's target is HintAllocationFunction,
+ * the call becomes an AllocationExpr, which:
+ * - Memory leak queries detect (MemoryNeverFreed, MemoryMayNotBeFreed)
+ * - MissingNullTest detects (checks if return value is null-checked before use)
  */
 class HintAllocationFunction extends AllocationFunction {{
   HintAllocationFunction() {{
     this.getName() in [{alloc_names}]
   }}
 
+  // This allocation requires deallocation - memory must be freed
   override predicate requiresDealloc() {{ any() }}
 }}
 
 /**
- * Custom deallocation functions identified by HINT/LLM annotations.
- * These functions free memory allocated by allocation functions.
+ * Custom deallocation functions from LLM annotations.
+ *
+ * When a FunctionCall's target is HintDeallocationFunction,
+ * the call becomes a DeallocationExpr, which double-free
+ * and use-after-free queries detect.
  */
 class HintDeallocationFunction extends DeallocationFunction {{
   HintDeallocationFunction() {{
     this.getName() in [{free_names}]
   }}
 
+  // The first argument (index 0) is the pointer being freed
   override int getFreedArg() {{ result = 0 }}
 }}
-
-/**
- * Custom nullable functions identified by HINT/LLM annotations.
- * These functions may return NULL and their return values should be checked.
- * Used by MissingNullTest.ql to detect missing null checks.
- */
-class HintNullableFunction extends Function {{
-  HintNullableFunction() {{
-    this.getName() in [{nullable_names}]
-  }}
-
-  /** Holds if the return value of this function may be NULL. */
-  predicate mayReturnNull() {{ any() }}
-}}
-
-/**
- * Predicate to identify calls to nullable functions.
- * This can be used by queries to find unchecked return values.
- */
-predicate isNullableFunctionCall(FunctionCall call) {{
-  call.getTarget() instanceof HintNullableFunction
-  or
-  call.getTarget() instanceof HintAllocationFunction
-  or
-  // Standard library functions that may return NULL
-  call.getTarget().getName() in [
-    "malloc", "calloc", "realloc", "aligned_alloc", "memalign",
-    "fopen", "fgets", "gets", "getenv", "bsearch",
-    "strchr", "strrchr", "strstr", "strpbrk", "memchr",
-    "tmpfile", "freopen", "strdup", "strndup"
-  ]
-}}
 '''
-        (model_pack_dir / "HintMemoryModels.qll").write_text(qll_content)
-        logger.info(f"Generated HintMemoryModels.qll with {len(alloc_funcs)} allocators, {len(free_funcs)} deallocators, {len(nullable_funcs)} nullable functions")
+        qll_path = model_pack_dir / "HintMemoryModels.qll"
+        qll_path.write_text(qll_content)
+        logger.info(f"Generated: {qll_path}")
 
-    def _generate_data_extension(
-        self, models_dir: Path, alloc_funcs: list[str], free_funcs: list[str], nullable_funcs: list[str] = None
-    ) -> None:
-        """Generate data extension YAML for dataflow models.
-
-        This provides additional dataflow information that some queries may use.
-        """
-        if nullable_funcs is None:
-            nullable_funcs = []
-
-        extensions = []
-
-        # Model allocators as sources (return value is a fresh allocation)
-        if alloc_funcs:
-            source_data = []
-            for func in alloc_funcs:
-                # Format: [namespace, type, subtypes, name, signature, ext, output, kind, provenance]
-                source_data.append(["", "", False, func, "", "", "ReturnValue", "allocation", "manual"])
-
-            extensions.append({
-                "addsTo": {
-                    "pack": "codeql/cpp-all",
-                    "extensible": "sourceModel"
-                },
-                "data": source_data
-            })
-
-        # Model deallocators as sinks (argument is freed)
-        if free_funcs:
-            sink_data = []
-            for func in free_funcs:
-                # Format: [namespace, type, subtypes, name, signature, ext, input, kind, provenance]
-                sink_data.append(["", "", False, func, "", "", "Argument[0]", "deallocation", "manual"])
-
-            extensions.append({
-                "addsTo": {
-                    "pack": "codeql/cpp-all",
-                    "extensible": "sinkModel"
-                },
-                "data": sink_data
-            })
-
-        # Model nullable functions as sources that may produce NULL
-        # This helps queries like MissingNullTest detect unchecked return values
-        if nullable_funcs:
-            nullable_source_data = []
-            for func in nullable_funcs:
-                # Format: [namespace, type, subtypes, name, signature, ext, output, kind, provenance]
-                # Using "local" kind to mark these as potential sources of null values
-                nullable_source_data.append(["", "", False, func, "", "", "ReturnValue", "nullable", "manual"])
-
-            extensions.append({
-                "addsTo": {
-                    "pack": "codeql/cpp-all",
-                    "extensible": "sourceModel"
-                },
-                "data": nullable_source_data
-            })
-
-        if extensions:
-            import yaml
-            yaml_content = {"extensions": extensions}
-            (models_dir / "hint-memory-models.model.yml").write_text(
-                yaml.dump(yaml_content, default_flow_style=False, sort_keys=False)
-            )
-            logger.info(f"Generated hint-memory-models.model.yml with {len(alloc_funcs)} allocators, {len(free_funcs)} deallocators, {len(nullable_funcs)} nullable functions")
+        # Log the content for debugging
+        logger.debug(f"QLL content:\n{qll_content}")
 
     def _run_memory_queries_with_models(
         self, db_path: Path, model_pack_dir: Path, results_path: Path
     ) -> bool:
-        """Run built-in memory leak queries with custom model pack."""
-        # The memory queries we want to run - correct path format: pack:path
+        """Run built-in memory queries with custom model pack."""
         memory_queries = [
             "codeql/cpp-queries:Critical/MemoryNeverFreed.ql",
             "codeql/cpp-queries:Critical/MemoryMayNotBeFreed.ql",
             "codeql/cpp-queries:Critical/DoubleFree.ql",
             "codeql/cpp-queries:Critical/UseAfterFree.ql",
             "codeql/cpp-queries:Critical/MissingNullTest.ql",
+            "codeql/cpp-queries:Critical/OverflowCalculated.ql",
+            "codeql/cpp-queries:Critical/OverflowDestination.ql",
+            "codeql/cpp-queries:Critical/OverflowStatic.ql",
         ]
 
         cmd = [
             self.binary, "database", "analyze",
             str(db_path),
-            "--format=sarif-latest",
-            f"--output={results_path}",
-            f"--additional-packs={model_pack_dir}",
-            "--download",  # Auto-download missing packs
-        ] + memory_queries
-
-        logger.info(f"Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, timeout=self.timeout, capture_output=True)
-
-        if result.returncode != 0:
-            logger.warning(f"Memory queries with models failed: {result.stderr.decode()[:500]}")
-            # Try alternative approach: run query suite
-            return self._run_memory_suite_with_models(db_path, model_pack_dir, results_path)
-
-        return True
-
-    def _run_memory_suite_with_models(
-        self, db_path: Path, model_pack_dir: Path, results_path: Path
-    ) -> bool:
-        """Alternative: Run security-and-quality suite which includes memory queries."""
-        cmd = [
-            self.binary, "database", "analyze",
-            str(db_path),
-            "codeql/cpp-queries:codeql-suites/cpp-security-and-quality.qls",
             "--format=sarif-latest",
             f"--output={results_path}",
             f"--additional-packs={model_pack_dir}",
             "--download",
-        ]
+        ] + memory_queries
 
-        logger.info(f"Running suite: {' '.join(cmd)}")
+        logger.info(f"Running CodeQL analyze...")
+        logger.debug(f"Command: {' '.join(cmd)}")
+
         result = subprocess.run(cmd, timeout=self.timeout, capture_output=True)
 
+        stdout = result.stdout.decode()
+        stderr = result.stderr.decode()
+
+        logger.info(f"CodeQL analyze return code: {result.returncode}")
+        if stdout:
+            logger.debug(f"stdout:\n{stdout[:2000]}")
+        if stderr:
+            logger.info(f"stderr:\n{stderr[:2000]}")
+
         if result.returncode != 0:
-            logger.warning(f"Suite failed: {result.stderr.decode()[:500]}")
-            return False
-        return True
+            logger.warning("Query execution returned non-zero, trying fallback...")
+            return self._run_memory_queries(db_path, results_path)
+
+        return results_path.exists()
 
     def _run_memory_queries(self, db_path: Path, results_path: Path) -> bool:
-        """Run built-in memory leak queries without custom models."""
-        # Try running specific memory queries first - correct path format
+        """Run built-in memory queries without custom models."""
         memory_queries = [
             "codeql/cpp-queries:Critical/MemoryNeverFreed.ql",
             "codeql/cpp-queries:Critical/MemoryMayNotBeFreed.ql",
             "codeql/cpp-queries:Critical/DoubleFree.ql",
             "codeql/cpp-queries:Critical/UseAfterFree.ql",
             "codeql/cpp-queries:Critical/MissingNullTest.ql",
+            "codeql/cpp-queries:Critical/OverflowCalculated.ql",
+            "codeql/cpp-queries:Critical/OverflowDestination.ql",
+            "codeql/cpp-queries:Critical/OverflowStatic.ql",
         ]
 
         cmd = [
@@ -490,33 +383,18 @@ predicate isNullableFunctionCall(FunctionCall call) {{
             "--download",
         ] + memory_queries
 
-        logger.info(f"Running: {' '.join(cmd)}")
+        logger.info(f"Running CodeQL analyze (no custom models)...")
         result = subprocess.run(cmd, timeout=self.timeout, capture_output=True)
 
         if result.returncode != 0:
-            logger.warning(f"Specific memory queries failed, trying suite...")
-            # Fallback to built-in suite
-            return self._run_builtin(db_path, results_path)
+            logger.warning(f"Queries failed: {result.stderr.decode()[:500]}")
 
-        return True
-
-    def _run_builtin(self, db_path: Path, results_path: Path) -> bool:
-        """Run built-in query suite."""
-        cmd = [
-            self.binary, "database", "analyze",
-            str(db_path),
-            "codeql/cpp-queries:codeql-suites/cpp-security-and-quality.qls",
-            "--format=sarif-latest",
-            f"--output={results_path}",
-            "--download",
-        ]
-
-        result = subprocess.run(cmd, timeout=self.timeout, capture_output=True)
-        return result.returncode == 0
+        return results_path.exists()
 
     def _parse_sarif(self, sarif_path: Path) -> list[Warning]:
         """Parse SARIF results."""
         if not sarif_path.exists():
+            logger.warning(f"SARIF not found: {sarif_path}")
             return []
 
         warnings = []
@@ -527,7 +405,6 @@ predicate isNullableFunctionCall(FunctionCall call) {{
                 for result in run.get("results", []):
                     rule_id = result.get("ruleId", "").lower()
 
-                    # Determine issue type
                     issue_type = MemoryIssueType.MEMORY_LEAK
                     for key, val in CODEQL_ISSUE_MAP.items():
                         if key in rule_id:
@@ -549,27 +426,21 @@ predicate isNullableFunctionCall(FunctionCall call) {{
                         issue_type=issue_type,
                         trace=[],
                     ))
+
+            logger.info(f"Parsed {len(warnings)} warnings")
+
         except Exception as e:
-            logger.warning(f"SARIF parse error: {e}")
+            logger.error(f"SARIF parse error: {e}")
 
         return warnings
 
 
 class InferAnalyzer:
-    """Facebook Infer static analyzer adapter.
-
-    Infer is a static analysis tool that detects memory safety issues
-    including null pointer dereferences, memory leaks, and resource leaks.
-
-    Infer uses .inferconfig for configuration and supports custom models
-    via .inferlibmodels files.
-    """
+    """Facebook Infer static analyzer adapter."""
 
     def __init__(self, binary: str = "infer", timeout: int = 600):
         self.binary = binary
         self.timeout = timeout
-
-        # Infer checkers for different issue types
         self.issue_type_map = {
             "NULL_DEREFERENCE": MemoryIssueType.NULL_DEREFERENCE,
             "NULLPTR_DEREFERENCE": MemoryIssueType.NULL_DEREFERENCE,
@@ -578,187 +449,55 @@ class InferAnalyzer:
             "USE_AFTER_FREE": MemoryIssueType.USE_AFTER_FREE,
             "USE_AFTER_DELETE": MemoryIssueType.USE_AFTER_FREE,
             "DOUBLE_FREE": MemoryIssueType.DOUBLE_FREE,
-            "USE_AFTER_LIFETIME": MemoryIssueType.USE_AFTER_FREE,
-            "DANGLING_POINTER_DEREFERENCE": MemoryIssueType.USE_AFTER_FREE,
-            "UNINITIALIZED_VALUE": MemoryIssueType.UNINITIALIZED_READ,
         }
 
-    def analyze(
-        self, project_path: Path, annotations: AnnotationSet = None,
-        issue_types: list[MemoryIssueType] = None
-    ) -> list[Warning]:
-        """Run Infer analysis."""
+    def analyze(self, project_path: Path, hints: HintSet = None, issue_types: list[MemoryIssueType] = None) -> list[Warning]:
         output_dir = Path(tempfile.mkdtemp())
         infer_out = output_dir / "infer-out"
 
-        # Generate .inferconfig with custom models if we have annotations
-        if annotations and len(annotations.annotations) > 0:
-            self._generate_inferconfig(project_path, annotations)
+        if hints and len(hints.hints) > 0:
+            self._generate_inferconfig(project_path, hints)
 
         try:
-            # Step 1: Run infer capture + analyze
             warnings = self._run_infer(project_path, infer_out)
-
-            # Step 2: Filter by issue types if specified
             if issue_types:
                 warnings = [w for w in warnings if w.issue_type in issue_types]
-
             return warnings
-
-        except FileNotFoundError:
-            logger.error(f"Infer binary not found: {self.binary}")
-            return []
         except Exception as e:
-            logger.error(f"Infer analysis failed: {e}")
+            logger.error(f"Infer failed: {e}")
             return []
         finally:
-            # Cleanup .inferconfig if we created it
             inferconfig = project_path / ".inferconfig"
             if inferconfig.exists():
-                try:
-                    inferconfig.unlink()
-                except:
-                    pass
+                inferconfig.unlink(missing_ok=True)
 
     def _run_infer(self, project_path: Path, infer_out: Path) -> list[Warning]:
-        """Run Infer on project."""
-        # Detect build system and run appropriate command
-        warnings = []
-
-        # Check for different build systems
         if (project_path / "Makefile").exists():
-            warnings = self._run_with_make(project_path, infer_out)
-        elif (project_path / "CMakeLists.txt").exists():
-            warnings = self._run_with_cmake(project_path, infer_out)
+            subprocess.run(["make", "clean"], cwd=project_path, capture_output=True)
+            cmd = [self.binary, "run", "-o", str(infer_out), "--", "make", "-j4"]
         elif (project_path / "compile_commands.json").exists():
-            warnings = self._run_with_compilation_db(project_path, infer_out)
+            cmd = [self.binary, "run", "-o", str(infer_out), "--compilation-database", str(project_path / "compile_commands.json")]
         else:
-            # Try direct capture on C files
-            warnings = self._run_direct(project_path, infer_out)
+            c_files = list(project_path.glob("**/*.c")) + list(project_path.glob("**/*.cpp"))
+            if not c_files:
+                return []
+            for f in c_files[:50]:
+                subprocess.run([self.binary, "capture", "-o", str(infer_out), "--", "clang", "-c", str(f)], capture_output=True, timeout=60)
+            cmd = [self.binary, "analyze", "-o", str(infer_out)]
 
-        return warnings
-
-    def _run_with_make(self, project_path: Path, infer_out: Path) -> list[Warning]:
-        """Run Infer with make build system."""
-        # Clean first
-        subprocess.run(["make", "clean"], cwd=project_path, capture_output=True)
-
-        cmd = [
-            self.binary, "run",
-            "-o", str(infer_out),
-            "--", "make", "-j4"
-        ]
-
-        logger.info(f"Running: {' '.join(cmd)}")
-        result = subprocess.run(
-            cmd,
-            cwd=project_path,
-            capture_output=True,
-            timeout=self.timeout
-        )
-
-        if result.returncode != 0:
-            logger.warning(f"Infer returned {result.returncode}")
-            stderr = result.stderr.decode()[:500]
-            if stderr:
-                logger.debug(f"stderr: {stderr}")
-
-        return self._parse_results(infer_out)
-
-    def _run_with_cmake(self, project_path: Path, infer_out: Path) -> list[Warning]:
-        """Run Infer with CMake build system."""
-        build_dir = project_path / "build"
-        build_dir.mkdir(exist_ok=True)
-
-        # Generate compile_commands.json
-        subprocess.run(
-            ["cmake", "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", ".."],
-            cwd=build_dir,
-            capture_output=True
-        )
-
-        compile_commands = build_dir / "compile_commands.json"
-        if compile_commands.exists():
-            return self._run_with_compilation_db(project_path, infer_out, compile_commands)
-
-        # Fallback to make
-        cmd = [
-            self.binary, "run",
-            "-o", str(infer_out),
-            "--", "cmake", "--build", str(build_dir)
-        ]
-
-        result = subprocess.run(cmd, cwd=project_path, capture_output=True, timeout=self.timeout)
-        return self._parse_results(infer_out)
-
-    def _run_with_compilation_db(
-        self, project_path: Path, infer_out: Path,
-        compile_commands: Path = None
-    ) -> list[Warning]:
-        """Run Infer with compilation database."""
-        if compile_commands is None:
-            compile_commands = project_path / "compile_commands.json"
-
-        cmd = [
-            self.binary, "run",
-            "-o", str(infer_out),
-            "--compilation-database", str(compile_commands)
-        ]
-
-        logger.info(f"Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, cwd=project_path, capture_output=True, timeout=self.timeout)
-        return self._parse_results(infer_out)
-
-    def _run_direct(self, project_path: Path, infer_out: Path) -> list[Warning]:
-        """Run Infer directly on C/C++ files."""
-        # Find all C/C++ files
-        c_files = list(project_path.glob("**/*.c")) + list(project_path.glob("**/*.cpp"))
-        c_files = [f for f in c_files if "test" not in str(f).lower()]
-
-        if not c_files:
-            logger.warning("No C/C++ files found")
-            return []
-
-        # Use infer capture with clang
-        for c_file in c_files[:50]:  # Limit to avoid timeout
-            cmd = [
-                self.binary, "capture",
-                "-o", str(infer_out),
-                "--", "clang", "-c", str(c_file), "-I", str(project_path)
-            ]
-            subprocess.run(cmd, capture_output=True, timeout=60)
-
-        # Run analysis
-        cmd = [self.binary, "analyze", "-o", str(infer_out)]
-        subprocess.run(cmd, capture_output=True, timeout=self.timeout)
-
+        subprocess.run(cmd, cwd=project_path, capture_output=True, timeout=self.timeout)
         return self._parse_results(infer_out)
 
     def _parse_results(self, infer_out: Path) -> list[Warning]:
-        """Parse Infer JSON report."""
-        warnings = []
         report_file = infer_out / "report.json"
-
         if not report_file.exists():
-            logger.warning(f"Infer report not found: {report_file}")
             return []
 
+        warnings = []
         try:
-            data = json.loads(report_file.read_text())
-
-            for item in data:
+            for item in json.loads(report_file.read_text()):
                 bug_type = item.get("bug_type", "")
                 issue_type = self.issue_type_map.get(bug_type, MemoryIssueType.MEMORY_LEAK)
-
-                # Extract trace
-                trace = []
-                for trace_item in item.get("bug_trace", []):
-                    desc = trace_item.get("description", "")
-                    filename = trace_item.get("filename", "")
-                    line = trace_item.get("line_number", 0)
-                    if desc:
-                        trace.append(f"{filename}:{line}: {desc}")
-
                 warnings.append(Warning(
                     file_path=item.get("file", ""),
                     line_number=item.get("line", 0),
@@ -766,84 +505,18 @@ class InferAnalyzer:
                     warning_type=bug_type,
                     message=item.get("qualifier", ""),
                     issue_type=issue_type,
-                    trace=trace,
+                    trace=[],
                 ))
-
-            logger.info(f"Parsed {len(warnings)} Infer warnings")
-
         except Exception as e:
-            logger.error(f"Failed to parse Infer results: {e}")
-
+            logger.error(f"Infer parse error: {e}")
         return warnings
 
-    def _generate_inferconfig(self, project_path: Path, annotations: AnnotationSet) -> None:
-        """Generate .inferconfig with custom allocator/deallocator models."""
-        config = {
-            "report-suppress-errors": [],
-            # Enable memory safety checkers
-            "pulse": True,
-            "biabduction": True,
-        }
-
-        # Collect custom allocators and deallocators
-        alloc_funcs = []
-        free_funcs = []
-
-        for func_name, anns in annotations.annotations.items():
-            for ann in anns:
-                if ann.is_bug_annotation():
-                    continue
-                if ann.annotation_type in (AnnotationType.ALLOC_SOURCE, AnnotationType.ARRAY_ALLOC):
-                    alloc_funcs.append(func_name)
-                elif ann.annotation_type == AnnotationType.FREE_SINK:
-                    free_funcs.append(func_name)
-
-        # Write config
-        config_path = project_path / ".inferconfig"
-        config_path.write_text(json.dumps(config, indent=2))
-
-        # Generate models file for custom allocators
-        if alloc_funcs or free_funcs:
-            self._generate_models_file(project_path, alloc_funcs, free_funcs)
-
-        logger.info(f"Generated .inferconfig with {len(alloc_funcs)} allocators, {len(free_funcs)} deallocators")
-
-    def _generate_models_file(
-        self, project_path: Path,
-        alloc_funcs: list[str],
-        free_funcs: list[str]
-    ) -> None:
-        """Generate Infer models for custom allocators/deallocators.
-
-        Creates a .infermodels file that tells Infer about custom
-        memory management functions.
-        """
-        models = []
-
-        # Model allocators
-        for func in alloc_funcs:
-            models.append({
-                "procedure": func,
-                "model": "allocation",
-                "return": "fresh"
-            })
-
-        # Model deallocators
-        for func in free_funcs:
-            models.append({
-                "procedure": func,
-                "model": "deallocation",
-                "parameter": 0
-            })
-
-        if models:
-            models_path = project_path / ".infermodels"
-            models_path.write_text(json.dumps(models, indent=2))
-            logger.info(f"Generated Infer models file")
+    def _generate_inferconfig(self, project_path: Path, hints: HintSet) -> None:
+        config = {"pulse": True, "biabduction": True}
+        (project_path / ".inferconfig").write_text(json.dumps(config, indent=2))
 
 
 def create_analyzer(analyzer_type: str = "codeql", **kwargs):
-    """Factory function to create analyzer."""
     if analyzer_type == "infer":
         return InferAnalyzer(**kwargs)
     return CodeQLAnalyzer(**kwargs)

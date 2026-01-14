@@ -9,6 +9,9 @@ from tree_sitter import Language, Parser
 
 from src.core.models import FunctionInfo
 
+# Note: FunctionInfo doesn't have return_expressions in the new models
+# We add it here for compatibility
+
 logger = logging.getLogger(__name__)
 
 C_LANGUAGE = Language(tsc.language())
@@ -26,7 +29,7 @@ class CodeParser:
         """Parse all C/C++ files in project."""
         functions = {}
         extensions = (".c", ".cpp", ".cc", ".cxx", ".h", ".hpp")
-        
+
         # Resolve project path
         project_path = project_path.resolve()
 
@@ -53,7 +56,7 @@ class CodeParser:
         except Exception as e:
             logger.warning(f"Cannot read {file_path}: {e}")
             return {}
-        
+
         # Use relative path if provided, otherwise use file name
         stored_path = rel_path or file_path.name
 

@@ -1,488 +1,327 @@
-"""Hint's Pipeline - Memory Safety Analysis with LLM-Assisted Annotations and Code Slicing and Merging
+"""HINT Pipeline - Memory Safety Analysis with LLM-Assisted Hints.
 
-Architecture:
-1. Parse source code with tree-sitter
-2. LLM generates memory safety annotations
-3. Z3 constraint solver validates annotations
-4. Merge relevant code into single file (with dependency tracking) TODO: needs to check
-5. Static analyzer (CodeQL/Infer) analyzes merged code
-6. Map results back to original locations
+Pipeline flow:
+1. Parse: Extract functions from source code (tree-sitter)
+2. Generate: LLM generates memory safety hints (ALLOCATOR, DEALLOCATOR, etc.)
+3. Validate Hints: Z3 validates hints are consistent with code
+4. Analyze: CodeQL scans with custom model extensions based on hints
+5. Filter: Z3 filters false positives by path feasibility
+
+The key insight: LLM identifies FUNCTION SEMANTICS (hints), not bugs.
+CodeQL uses these hints to find bugs. Z3 filters impossible scenarios.
 """
 
 import json
 import logging
-import tempfile
 import shutil
+import tempfile
 from pathlib import Path
 
 from tqdm import tqdm
 
 from src.core.models import (
-    FunctionInfo, Annotation, AnnotationType, AnnotationSet,
+    FunctionInfo, Hint, HintType, HintSet,
     Warning, Evidence, AnalysisResult, MemoryIssueType
 )
 from src.tree_sitter_parser import CodeParser
-from src.llm_client import LLMClient, AnnotationGenerator
-from src.symbolic.validator import AnnotationValidator, analyze_with_slicing
-from src.analyzer.adapters import create_analyzer, CodeQLAnalyzer
-from src.analyzer.merger import CodeMerger, OriginalLocation
+from src.llm_client import HintGenerator, LLMClient
+from src.symbolic.z3_solver import HintValidator, WarningValidator
+from src.analyzer.adapters import CodeQLAnalyzer
 
 logger = logging.getLogger(__name__)
 
-
 class Pipeline:
-    """HINT analysis pipeline with code merging and dependency slicing.
+    """HINT analysis pipeline.
 
-    Key features:
-    1. Cross-file dependency tracking (recursive callees, types)
-    2. Single-file compilation for fast analysis
-    3. LLM patches merged code for compilability
-    4. Results mapped back to original locations
+    Pipeline stages:
+    1. Parse: Extract function information using tree-sitter
+    2. Generate: LLM generates memory safety hints
+    3. Validate Hints: Z3 validates hints are consistent
+    4. Analyze: CodeQL scans with hint-based model extensions
+    5. Filter: Z3 filters infeasible warning paths
     """
 
     def __init__(
         self,
-        api_key: str = None,
+        api_key: str = None,  # Kept for compatibility, not used with Vertex AI
         model: str = "gemini-2.5-pro",
         analyzer_type: str = "codeql",
         max_iterations: int = 3,
         issue_types: list[MemoryIssueType] = None,
-        use_merge: bool = False,
+        use_merge: bool = False,  # Kept for compatibility
     ):
+        """Initialize pipeline.
+
+        Args:
+            api_key: Unused (Vertex AI uses service account)
+            model: LLM model name
+            analyzer_type: "codeql" or "infer"
+            max_iterations: Max CEGAR iterations (for future refinement)
+            issue_types: Which bug types to detect (default: all)
+            use_merge: Whether to merge code (kept for compatibility)
+        """
+        # Components
         self.parser = CodeParser()
-        self.llm = LLMClient(api_key=api_key, model=model)
-        self.generator = AnnotationGenerator(self.llm)
-        self.analyzer = create_analyzer(analyzer_type)
-        self.constraint_validator = AnnotationValidator()
+        self.llm_client = LLMClient(model=model)
+        self.hint_generator = HintGenerator(self.llm_client)
+        self.hint_validator = HintValidator()
+        self.warning_validator = None  # Initialized with known allocators
+        self.analyzer = CodeQLAnalyzer()
+
+        # Configuration
         self.max_iterations = max_iterations
         self.use_merge = use_merge
-
-        # Default to all issue types
         self.issue_types = issue_types or [
             MemoryIssueType.MEMORY_LEAK,
             MemoryIssueType.DOUBLE_FREE,
             MemoryIssueType.USE_AFTER_FREE,
             MemoryIssueType.NULL_DEREFERENCE,
+            MemoryIssueType.BUFFER_OVERFLOW,
         ]
 
+        # State
         self.functions: dict[str, FunctionInfo] = {}
-        self.annotations = AnnotationSet()
+        self.hints = HintSet()
         self.conflicts: list[str] = []
 
     def analyze(self, project_path: Path, output_dir: Path = None) -> AnalysisResult:
-        """Run analysis pipeline with code merging.
+        """Run the full analysis pipeline.
 
         Pipeline:
         1. Parse source code
-        2. LLM generates annotations (function properties + bug hints)
-        3. Z3 validates annotations
-        4. Merge relevant code with dependency tracking
-        5. Static analyzer analyzes merged code
-        6. Map results back to original locations
-        7. Z3 filters infeasible paths
+        2. LLM generates hints (function semantics)
+        3. Z3 validates hints
+        4. CodeQL scans with hints as model extensions
+        5. Z3 filters infeasible warning paths
+
+        Args:
+            project_path: Path to C/C++ project
+            output_dir: Where to save results
+
+        Returns:
+            AnalysisResult with confirmed bugs and hints
         """
         project_path = Path(project_path).resolve()
         output_dir = output_dir or Path("./output")
         output_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(f"Analyzing {project_path}")
-        logger.info(f"Issue types: {[t.name for t in self.issue_types]}")
+        logger.info(f"Bug types: {[t.name for t in self.issue_types]}")
 
+        # =====================================================================
         # Phase 1: Parse source code
+        # =====================================================================
         logger.info("Phase 1: Parsing source code...")
         self.functions = self.parser.parse_project(project_path)
-        logger.info(f"Found {len(self.functions)} functions")
+        logger.info(f"  Found {len(self.functions)} functions")
 
-        annotations_file = output_dir / "annotations.json"
-        if annotations_file.exists():
-            logger.info(f"annotations.json found in {output_dir}, reusing existing annotations")
-            self.annotations = self._load_annotations_from_file(annotations_file)
+        if not self.functions:
+            logger.warning("No functions found")
+            return AnalysisResult(
+                confirmed_bugs=[],
+                hints=HintSet(),
+                iterations=0,
+                spurious_filtered=0,
+            )
+
+        # Check for cached hints
+        hints_file = output_dir / "hints.json"
+        if hints_file.exists():
+            logger.info(f"  Loading cached hints from {hints_file}")
+            self.hints = self._load_hints(hints_file)
         else:
-            # Phase 2: Generate annotations with LLM
-            logger.info("Phase 2: Generating annotations with LLM...")
-            self._generate_annotations()
+            # =================================================================
+            # Phase 2: LLM generates hints
+            # =================================================================
+            logger.info("Phase 2: Generating hints with LLM...")
+            self.hints = self.hint_generator.generate_hints(self.functions)
+            logger.info(f"  {self.hints.summary()}")
 
-            func_annotations = sum(
-                1 for anns in self.annotations.annotations.values()
-                for ann in anns if not ann.is_bug_annotation()
+            # =================================================================
+            # Phase 3: Z3 validates hints
+            # =================================================================
+            logger.info("Phase 3: Validating hints with Z3...")
+            self.hints, conflicts = self.hint_validator.validate_hints(
+                self.hints, self.functions
             )
-            bug_hints = sum(
-                1 for anns in self.annotations.annotations.values()
-                for ann in anns if ann.is_bug_annotation()
+            self.conflicts.extend(conflicts)
+
+            if conflicts:
+                logger.info(f"  Removed {len(conflicts)} invalid hints:")
+                for c in conflicts[:5]:
+                    logger.info(f"    - {c}")
+                if len(conflicts) > 5:
+                    logger.info(f"    ... and {len(conflicts) - 5} more")
+
+            logger.info(f"  After validation: {self.hints.summary()}")
+
+            # Save validated hints
+            self._save_hints(hints_file)
+
+        # =====================================================================
+        # Phase 4: CodeQL analysis with hints
+        # =====================================================================
+        logger.info("Phase 4: Running CodeQL with hint-based models...")
+
+        # Export hints as CodeQL model extensions
+        self._export_codeql_models(output_dir)
+
+        # Run CodeQL
+        warnings = self.analyzer.analyze(
+            project_path,
+            self.hints,
+            self.issue_types,
+        )
+        logger.info(f"  CodeQL found {len(warnings)} warnings")
+
+        # =====================================================================
+        # Phase 5: Z3 filters false positives
+        # =====================================================================
+        logger.info("Phase 5: Filtering warnings with Z3 path analysis...")
+
+        # Initialize warning validator with known allocators
+        alloc_funcs = set(self.hints.get_allocators())
+        alloc_funcs.update({"malloc", "calloc", "realloc", "strdup"})
+        free_funcs = set(fn for fn, _ in self.hints.get_deallocators())
+        free_funcs.update({"free"})
+
+        self.warning_validator = WarningValidator(alloc_funcs, free_funcs)
+        confirmed_warnings, filtered_warnings = self.warning_validator.validate_warnings(
+            warnings, self.functions
+        )
+
+        logger.info(f"  Confirmed: {len(confirmed_warnings)}, Filtered: {len(filtered_warnings)}")
+
+        # Convert to Evidence
+        confirmed_bugs = [
+            Evidence(
+                warning=w,
+                concrete_trace=[],
+                root_cause="",
+                suggested_fix=self._suggest_fix(w),
+                z3_validated=True,
             )
-            logger.info(f"Generated {func_annotations} function annotations, {bug_hints} bug hints")
+            for w in confirmed_warnings
+        ]
 
-            # Phase 3: Validate with Z3
-            logger.info("Phase 3: Validating annotations with Z3...")
-            self._validate_annotations_with_z3()
-
-        if self.use_merge:
-            # Phase 4: Merge relevant code
-            logger.info("Phase 4: Merging code with dependency tracking...")
-            merger = CodeMerger(llm_client=self.llm)
-            merged = merger.merge(self.annotations, self.functions, project_path)
-
-            logger.info(
-                f"Merged {len(merged.included_functions)} functions, {len(merged.included_types)} types"
-            )
-
-            # Save merged code
-            merged_file = output_dir / "merged_analysis.c"
-            merged_file.write_text(merged.code)
-            logger.info(f"Wrote merged code: {merged_file}")
-
-            # Save location map
-            location_map_file = output_dir / "location_map.json"
-            map_data = {
-                str(line): {
-                    "file": loc.file_path,
-                    "line": loc.start_line,
-                    "function": loc.function_name,
-                }
-                for line, loc in merged.location_map.items()
-            }
-            location_map_file.write_text(json.dumps(map_data, indent=2))
-
-            # Phase 5: Run analyzer on merged code
-            analyzer_name = type(self.analyzer).__name__
-            logger.info(f"Phase 5: Running {analyzer_name} on merged code (merged file)...")
-
-            # Create temp directory with merged file
-            temp_dir = Path(tempfile.mkdtemp())
-            shutil.copy(merged_file, temp_dir / "merged_analysis.c")
-
-            try:
-                warnings = self.analyzer.analyze(temp_dir, self.annotations, self.issue_types)
-                logger.info(f"{analyzer_name} found {len(warnings)} warnings")
-            finally:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
-            # Phase 6: Map results to original locations
-            logger.info("Phase 6: Mapping to original locations (from merged file)...")
-            mapped_warnings = []
-            for warning in warnings:
-                original_loc = CodeMerger.map_result_to_original(
-                    warning.line_number, merged.location_map
-                )
-                if original_loc:
-                    mapped_warnings.append(Warning(
-                        file_path=original_loc.file_path,
-                        line_number=original_loc.start_line,
-                        function_name=original_loc.function_name or warning.function_name,
-                        warning_type=warning.warning_type,
-                        message=warning.message,
-                        issue_type=warning.issue_type,
-                        trace=warning.trace,
-                    ))
-                else:
-                    mapped_warnings.append(warning)
-        else:
-            # No merge: run analyzer directly on original project
-            analyzer_name = type(self.analyzer).__name__
-            logger.info(
-                f"Phase 4: Skipping merge (use_merge=False), running {analyzer_name} on original project..."
-            )
-            warnings = self.analyzer.analyze(project_path, self.annotations, self.issue_types)
-            logger.info(f"{analyzer_name} found {len(warnings)} warnings")
-            mapped_warnings = warnings
-
-        # Phase 7: Filter with Z3
-        logger.info("Phase 7: Z3 path feasibility filtering...")
-        confirmed_bugs = self._filter_warnings_with_z3(mapped_warnings, project_path)
-        logger.info(f"Confirmed {len(confirmed_bugs)} bugs after Z3 filtering")
-
+        # =====================================================================
         # Export results
-        self._export_analyzer_config(output_dir)
-        self._export_final_output(output_dir, confirmed_bugs)
+        # =====================================================================
+        self._export_results(output_dir, confirmed_bugs, filtered_warnings)
 
         return AnalysisResult(
             confirmed_bugs=confirmed_bugs,
-            final_annotations=self.annotations,
+            hints=self.hints,
             iterations=1,
-            spurious_filtered=len(warnings) - len(confirmed_bugs),
+            spurious_filtered=len(filtered_warnings),
         )
 
-    def _load_annotations_from_file(self, file_path: Path) -> AnnotationSet:
-        """Load annotations.json produced by a previous run."""
-        data = json.loads(Path(file_path).read_text())
-        loaded = AnnotationSet()
+    def _load_hints(self, file_path: Path) -> HintSet:
+        """Load hints from JSON file."""
+        data = json.loads(file_path.read_text())
+        return HintSet.from_json(data)
 
-        # Function annotations
-        for func_name, anns in data.get("functions", {}).items():
-            for ann in anns:
-                ann_type_name = ann.get("type")
-                if not ann_type_name:
-                    continue
-                try:
-                    ann_type = AnnotationType[ann_type_name]
-                except KeyError:
-                    logger.warning(f"Unknown annotation type in file: {ann_type_name}")
-                    continue
-                loaded.add(Annotation(
-                    function_name=func_name,
-                    annotation_type=ann_type,
-                    target=ann.get("target", ""),
-                    reason=ann.get("reason", "")
-                ))
+    def _save_hints(self, file_path: Path) -> None:
+        """Save hints to JSON file."""
+        file_path.write_text(json.dumps(self.hints.to_json(), indent=2))
 
-        # Bug hints
-        for hint in data.get("bug_hints", []):
-            ann_type_name = hint.get("type")
-            func_name = hint.get("function", "")
-            if not ann_type_name or not func_name:
-                continue
-            try:
-                ann_type = AnnotationType[ann_type_name]
-            except KeyError:
-                logger.warning(f"Unknown bug hint type in file: {ann_type_name}")
-                continue
-            loaded.add(Annotation(
-                function_name=func_name,
-                annotation_type=ann_type,
-                target=hint.get("target", ""),
-                line_number=hint.get("line"),
-                confidence=hint.get("confidence", 1.0),
-                reason=hint.get("reason", "")
-            ))
+    def _export_codeql_models(self, output_dir: Path) -> None:
+        """Export hints as CodeQL model extensions."""
+        # YAML model file
+        model_yaml = output_dir / "codeql_model.yml"
+        model_yaml.write_text(self.hints.to_codeql_model())
 
-        logger.info(f"Loaded annotations from {file_path}")
-        return loaded
-
-    def _generate_annotations(self) -> None:
-        """Generate comprehensive memory safety annotations using LLM."""
-        self.annotations = AnnotationSet()
-
-        for func_name, func in tqdm(self.functions.items(), desc="Generating annotations"):
-            annotations = self.generator.generate(func, self.functions)
-            for ann in annotations:
-                self.annotations.add(ann)
-
-    def _validate_annotations_with_z3(self) -> None:
-        """Validate annotations using Z3 constraint solver.
-
-        This is the core CEGAR component - it checks if annotations
-        are consistent with the code structure using constraint solving.
-        """
-        validated, conflicts = self.constraint_validator.validate_annotations(
-            self.annotations, self.functions
-        )
-
-        self.annotations = validated
-        self.conflicts.extend(conflicts)
-
-        if conflicts:
-            logger.info(f"Z3 validation found {len(conflicts)} conflicts:")
-            for conflict in conflicts[:5]:
-                logger.info(f"  - {conflict}")
-            if len(conflicts) > 5:
-                logger.info(f"  ... and {len(conflicts) - 5} more")
-
-    # def _validate_annotations_with_llm(self) -> None:
-    #     """Additional LLM-based semantic validation."""
-    #     to_remove = []
-
-    #     for func_name, anns in tqdm(
-    #         list(self.annotations.annotations.items()),
-    #         desc="LLM validation"
-    #     ):
-    #         if func_name not in self.functions:
-    #             continue
-    #         func = self.functions[func_name]
-
-    #         for ann in anns:
-    #             # Validate allocation annotations (most prone to false positives)
-    #             if ann.annotation_type in (AnnotationType.ALLOC_SOURCE, AnnotationType.ARRAY_ALLOC):
-    #                 is_valid, reason = self.generator.validate(func, ann)
-    #                 if not is_valid:
-    #                     logger.debug(f"LLM removing invalid annotation {func_name}: {reason}")
-    #                     to_remove.append((func_name, ann.annotation_type))
-    #                     self.conflicts.append(f"LLM CONFLICT: {func_name} - {reason}")
-
-    #     for func_name, ann_type in to_remove:
-    #         self.annotations.remove(func_name, ann_type)
-
-    #     if to_remove:
-    #         logger.info(f"LLM validation removed {len(to_remove)} annotations")
-
-    def _filter_warnings_with_z3(
-        self, warnings: list[Warning], project_path: Path
-    ) -> list[Evidence]:
-        """Filter static analyzer warnings using Z3 constraint solving.
-
-        This reduces false positives by checking path feasibility:
-        1. Extract minimal slice relevant to the bug
-        2. Check feasibility with Z3 on the slice
-        3. Keep only feasible warnings
-
-        The static analyzer results are authoritative -
-        we only filter out provably infeasible paths.
-        """
-        confirmed = []
-        filtered_count = 0
-
-        # Get known allocation functions from annotations
-        alloc_funcs = set(self.annotations.get_alloc_functions())
-        # Always include standard allocators
-        alloc_funcs.update({"malloc", "calloc", "realloc", "strdup"})
-
-        for warning in warnings:
-            func = self.functions.get(warning.function_name)
-
-            if not func:
-                # Can't analyze without function code - keep warning
-                confirmed.append(Evidence(
-                    warning=warning,
-                    concrete_trace=["Unable to analyze: function code not found"],
-                    leak_point=f"line {warning.line_number}",
-                    suggested_fix=self._suggest_fix(warning),
-                ))
-                continue
-
-            # Try Z3 sliced analysis for path feasibility
-            try:
-                slice_results = analyze_with_slicing(func.code, alloc_funcs)
-                issue_key = warning.issue_type.name
-
-                if issue_key in slice_results:
-                    results = slice_results[issue_key]
-
-                    if not results:
-                        # Z3 proves no feasible path exists - filter
-                        logger.debug(f"Z3 filtered: {warning.function_name}:{warning.line_number} - {issue_key}")
-                        self.conflicts.append(
-                            f"Z3 FILTERED: {warning.function_name}:{warning.line_number} - infeasible {issue_key}"
-                        )
-                        filtered_count += 1
-                        continue
-
-                    # Z3 confirms feasible path exists
-                    trace = [f"Z3 confirmed: feasible path exists"]
-                    for r in results:
-                        if r.condition:
-                            trace.append(f"Condition: {r.condition}")
-
-                    confirmed.append(Evidence(
-                        warning=warning,
-                        concrete_trace=trace,
-                        leak_point=f"line {warning.line_number}",
-                        suggested_fix=self._suggest_fix(warning),
-                    ))
-                else:
-                    # Issue type not handled by Z3 slicer - keep warning
-                    confirmed.append(Evidence(
-                        warning=warning,
-                        concrete_trace=[],
-                        leak_point=f"line {warning.line_number}",
-                        suggested_fix=self._suggest_fix(warning),
-                    ))
-
-            except Exception as e:
-                # Z3 analysis failed - keep warning (conservative)
-                logger.debug(f"Z3 analysis failed for {warning.function_name}: {e}")
-                confirmed.append(Evidence(
-                    warning=warning,
-                    concrete_trace=[f"Z3 analysis skipped: {e}"],
-                    leak_point=f"line {warning.line_number}",
-                    suggested_fix=self._suggest_fix(warning),
-                ))
-
-        if filtered_count:
-            logger.info(f"Z3 filtered {filtered_count} infeasible warnings")
-
-        return confirmed
-
-    def _export_analyzer_config(self, output_dir: Path) -> None:
-        """Export annotations to analyzer-specific formats."""
-        from src.analyzer.adapters import CodeQLAnalyzer, InferAnalyzer
-
-        # CodeQL model extension
-        codeql_model = output_dir / "codeql_model.yml"
-        with open(codeql_model, "w") as f:
-            f.write(self.annotations.to_codeql_model())
-
-        # CodeQL model extension pack
+        # Also create model pack for CodeQL
         if isinstance(self.analyzer, CodeQLAnalyzer):
-            model_pack_dir = output_dir / "model-pack"
-            self.analyzer._setup_model_pack(model_pack_dir, self.annotations)
-        else:
-            # Generate CodeQL model pack anyway for reference
-            codeql = CodeQLAnalyzer()
-            model_pack_dir = output_dir / "model-pack"
-            codeql._setup_model_pack(model_pack_dir, self.annotations)
+            query_pack_dir = output_dir / "query-pack"
+            self.analyzer._setup_model_pack(query_pack_dir, self.hints)
+            logger.info(f"  Created CodeQL query pack at {query_pack_dir}")
 
-        # Infer config (if using Infer)
-        if isinstance(self.analyzer, InferAnalyzer):
-            # Infer config is generated in project directory during analysis
-            pass
-
-        # Export annotations as JSON (generic format)
-        ann_file = output_dir / "annotations.json"
-        with open(ann_file, "w") as f:
-            json.dump(self.annotations.to_json(), f, indent=2)
-
-        # Export conflicts for debugging
-        if self.conflicts:
-            with open(output_dir / "validation_conflicts.txt", "w") as f:
-                f.write("\n".join(self.conflicts))
-
-        # Export LLM bug hints (for reference only, NOT merged with results)
-        bug_hints = []
-        for func_name, anns in self.annotations.annotations.items():
-            for ann in anns:
-                if ann.is_bug_annotation():
-                    bug_hints.append({
-                        "function": func_name,
-                        "type": ann.annotation_type.name,
-                        "variable": ann.target,
-                        "line": ann.line_number,
-                        "confidence": ann.confidence,
-                        "reason": ann.reason,
-                    })
-
-        logger.info(f"Exported analyzer configs to {output_dir}")
-
-    def _export_final_output(self, output_dir: Path, bugs: list[Evidence]) -> None:
-        """Export final results."""
-        # Bug report grouped by type
-        bugs_by_type = {}
-        for bug in bugs:
+    def _export_results(
+        self,
+        output_dir: Path,
+        confirmed: list[Evidence],
+        filtered: list[Warning],
+    ) -> None:
+        """Export analysis results."""
+        # Confirmed bugs
+        bugs_data = {}
+        for bug in confirmed:
             t = bug.warning.issue_type.name
-            if t not in bugs_by_type:
-                bugs_by_type[t] = []
-            bugs_by_type[t].append({
+            if t not in bugs_data:
+                bugs_data[t] = []
+            bugs_data[t].append({
                 "file": bug.warning.file_path,
                 "line": bug.warning.line_number,
                 "function": bug.warning.function_name,
                 "message": bug.warning.message,
-                "leak_point": bug.leak_point,
                 "suggested_fix": bug.suggested_fix,
-                "trace": bug.concrete_trace,
             })
 
-        with open(output_dir / "memory_safety_bugs.json", "w") as f:
-            json.dump(bugs_by_type, f, indent=2)
+        bugs_file = output_dir / "memory_safety_bugs.json"
+        bugs_file.write_text(json.dumps(bugs_data, indent=2))
 
-        # Human-readable summary
-        summary_lines = ["# HINT Memory Safety Analysis Report", ""]
-        summary_lines.append(f"**Total Issues Found**: {len(bugs)}")
-        summary_lines.append(f"**Annotations Generated**: {len(self.annotations.annotations)}")
-        summary_lines.append(f"**Conflicts Resolved**: {len(self.conflicts)}")
-        summary_lines.append("")
+        # Filtered warnings (for debugging)
+        filtered_data = [
+            {
+                "file": w.file_path,
+                "line": w.line_number,
+                "type": w.issue_type.name,
+                "message": w.message,
+            }
+            for w in filtered
+        ]
+        filtered_file = output_dir / "filtered_warnings.json"
+        filtered_file.write_text(json.dumps(filtered_data, indent=2))
 
-        for issue_type, type_bugs in bugs_by_type.items():
-            summary_lines.append(f"## {issue_type} ({len(type_bugs)} issues)")
+        # Conflicts log
+        if self.conflicts:
+            conflicts_file = output_dir / "validation_conflicts.txt"
+            conflicts_file.write_text("\n".join(self.conflicts))
+
+        # Human-readable report
+        report = self._generate_report(confirmed)
+        report_file = output_dir / "report.md"
+        report_file.write_text(report)
+
+        logger.info(f"Results saved to {output_dir}")
+
+    def _generate_report(self, bugs: list[Evidence]) -> str:
+        """Generate markdown report."""
+        lines = [
+            "# HINT Memory Safety Analysis Report",
+            "",
+            "## Summary",
+            "",
+            f"- **Bugs found**: {len(bugs)}",
+            f"- **Functions analyzed**: {len(self.functions)}",
+            f"- **Hints generated**: {len(self.hints)}",
+            "",
+            "## Hints Summary",
+            "",
+            self.hints.summary(),
+            "",
+        ]
+
+        # Group bugs by type
+        by_type: dict[MemoryIssueType, list[Evidence]] = {}
+        for bug in bugs:
+            t = bug.warning.issue_type
+            if t not in by_type:
+                by_type[t] = []
+            by_type[t].append(bug)
+
+        for bug_type, type_bugs in by_type.items():
+            lines.append(f"## {bug_type.name} ({len(type_bugs)} issues)")
+            lines.append("")
             for i, bug in enumerate(type_bugs, 1):
-                summary_lines.append(f"\n### Issue {i}")
-                summary_lines.append(f"- **File**: {bug['file']}:{bug['line']}")
-                summary_lines.append(f"- **Function**: {bug['function']}")
-                summary_lines.append(f"- **Message**: {bug['message']}")
-                summary_lines.append(f"- **Fix**: {bug['suggested_fix']}")
-            summary_lines.append("")
+                lines.append(f"### {i}. {bug.warning.file_path}:{bug.warning.line_number}")
+                lines.append(f"- **Function**: {bug.warning.function_name}")
+                lines.append(f"- **Message**: {bug.warning.message}")
+                lines.append(f"- **Fix**: {bug.suggested_fix}")
+                lines.append("")
 
-        with open(output_dir / "report.md", "w") as f:
-            f.write("\n".join(summary_lines))
-
-        logger.info(f"Final output saved to {output_dir}")
+        return "\n".join(lines)
 
     def _suggest_fix(self, warning: Warning) -> str:
         """Generate fix suggestion for a warning."""
@@ -493,4 +332,4 @@ class Pipeline:
             MemoryIssueType.NULL_DEREFERENCE: "Add null check before pointer use",
             MemoryIssueType.BUFFER_OVERFLOW: "Validate buffer bounds before access",
         }
-        return fixes.get(warning.issue_type, "Review and fix memory safety issue")
+        return fixes.get(warning.issue_type, "Review memory safety issue")
