@@ -217,7 +217,7 @@ class CodeQLAnalyzer:
 
         for func_name, anns in annotations.annotations.items():
             for ann in anns:
-                if ann.annotation_type in (AnnotationType.ALLOC_SOURCE, AnnotationType.ARRAY_ALLOC):
+                if ann.annotation_type in (AnnotationType.ALLOC_SOURCE, AnnotationType.ARRAY_ALLOC,):
                     if func_name not in ("main", "_main") and func_name not in alloc_funcs:
                         alloc_funcs.append(func_name)
                         # Allocators can return NULL, so they're also nullable
@@ -226,7 +226,7 @@ class CodeQLAnalyzer:
                 elif ann.annotation_type == AnnotationType.FREE_SINK:
                     if func_name not in free_funcs:
                         free_funcs.append(func_name)
-                elif ann.annotation_type in (AnnotationType.NULLABLE_RETURN, AnnotationType.MUST_CHECK_NULL):
+                elif ann.annotation_type in (AnnotationType.NULLABLE_RETURN, AnnotationType.MUST_CHECK_NULL, AnnotationType.OWNERSHIP_RETURN):
                     if func_name not in nullable_funcs:
                         nullable_funcs.append(func_name)
 
@@ -479,7 +479,7 @@ predicate isNullableFunctionCall(FunctionCall call) {{
             "codeql/cpp-queries:Critical/MemoryMayNotBeFreed.ql",
             "codeql/cpp-queries:Critical/DoubleFree.ql",
             "codeql/cpp-queries:Critical/UseAfterFree.ql",
-            "codeql/cpp-queries:Likely Bugs/Memory Management/MissingNullTest.ql",
+            "codeql/cpp-queries:Critical/MissingNullTest.ql",
         ]
 
         cmd = [
