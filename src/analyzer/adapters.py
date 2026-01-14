@@ -203,25 +203,32 @@ class CodeQLAnalyzer:
         return None
 
     def _setup_model_pack(self, model_pack_dir: Path, annotations: AnnotationSet) -> None:
-        """Create a CodeQL model pack with custom allocation/deallocation models.
+        """Create a CodeQL model pack with custom allocation/deallocation/nullable models.
 
-        This creates a library pack that extends AllocationFunction and DeallocationFunction
-        classes to recognize custom allocators and deallocators from annotations.
+        This creates a library pack that extends AllocationFunction, DeallocationFunction,
+        and adds nullable function models to recognize custom functions from annotations.
         """
         model_pack_dir.mkdir(parents=True, exist_ok=True)
 
         # Collect function annotations
         alloc_funcs = []
         free_funcs = []
+        nullable_funcs = []  # Functions that may return NULL
 
         for func_name, anns in annotations.annotations.items():
             for ann in anns:
                 if ann.annotation_type in (AnnotationType.ALLOC_SOURCE, AnnotationType.ARRAY_ALLOC):
                     if func_name not in ("main", "_main") and func_name not in alloc_funcs:
                         alloc_funcs.append(func_name)
+                        # Allocators can return NULL, so they're also nullable
+                        if func_name not in nullable_funcs:
+                            nullable_funcs.append(func_name)
                 elif ann.annotation_type == AnnotationType.FREE_SINK:
                     if func_name not in free_funcs:
                         free_funcs.append(func_name)
+                elif ann.annotation_type in (AnnotationType.NULLABLE_RETURN, AnnotationType.MUST_CHECK_NULL):
+                    if func_name not in nullable_funcs:
+                        nullable_funcs.append(func_name)
 
         # Create qlpack.yml for the model pack
         qlpack_content = """name: hint/memory-models
@@ -241,10 +248,10 @@ dataExtensions:
         # Generate the model extension YAML file
         # Note: For memory leak queries, we need to extend AllocationFunction and DeallocationFunction
         # This is done via a library (.qll) file that gets imported by the queries
-        self._generate_model_extension_library(model_pack_dir, alloc_funcs, free_funcs)
+        self._generate_model_extension_library(model_pack_dir, alloc_funcs, free_funcs, nullable_funcs)
 
         # Also generate a data extension file for dataflow models (if needed by some queries)
-        self._generate_data_extension(models_dir, alloc_funcs, free_funcs)
+        self._generate_data_extension(models_dir, alloc_funcs, free_funcs, nullable_funcs)
 
         # Install dependencies
         logger.info("Installing model pack dependencies...")
@@ -255,23 +262,28 @@ dataExtensions:
         if result.returncode != 0:
             logger.warning(f"Pack install warning: {result.stderr.decode()[:500]}")
 
-        logger.info(f"Model pack created with {len(alloc_funcs)} allocators, {len(free_funcs)} deallocators")
+        logger.info(f"Model pack created with {len(alloc_funcs)} allocators, {len(free_funcs)} deallocators, {len(nullable_funcs)} nullable functions")
 
     def _generate_model_extension_library(
-        self, model_pack_dir: Path, alloc_funcs: list[str], free_funcs: list[str]
+        self, model_pack_dir: Path, alloc_funcs: list[str], free_funcs: list[str], nullable_funcs: list[str] = None
     ) -> None:
-        """Generate a CodeQL library (.qll) file that extends AllocationFunction and DeallocationFunction.
+        """Generate a CodeQL library (.qll) file that extends AllocationFunction, DeallocationFunction,
+        and models nullable functions.
 
-        This allows the built-in MemoryNeverFreed.ql and MemoryMayNotBeFreed.ql queries
-        to recognize our custom allocators and deallocators.
+        This allows the built-in MemoryNeverFreed.ql, MemoryMayNotBeFreed.ql, and MissingNullTest.ql queries
+        to recognize our custom allocators, deallocators, and nullable functions.
         """
+        if nullable_funcs is None:
+            nullable_funcs = []
+
         # Generate the list of function names for CodeQL
         alloc_names = ", ".join(f'"{f}"' for f in alloc_funcs) if alloc_funcs else '"__hint_no_custom_alloc__"'
         free_names = ", ".join(f'"{f}"' for f in free_funcs) if free_funcs else '"__hint_no_custom_free__"'
+        nullable_names = ", ".join(f'"{f}"' for f in nullable_funcs) if nullable_funcs else '"__hint_no_custom_nullable__"'
 
         qll_content = f'''/**
  * @name HINT Custom Memory Models
- * @description Extends CodeQL's built-in allocation and deallocation models
+ * @description Extends CodeQL's built-in allocation, deallocation, and nullable models
  *              with custom functions identified by LLM annotations.
  */
 
@@ -302,17 +314,52 @@ class HintDeallocationFunction extends DeallocationFunction {{
 
   override int getFreedArg() {{ result = 0 }}
 }}
+
+/**
+ * Custom nullable functions identified by HINT/LLM annotations.
+ * These functions may return NULL and their return values should be checked.
+ * Used by MissingNullTest.ql to detect missing null checks.
+ */
+class HintNullableFunction extends Function {{
+  HintNullableFunction() {{
+    this.getName() in [{nullable_names}]
+  }}
+
+  /** Holds if the return value of this function may be NULL. */
+  predicate mayReturnNull() {{ any() }}
+}}
+
+/**
+ * Predicate to identify calls to nullable functions.
+ * This can be used by queries to find unchecked return values.
+ */
+predicate isNullableFunctionCall(FunctionCall call) {{
+  call.getTarget() instanceof HintNullableFunction
+  or
+  call.getTarget() instanceof HintAllocationFunction
+  or
+  // Standard library functions that may return NULL
+  call.getTarget().getName() in [
+    "malloc", "calloc", "realloc", "aligned_alloc", "memalign",
+    "fopen", "fgets", "gets", "getenv", "bsearch",
+    "strchr", "strrchr", "strstr", "strpbrk", "memchr",
+    "tmpfile", "freopen", "strdup", "strndup"
+  ]
+}}
 '''
         (model_pack_dir / "HintMemoryModels.qll").write_text(qll_content)
-        logger.info(f"Generated HintMemoryModels.qll with custom allocators/deallocators")
+        logger.info(f"Generated HintMemoryModels.qll with {len(alloc_funcs)} allocators, {len(free_funcs)} deallocators, {len(nullable_funcs)} nullable functions")
 
     def _generate_data_extension(
-        self, models_dir: Path, alloc_funcs: list[str], free_funcs: list[str]
+        self, models_dir: Path, alloc_funcs: list[str], free_funcs: list[str], nullable_funcs: list[str] = None
     ) -> None:
         """Generate data extension YAML for dataflow models.
 
         This provides additional dataflow information that some queries may use.
         """
+        if nullable_funcs is None:
+            nullable_funcs = []
+
         extensions = []
 
         # Model allocators as sources (return value is a fresh allocation)
@@ -345,13 +392,30 @@ class HintDeallocationFunction extends DeallocationFunction {{
                 "data": sink_data
             })
 
+        # Model nullable functions as sources that may produce NULL
+        # This helps queries like MissingNullTest detect unchecked return values
+        if nullable_funcs:
+            nullable_source_data = []
+            for func in nullable_funcs:
+                # Format: [namespace, type, subtypes, name, signature, ext, output, kind, provenance]
+                # Using "local" kind to mark these as potential sources of null values
+                nullable_source_data.append(["", "", False, func, "", "", "ReturnValue", "nullable", "manual"])
+
+            extensions.append({
+                "addsTo": {
+                    "pack": "codeql/cpp-all",
+                    "extensible": "sourceModel"
+                },
+                "data": nullable_source_data
+            })
+
         if extensions:
             import yaml
             yaml_content = {"extensions": extensions}
             (models_dir / "hint-memory-models.model.yml").write_text(
                 yaml.dump(yaml_content, default_flow_style=False, sort_keys=False)
             )
-            logger.info("Generated hint-memory-models.model.yml")
+            logger.info(f"Generated hint-memory-models.model.yml with {len(alloc_funcs)} allocators, {len(free_funcs)} deallocators, {len(nullable_funcs)} nullable functions")
 
     def _run_memory_queries_with_models(
         self, db_path: Path, model_pack_dir: Path, results_path: Path
