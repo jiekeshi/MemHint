@@ -400,15 +400,15 @@ class Pipeline:
         with open(codeql_model, "w") as f:
             f.write(self.annotations.to_codeql_model())
 
-        # CodeQL custom query
+        # CodeQL model extension pack
         if isinstance(self.analyzer, CodeQLAnalyzer):
-            query_file = output_dir / "memory_safety.ql"
-            self.analyzer.generate_custom_query(self.annotations, query_file)
+            model_pack_dir = output_dir / "model-pack"
+            self.analyzer._setup_model_pack(model_pack_dir, self.annotations)
         else:
-            # Generate CodeQL query anyway for reference
+            # Generate CodeQL model pack anyway for reference
             codeql = CodeQLAnalyzer()
-            query_file = output_dir / "memory_safety.ql"
-            codeql.generate_custom_query(self.annotations, query_file)
+            model_pack_dir = output_dir / "model-pack"
+            codeql._setup_model_pack(model_pack_dir, self.annotations)
 
         # Infer config (if using Infer)
         if isinstance(self.analyzer, InferAnalyzer):

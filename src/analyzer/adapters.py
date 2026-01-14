@@ -23,7 +23,12 @@ CODEQL_ISSUE_MAP = {
 
 
 class CodeQLAnalyzer:
-    """CodeQL analyzer with custom query support."""
+    """CodeQL analyzer with C/C++ model extension support.
+
+    This analyzer uses CodeQL's model extension mechanism to define custom
+    allocation and deallocation functions, then runs the built-in memory
+    leak detection queries (MemoryNeverFreed.ql and MemoryMayNotBeFreed.ql).
+    """
 
     def __init__(self, binary: str = "codeql", timeout: int = 600):
         self.binary = binary
@@ -33,12 +38,11 @@ class CodeQLAnalyzer:
         self, project_path: Path, annotations: AnnotationSet = None,
         issue_types: list[MemoryIssueType] = None
     ) -> list[Warning]:
-        """Run CodeQL analysis with custom annotations."""
+        """Run CodeQL analysis with model extensions for custom allocators/deallocators."""
         output_dir = Path(tempfile.mkdtemp())
         db_path = output_dir / "codeql-db"
         results_path = output_dir / "results.sarif"
-        query_dir = output_dir / "queries"
-        query_dir.mkdir(exist_ok=True)
+        model_pack_dir = output_dir / "model-pack"
 
         try:
             # Step 1: Create database
@@ -47,18 +51,19 @@ class CodeQLAnalyzer:
                 logger.error("Failed to create database")
                 return []
 
-            # Step 2: Generate and run custom query
+            # Step 2: Generate model pack with custom allocator/deallocator models
             if annotations and len(annotations.annotations) > 0:
-                logger.info("Step 2: Generating custom query...")
-                self._setup_query_pack(query_dir, annotations)
+                logger.info("Step 2: Generating model pack with custom models...")
+                self._setup_model_pack(model_pack_dir, annotations)
 
-                logger.info("Step 3: Running custom query...")
-                if self._run_query(db_path, str(query_dir), results_path):
+                # Step 3: Run built-in memory queries with model pack
+                logger.info("Step 3: Running memory leak queries with custom models...")
+                if self._run_memory_queries_with_models(db_path, model_pack_dir, results_path):
                     return self._parse_sarif(results_path)
 
-            # Step 3: Fallback - try built-in suite
-            logger.info("Trying built-in query suite...")
-            if self._run_builtin(db_path, results_path):
+            # Fallback: Run built-in queries without custom models
+            logger.info("Running built-in memory queries (no custom models)...")
+            if self._run_memory_queries(db_path, results_path):
                 return self._parse_sarif(results_path)
 
             return []
@@ -68,6 +73,10 @@ class CodeQLAnalyzer:
             import traceback
             traceback.print_exc()
             return []
+        finally:
+            # Cleanup
+            if output_dir.exists():
+                shutil.rmtree(output_dir, ignore_errors=True)
 
     def _create_database(self, project_path: Path, db_path: Path) -> bool:
         """Create CodeQL database."""
@@ -116,7 +125,7 @@ class CodeQLAnalyzer:
 
     def _get_build_command(self, project_path: Path) -> str:
         """Determine appropriate build command for project.
-        
+
         When analyzing original project (not merged), try to detect build system.
         When analyzing merged file, use direct compilation.
         """
@@ -193,41 +202,238 @@ class CodeQLAnalyzer:
 
         return None
 
-    def _setup_query_pack(self, query_dir: Path, annotations: AnnotationSet) -> None:
-        """Create query pack with custom query."""
-        # Create qlpack.yml
-        qlpack = """name: hint-queries
+    def _setup_model_pack(self, model_pack_dir: Path, annotations: AnnotationSet) -> None:
+        """Create a CodeQL model pack with custom allocation/deallocation models.
+
+        This creates a library pack that extends AllocationFunction and DeallocationFunction
+        classes to recognize custom allocators and deallocators from annotations.
+        """
+        model_pack_dir.mkdir(parents=True, exist_ok=True)
+
+        # Collect function annotations
+        alloc_funcs = []
+        free_funcs = []
+
+        for func_name, anns in annotations.annotations.items():
+            for ann in anns:
+                if ann.annotation_type in (AnnotationType.ALLOC_SOURCE, AnnotationType.ARRAY_ALLOC):
+                    if func_name not in ("main", "_main") and func_name not in alloc_funcs:
+                        alloc_funcs.append(func_name)
+                elif ann.annotation_type == AnnotationType.FREE_SINK:
+                    if func_name not in free_funcs:
+                        free_funcs.append(func_name)
+
+        # Create qlpack.yml for the model pack
+        qlpack_content = """name: hint/memory-models
 version: 0.0.1
+library: true
 dependencies:
   codeql/cpp-all: "*"
+dataExtensions:
+  - models/**/*.yml
 """
-        (query_dir / "qlpack.yml").write_text(qlpack)
+        (model_pack_dir / "qlpack.yml").write_text(qlpack_content)
+
+        # Create models directory
+        models_dir = model_pack_dir / "models"
+        models_dir.mkdir(exist_ok=True)
+
+        # Generate the model extension YAML file
+        # Note: For memory leak queries, we need to extend AllocationFunction and DeallocationFunction
+        # This is done via a library (.qll) file that gets imported by the queries
+        self._generate_model_extension_library(model_pack_dir, alloc_funcs, free_funcs)
+
+        # Also generate a data extension file for dataflow models (if needed by some queries)
+        self._generate_data_extension(models_dir, alloc_funcs, free_funcs)
 
         # Install dependencies
-        subprocess.run(
-            [self.binary, "pack", "install", str(query_dir)],
+        logger.info("Installing model pack dependencies...")
+        result = subprocess.run(
+            [self.binary, "pack", "install", str(model_pack_dir)],
             capture_output=True, timeout=300
         )
+        if result.returncode != 0:
+            logger.warning(f"Pack install warning: {result.stderr.decode()[:500]}")
 
-        # Generate query
-        self.generate_custom_query(annotations, query_dir / "hint_memory.ql")
+        logger.info(f"Model pack created with {len(alloc_funcs)} allocators, {len(free_funcs)} deallocators")
 
-    def _run_query(self, db_path: Path, query_path: str, results_path: Path) -> bool:
-        """Run CodeQL query."""
+    def _generate_model_extension_library(
+        self, model_pack_dir: Path, alloc_funcs: list[str], free_funcs: list[str]
+    ) -> None:
+        """Generate a CodeQL library (.qll) file that extends AllocationFunction and DeallocationFunction.
+
+        This allows the built-in MemoryNeverFreed.ql and MemoryMayNotBeFreed.ql queries
+        to recognize our custom allocators and deallocators.
+        """
+        # Generate the list of function names for CodeQL
+        alloc_names = ", ".join(f'"{f}"' for f in alloc_funcs) if alloc_funcs else '"__hint_no_custom_alloc__"'
+        free_names = ", ".join(f'"{f}"' for f in free_funcs) if free_funcs else '"__hint_no_custom_free__"'
+
+        qll_content = f'''/**
+ * @name HINT Custom Memory Models
+ * @description Extends CodeQL's built-in allocation and deallocation models
+ *              with custom functions identified by LLM annotations.
+ */
+
+import cpp
+private import semmle.code.cpp.models.interfaces.Allocation
+private import semmle.code.cpp.models.interfaces.Deallocation
+
+/**
+ * Custom allocation functions identified by HINT/LLM annotations.
+ * These functions allocate memory that must be freed.
+ */
+class HintAllocationFunction extends AllocationFunction {{
+  HintAllocationFunction() {{
+    this.getName() in [{alloc_names}]
+  }}
+
+  override predicate requiresDealloc() {{ any() }}
+}}
+
+/**
+ * Custom deallocation functions identified by HINT/LLM annotations.
+ * These functions free memory allocated by allocation functions.
+ */
+class HintDeallocationFunction extends DeallocationFunction {{
+  HintDeallocationFunction() {{
+    this.getName() in [{free_names}]
+  }}
+
+  override int getFreedArg() {{ result = 0 }}
+}}
+'''
+        (model_pack_dir / "HintMemoryModels.qll").write_text(qll_content)
+        logger.info(f"Generated HintMemoryModels.qll with custom allocators/deallocators")
+
+    def _generate_data_extension(
+        self, models_dir: Path, alloc_funcs: list[str], free_funcs: list[str]
+    ) -> None:
+        """Generate data extension YAML for dataflow models.
+
+        This provides additional dataflow information that some queries may use.
+        """
+        extensions = []
+
+        # Model allocators as sources (return value is a fresh allocation)
+        if alloc_funcs:
+            source_data = []
+            for func in alloc_funcs:
+                # Format: [namespace, type, subtypes, name, signature, ext, output, kind, provenance]
+                source_data.append(["", "", False, func, "", "", "ReturnValue", "allocation", "manual"])
+
+            extensions.append({
+                "addsTo": {
+                    "pack": "codeql/cpp-all",
+                    "extensible": "sourceModel"
+                },
+                "data": source_data
+            })
+
+        # Model deallocators as sinks (argument is freed)
+        if free_funcs:
+            sink_data = []
+            for func in free_funcs:
+                # Format: [namespace, type, subtypes, name, signature, ext, input, kind, provenance]
+                sink_data.append(["", "", False, func, "", "", "Argument[0]", "deallocation", "manual"])
+
+            extensions.append({
+                "addsTo": {
+                    "pack": "codeql/cpp-all",
+                    "extensible": "sinkModel"
+                },
+                "data": sink_data
+            })
+
+        if extensions:
+            import yaml
+            yaml_content = {"extensions": extensions}
+            (models_dir / "hint-memory-models.model.yml").write_text(
+                yaml.dump(yaml_content, default_flow_style=False, sort_keys=False)
+            )
+            logger.info("Generated hint-memory-models.model.yml")
+
+    def _run_memory_queries_with_models(
+        self, db_path: Path, model_pack_dir: Path, results_path: Path
+    ) -> bool:
+        """Run built-in memory leak queries with custom model pack."""
+        # The memory queries we want to run - correct path format: pack:path
+        memory_queries = [
+            "codeql/cpp-queries:Critical/MemoryNeverFreed.ql",
+            "codeql/cpp-queries:Critical/MemoryMayNotBeFreed.ql",
+            "codeql/cpp-queries:Critical/DoubleFree.ql",
+            "codeql/cpp-queries:Critical/UseAfterFree.ql",
+            "codeql/cpp-queries:Critical/MissingNullTest.ql",
+        ]
+
         cmd = [
             self.binary, "database", "analyze",
             str(db_path),
-            query_path,
             "--format=sarif-latest",
             f"--output={results_path}",
-        ]
+            f"--additional-packs={model_pack_dir}",
+            "--download",  # Auto-download missing packs
+        ] + memory_queries
 
         logger.info(f"Running: {' '.join(cmd)}")
         result = subprocess.run(cmd, timeout=self.timeout, capture_output=True)
 
         if result.returncode != 0:
-            logger.warning(f"Query failed: {result.stderr.decode()[:500]}")
+            logger.warning(f"Memory queries with models failed: {result.stderr.decode()[:500]}")
+            # Try alternative approach: run query suite
+            return self._run_memory_suite_with_models(db_path, model_pack_dir, results_path)
+
+        return True
+
+    def _run_memory_suite_with_models(
+        self, db_path: Path, model_pack_dir: Path, results_path: Path
+    ) -> bool:
+        """Alternative: Run security-and-quality suite which includes memory queries."""
+        cmd = [
+            self.binary, "database", "analyze",
+            str(db_path),
+            "codeql/cpp-queries:codeql-suites/cpp-security-and-quality.qls",
+            "--format=sarif-latest",
+            f"--output={results_path}",
+            f"--additional-packs={model_pack_dir}",
+            "--download",
+        ]
+
+        logger.info(f"Running suite: {' '.join(cmd)}")
+        result = subprocess.run(cmd, timeout=self.timeout, capture_output=True)
+
+        if result.returncode != 0:
+            logger.warning(f"Suite failed: {result.stderr.decode()[:500]}")
             return False
+        return True
+
+    def _run_memory_queries(self, db_path: Path, results_path: Path) -> bool:
+        """Run built-in memory leak queries without custom models."""
+        # Try running specific memory queries first - correct path format
+        memory_queries = [
+            "codeql/cpp-queries:Critical/MemoryNeverFreed.ql",
+            "codeql/cpp-queries:Critical/MemoryMayNotBeFreed.ql",
+            "codeql/cpp-queries:Critical/DoubleFree.ql",
+            "codeql/cpp-queries:Critical/UseAfterFree.ql",
+            "codeql/cpp-queries:Likely Bugs/Memory Management/MissingNullTest.ql",
+        ]
+
+        cmd = [
+            self.binary, "database", "analyze",
+            str(db_path),
+            "--format=sarif-latest",
+            f"--output={results_path}",
+            "--download",
+        ] + memory_queries
+
+        logger.info(f"Running: {' '.join(cmd)}")
+        result = subprocess.run(cmd, timeout=self.timeout, capture_output=True)
+
+        if result.returncode != 0:
+            logger.warning(f"Specific memory queries failed, trying suite...")
+            # Fallback to built-in suite
+            return self._run_builtin(db_path, results_path)
+
         return True
 
     def _run_builtin(self, db_path: Path, results_path: Path) -> bool:
@@ -235,9 +441,10 @@ dependencies:
         cmd = [
             self.binary, "database", "analyze",
             str(db_path),
-            "cpp-security-and-quality",
+            "codeql/cpp-queries:codeql-suites/cpp-security-and-quality.qls",
             "--format=sarif-latest",
             f"--output={results_path}",
+            "--download",
         ]
 
         result = subprocess.run(cmd, timeout=self.timeout, capture_output=True)
@@ -282,363 +489,6 @@ dependencies:
             logger.warning(f"SARIF parse error: {e}")
 
         return warnings
-
-    def generate_custom_query(self, annotations: AnnotationSet, output_path: Path) -> None:
-        """Generate comprehensive CodeQL query for memory safety.
-
-        Detects:
-        1. Memory Leak - allocated memory not freed
-        2. Use-After-Free - memory accessed after being freed
-        3. Double-Free - memory freed twice
-        4. Null Dereference - pointer used without null check
-
-        Uses annotations to recognize custom allocators/deallocators/nullable functions.
-        """
-        # Collect function annotations
-        alloc_funcs = []
-        free_funcs = []
-        nullable_funcs = []  # Functions that may return NULL
-
-        # Collect LLM bug hints (for logging/comments only)
-        bug_hints = {
-            "leak_vars": [],
-            "uaf_vars": [],
-            "double_free_vars": [],
-            "null_deref_vars": [],
-            "suspect_functions": set(),
-        }
-
-        for func_name, anns in annotations.annotations.items():
-            for ann in anns:
-                # Function property annotations
-                if ann.annotation_type in (AnnotationType.ALLOC_SOURCE, AnnotationType.ARRAY_ALLOC):
-                    if func_name not in ("main", "_main"):
-                        alloc_funcs.append(func_name)
-                        # Allocators can return NULL, so they're also nullable
-                        if func_name not in nullable_funcs:
-                            nullable_funcs.append(func_name)
-                elif ann.annotation_type == AnnotationType.FREE_SINK:
-                    free_funcs.append(func_name)
-                elif ann.annotation_type in (AnnotationType.NULLABLE_RETURN, AnnotationType.MUST_CHECK_NULL):
-                    if func_name not in nullable_funcs:
-                        nullable_funcs.append(func_name)
-
-                # Bug hint annotations (for comments only)
-                elif ann.annotation_type == AnnotationType.POTENTIAL_LEAK:
-                    bug_hints["leak_vars"].append((func_name, ann.target))
-                    bug_hints["suspect_functions"].add(func_name)
-                elif ann.annotation_type == AnnotationType.USE_AFTER_FREE:
-                    bug_hints["uaf_vars"].append((func_name, ann.target))
-                    bug_hints["suspect_functions"].add(func_name)
-                elif ann.annotation_type == AnnotationType.DOUBLE_FREE:
-                    bug_hints["double_free_vars"].append((func_name, ann.target))
-                    bug_hints["suspect_functions"].add(func_name)
-                elif ann.annotation_type == AnnotationType.NULL_DEREF:
-                    bug_hints["null_deref_vars"].append((func_name, ann.target))
-                    bug_hints["suspect_functions"].add(func_name)
-
-        # Generate CodeQL lists
-        # alloc_funcs=[]
-        # free_funcs=[]
-        # nullable_funcs=[]
-        alloc_list = ", ".join(f'"{f}"' for f in alloc_funcs) if alloc_funcs else '"__hint_none__"'
-        free_list = ", ".join(f'"{f}"' for f in free_funcs) if free_funcs else '"__hint_none__"'
-        nullable_list = ", ".join(f'"{f}"' for f in nullable_funcs) if nullable_funcs else '"__hint_none__"'
-
-        query = f'''/**
- * @name HINT Comprehensive Memory Safety Check
- * @description Detects memory leaks, use-after-free, double-free, and null dereference
- * @kind problem
- * @problem.severity error
- * @precision medium
- * @id cpp/hint-memory-safety
- */
-
-import cpp
-
-//=============================================================================
-// HINT-Generated Function Classes
-//=============================================================================
-
-// Custom allocator functions (from HINT annotations)
-class CustomAlloc extends Function {{
-  CustomAlloc() {{ this.getName() in [{alloc_list}] }}
-}}
-
-// Custom deallocator functions (from HINT annotations)
-class CustomFree extends Function {{
-  CustomFree() {{ this.getName() in [{free_list}] }}
-}}
-
-// Custom nullable functions (from HINT annotations)
-class CustomNullable extends Function {{
-  CustomNullable() {{ this.getName() in [{nullable_list}] }}
-}}
-
-// Any allocator (standard + custom)
-class AnyAlloc extends Function {{
-  AnyAlloc() {{
-    this.getName() in ["malloc", "calloc", "realloc", "strdup", "strndup", "aligned_alloc", "memalign", "pvalloc", "valloc"]
-    or this instanceof CustomAlloc
-  }}
-}}
-
-// Any deallocator (standard + custom)
-class AnyFree extends Function {{
-  AnyFree() {{
-    this.getName() in ["free", "cfree", "g_free", "delete"]
-    or this instanceof CustomFree
-  }}
-}}
-
-// Any function that may return NULL
-class AnyNullable extends Function {{
-  AnyNullable() {{
-    // Standard library functions that may return NULL
-    this.getName() in ["malloc", "calloc", "realloc", "fopen", "fgets", "gets",
-                       "strdup", "strndup", "getenv", "bsearch", "strchr", "strrchr",
-                       "strstr", "strpbrk", "memchr", "tmpfile", "freopen",
-                       "aligned_alloc", "memalign", "pvalloc", "valloc"]
-    or this instanceof CustomNullable
-  }}
-}}
-
-//=============================================================================
-// Helper Predicates
-//=============================================================================
-
-// Get the variable that receives a function call result
-Variable getResultVar(FunctionCall call) {{
-  // Case 1: int *p = func(...)
-  result.getInitializer().getExpr() = call
-  or
-  // Case 2: p = func(...)
-  exists(AssignExpr assign |
-    assign.getRValue() = call and
-    result = assign.getLValue().(VariableAccess).getTarget()
-  )
-}}
-
-// Check if variable is freed in function
-predicate isFreedInFunc(Variable v, Function f) {{
-  exists(FunctionCall freeCall |
-    freeCall.getTarget() instanceof AnyFree and
-    freeCall.getEnclosingFunction() = f and
-    freeCall.getAnArgument().(VariableAccess).getTarget() = v
-  )
-}}
-
-// Check if variable is returned from function
-predicate isReturnedFromFunc(Variable v, Function f) {{
-  exists(ReturnStmt ret |
-    ret.getEnclosingFunction() = f and
-    ret.getExpr().(VariableAccess).getTarget() = v
-  )
-}}
-
-// Check if variable escapes (stored globally or passed to unknown function)
-predicate varEscapes(Variable v) {{
-  // Assigned to global or field
-  exists(AssignExpr a |
-    a.getRValue().(VariableAccess).getTarget() = v and
-    (
-      a.getLValue().(VariableAccess).getTarget() instanceof GlobalVariable or
-      a.getLValue() instanceof FieldAccess
-    )
-  )
-  or
-  // Passed to function that might store it
-  exists(FunctionCall fc |
-    fc.getAnArgument().(VariableAccess).getTarget() = v and
-    not fc.getTarget() instanceof AnyFree and
-    not fc.getTarget().getName() in ["printf", "fprintf", "sprintf", "snprintf",
-                                      "puts", "fputs", "fwrite", "memcpy", "memmove",
-                                      "memset", "memcmp", "strlen", "strcmp", "strncmp"]
-  )
-}}
-
-//=============================================================================
-// Pointer Dereference Detection
-//=============================================================================
-
-class PointerDeref extends Expr {{
-  Variable ptrVar;
-
-  PointerDeref() {{
-    // *p
-    (
-      this instanceof PointerDereferenceExpr and
-      ptrVar = this.(PointerDereferenceExpr).getOperand().(VariableAccess).getTarget()
-    )
-    or
-    // p[i]
-    (
-      this instanceof ArrayExpr and
-      ptrVar = this.(ArrayExpr).getArrayBase().(VariableAccess).getTarget()
-    )
-    or
-    // p->field
-    (
-      this instanceof PointerFieldAccess and
-      ptrVar = this.(PointerFieldAccess).getQualifier().(VariableAccess).getTarget()
-    )
-  }}
-
-  Variable getPtrVar() {{ result = ptrVar }}
-}}
-
-//=============================================================================
-// Free Call Detection
-//=============================================================================
-
-class FreeCall extends FunctionCall {{
-  Variable freedVar;
-
-  FreeCall() {{
-    this.getTarget() instanceof AnyFree and
-    freedVar = this.getAnArgument().(VariableAccess).getTarget()
-  }}
-
-  Variable getFreedVar() {{ result = freedVar }}
-}}
-
-//=============================================================================
-// Bug Detection Predicates
-//=============================================================================
-
-// Use-After-Free: dereference after free (same function, by line number)
-predicate useAfterFree(FreeCall freeCall, PointerDeref deref, Variable v) {{
-  freeCall.getFreedVar() = v and
-  deref.getPtrVar() = v and
-  freeCall.getEnclosingFunction() = deref.getEnclosingFunction() and
-  freeCall.getLocation().getStartLine() < deref.getLocation().getStartLine()
-}}
-
-// Double-Free: two frees of same variable (same function, by line number)
-predicate doubleFree(FreeCall f1, FreeCall f2, Variable v) {{
-  f1.getFreedVar() = v and
-  f2.getFreedVar() = v and
-  f1 != f2 and
-  f1.getEnclosingFunction() = f2.getEnclosingFunction() and
-  f1.getLocation().getStartLine() < f2.getLocation().getStartLine()
-}}
-
-// Null Dereference: dereference without null check
-predicate isNullChecked(Variable v, PointerDeref deref) {{
-  // Check if there's an if-statement checking this variable before the deref
-  exists(IfStmt ifStmt, VariableAccess checkAccess |
-    // The condition checks our variable
-    checkAccess = ifStmt.getCondition().getAChild*() and
-    checkAccess.getTarget() = v and
-    // The deref is inside the then-branch (protected path)
-    ifStmt.getThen().getAChild*() = deref
-  )
-  or
-  // Early return pattern: if (!p) return;
-  exists(IfStmt ifStmt, ReturnStmt ret |
-    ifStmt.getCondition().getAChild*().(VariableAccess).getTarget() = v and
-    ifStmt.getThen().getAChild*() = ret and
-    ifStmt.getLocation().getStartLine() < deref.getLocation().getStartLine() and
-    ifStmt.getEnclosingFunction() = deref.getEnclosingFunction()
-  )
-  or
-  // Ternary check: p ? *p : default
-  exists(ConditionalExpr cond |
-    cond.getCondition().getAChild*().(VariableAccess).getTarget() = v and
-    cond.getThen().getAChild*() = deref
-  )
-}}
-
-predicate nullDeref(FunctionCall nullableCall, PointerDeref deref, Variable v) {{
-  // Call to function that may return NULL
-  nullableCall.getTarget() instanceof AnyNullable and
-  v = getResultVar(nullableCall) and
-  // Dereferenced in same function
-  deref.getPtrVar() = v and
-  nullableCall.getEnclosingFunction() = deref.getEnclosingFunction() and
-  // Deref comes after the call
-  nullableCall.getLocation().getStartLine() < deref.getLocation().getStartLine() and
-  // Not protected by null check
-  not isNullChecked(v, deref)
-}}
-
-//=============================================================================
-// Main Query
-//=============================================================================
-
-from Expr loc, string issue, string detail, Function f
-where
-  // Memory Leak: allocated but not freed
-  (
-    exists(FunctionCall allocCall, Variable v |
-      allocCall.getTarget() instanceof AnyAlloc and
-      v = getResultVar(allocCall) and
-      f = allocCall.getEnclosingFunction() and
-      not isFreedInFunc(v, f) and
-      not isReturnedFromFunc(v, f) and
-      not varEscapes(v) and
-      loc = allocCall and
-      issue = "Memory Leak" and
-      detail = "'" + v.getName() + "' allocated but never freed in " + f.getName() + "()"
-    )
-  )
-  or
-  // Use-After-Free: dereferenced after being freed
-  (
-    exists(FreeCall freeCall, PointerDeref deref, Variable v |
-      useAfterFree(freeCall, deref, v) and
-      f = freeCall.getEnclosingFunction() and
-      loc = deref and
-      issue = "Use-After-Free" and
-      detail = "'" + v.getName() + "' used after free at line " + freeCall.getLocation().getStartLine().toString()
-    )
-  )
-  or
-  // Double-Free: freed twice
-  (
-    exists(FreeCall f1, FreeCall f2, Variable v |
-      doubleFree(f1, f2, v) and
-      f = f1.getEnclosingFunction() and
-      loc = f2 and
-      issue = "Double-Free" and
-      detail = "'" + v.getName() + "' freed again (first free at line " + f1.getLocation().getStartLine().toString() + ")"
-    )
-  )
-  or
-  // Null Dereference: used without null check after nullable call
-  (
-    exists(FunctionCall nullableCall, PointerDeref deref, Variable v |
-      nullDeref(nullableCall, deref, v) and
-      f = nullableCall.getEnclosingFunction() and
-      loc = deref and
-      issue = "Null Dereference" and
-      detail = "'" + v.getName() + "' may be NULL (from " + nullableCall.getTarget().getName() + " at line " + nullableCall.getLocation().getStartLine().toString() + ")"
-    )
-  )
-select loc, issue + ": " + detail
-'''
-
-        # Add LLM hints as comments (for reference only)
-        if bug_hints["suspect_functions"]:
-            hint_comment = f'''
-// =============================================================================
-// LLM Bug Hints (for reference - not used in detection logic):
-// Suspect functions: {list(bug_hints["suspect_functions"])}
-// Potential leaks: {bug_hints["leak_vars"]}
-// Potential UAF: {bug_hints["uaf_vars"]}
-// Potential double-free: {bug_hints["double_free_vars"]}
-// Potential null-deref: {bug_hints["null_deref_vars"]}
-// =============================================================================
-'''
-            query = query.replace("import cpp", f"import cpp\n{hint_comment}")
-
-        output_path.write_text(query)
-        logger.info(f"Generated CodeQL query: {output_path}")
-        logger.info(f"  Custom allocators: {alloc_funcs}")
-        logger.info(f"  Custom deallocators: {free_funcs}")
-        logger.info(f"  Nullable functions: {nullable_funcs}")
-        if bug_hints["suspect_functions"]:
-            logger.info(f"  LLM suspect functions: {list(bug_hints['suspect_functions'])}")
 
 
 class InferAnalyzer:
