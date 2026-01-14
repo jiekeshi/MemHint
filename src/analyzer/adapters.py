@@ -1,16 +1,4 @@
 """Static analyzer adapters for CodeQL and Facebook Infer.
-
-关键理解：
-- DoubleFree.ql, UseAfterFree.ql 使用 DeallocationExpr 来识别 free 操作
-- DeallocationExpr 是通过 DeallocationFunction 派生的
-- 如果 FunctionCall.getTarget() instanceof DeallocationFunction，那这个 call 就是 DeallocationExpr
-- 所以扩展 DeallocationFunction 就能让这些 queries 识别自定义 deallocators
-
-- MemoryNeverFreed.ql, MemoryMayNotBeFreed.ql 使用 AllocationExpr
-- AllocationExpr 是通过 AllocationFunction 派生的
-- 扩展 AllocationFunction 就能让这些 queries 识别自定义 allocators
-
-- MissingNullTest.ql 检查 null 返回值，可能需要不同的机制
 """
 
 import json
@@ -76,12 +64,9 @@ class CodeQLAnalyzer:
                 has_custom_models = self._setup_model_pack(model_pack_dir, hints)
 
             # Step 3: Run queries
-            if has_custom_models:
-                logger.info("Step 3: Running queries with custom models...")
-                success = self._run_memory_queries_with_models(db_path, model_pack_dir, results_path)
-            else:
-                logger.info("Step 3: Running queries without custom models...")
-                success = self._run_memory_queries(db_path, results_path)
+
+            logger.info("Step 3: Running queries with custom models...")
+            success = self._run_memory_queries_with_models(db_path, model_pack_dir, results_path)
 
             if success:
                 return self._parse_sarif(results_path)
@@ -229,19 +214,6 @@ extensionTargets:
         nullable_funcs: list[str] = None
     ) -> None:
         """Generate CodeQL library extending AllocationFunction and DeallocationFunction.
-
-        Key insight:
-        - Queries like DoubleFree.ql check: fc instanceof DeallocationExpr
-        - DeallocationExpr is satisfied when fc.getTarget() instanceof DeallocationFunction
-        - So extending DeallocationFunction makes our custom deallocators recognized
-
-        Same logic applies to AllocationFunction -> AllocationExpr for memory leak queries.
-
-        For MissingNullTest.ql:
-        - It checks AllocationExpr and verifies null check before dereference
-        - Since AllocationExpr is derived from AllocationFunction, our custom allocators
-          will also be checked for missing null tests
-        - The predicate requiresDealloc() indicates memory that could fail (return NULL)
         """
         if nullable_funcs is None:
             nullable_funcs = []
@@ -355,39 +327,6 @@ class HintDeallocationFunction extends DeallocationFunction {{
             logger.debug(f"stdout:\n{stdout[:2000]}")
         if stderr:
             logger.info(f"stderr:\n{stderr[:2000]}")
-
-        if result.returncode != 0:
-            logger.warning("Query execution returned non-zero, trying fallback...")
-            return self._run_memory_queries(db_path, results_path)
-
-        return results_path.exists()
-
-    def _run_memory_queries(self, db_path: Path, results_path: Path) -> bool:
-        """Run built-in memory queries without custom models."""
-        memory_queries = [
-            "codeql/cpp-queries:Critical/MemoryNeverFreed.ql",
-            "codeql/cpp-queries:Critical/MemoryMayNotBeFreed.ql",
-            "codeql/cpp-queries:Critical/DoubleFree.ql",
-            "codeql/cpp-queries:Critical/UseAfterFree.ql",
-            "codeql/cpp-queries:Critical/MissingNullTest.ql",
-            "codeql/cpp-queries:Critical/OverflowCalculated.ql",
-            "codeql/cpp-queries:Critical/OverflowDestination.ql",
-            "codeql/cpp-queries:Critical/OverflowStatic.ql",
-        ]
-
-        cmd = [
-            self.binary, "database", "analyze",
-            str(db_path),
-            "--format=sarif-latest",
-            f"--output={results_path}",
-            "--download",
-        ] + memory_queries
-
-        logger.info(f"Running CodeQL analyze (no custom models)...")
-        result = subprocess.run(cmd, timeout=self.timeout, capture_output=True)
-
-        if result.returncode != 0:
-            logger.warning(f"Queries failed: {result.stderr.decode()[:500]}")
 
         return results_path.exists()
 
