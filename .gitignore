@@ -209,4 +209,9 @@ __marimo__/
 py314
 output/
 .vscode
+
+codeql/
+*.zst
+huihui-472807-b8069b88637c.json
+bugscpp/
 keyfile.json

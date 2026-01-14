@@ -13,6 +13,9 @@ TODO: I am not sure if this is in correct format.
 
 import logging
 import re
+import subprocess
+import tempfile
+import shutil
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -510,62 +513,123 @@ class CodeMerger:
         return None
 
     def _llm_fix_code(self, merged: MergedCode) -> MergedCode:
-        """Use LLM to fix compilation issues."""
+        """Use LLM to fix compilation issues.
+
+        Flow:
+        1) Run a one-shot clang++/clang syntax check on the merged file.
+        2) If there are errors, send BOTH the compiler errors and the source
+           code to the LLM and let it return a patched version.
+        """
         if not self.llm:
             return merged
 
-        prompt = f"""Fix this auto-merged C code to make it compilable.
+        # 1) Write merged code to a temp file and run a single build.
+        tmp_dir = Path(tempfile.mkdtemp())
+        tmp_file = tmp_dir / "merged_analysis.c"
+        tmp_file.write_text(merged.code)
+
+        try:
+            compile_cmd = ["clang++", "-I.", "-c", "-fsyntax-only", str(tmp_file)]
+            result = subprocess.run(compile_cmd, capture_output=True)
+
+            # If compilation succeeds, no need to ask LLM.
+            if result.returncode == 0:
+                return merged
+
+            compiler_error = result.stderr.decode(errors="ignore")
+
+            # 2) Ask LLM to fix code using both error output and source.
+            prompt = f"""
+Fix this auto-merged source code to make it compilable.
+
+Compiler errors (from a single clang++ -fsyntax-only run):
+
+```text
+{compiler_error[:2000]}
+```
 
 IMPORTANT RULES:
-1. Add MINIMAL stub definitions for missing types:
-   `typedef struct {{ void* _opaque; }} MissingType;`
-2. Add MINIMAL stub declarations for missing functions:
-   `extern void* missing_func(void);`
-3. DO NOT modify existing function bodies or logic
-4. DO NOT remove any code or comments
-5. PRESERVE all "/* From: ... */" location comments exactly
-6. PRESERVE all "/* @ANNOTATION */" comments exactly
-7. If code looks compilable, return UNCHANGED
+1. Infer whether the code is C or C++ strictly from the input.
+   - If C++ features appear (e.g., templates, member functions, <string>),
+     treat the file as C++.
+   - Otherwise, treat it as C.
 
+2. Add MINIMAL declarations for missing types:
+   - Prefer forward declarations when possible:
+     `struct TypeName;` or `class TypeName;`
+   - If the full definition is required, use a minimal opaque stub:
+     `struct TypeName {{ void* _opaque; }};`
+
+3. Add MINIMAL declarations for missing functions:
+   `extern void* missing_func(...);`
+
+4. Fix missing standard library usage conservatively:
+   - If the code uses `string`, `weak_ptr`, etc., add the correct standard headers.
+   - Qualify with `std::` or add `using` declarations only if needed.
+   - If standard headers are unavailable, use `__has_include` with minimal fallbacks.
+
+5. DO NOT modify existing function bodies or logic.
+
+6. DO NOT remove any code or comments.
+
+7. PRESERVE all `/* From: ... */` location comments EXACTLY.
+
+8. PRESERVE all `/* @ANNOTATION */` comments EXACTLY.
+
+9. Prefer adding includes, forward declarations, or stubs over rewriting existing lines.
+
+10. If the code already appears compilable, return it UNCHANGED.
+
+--- BEGIN SOURCE CODE ---
 ```c
 {merged.code[:15000]}
 ```
+--- END SOURCE CODE ---
 
-Return ONLY the fixed C code. No explanations or markdown."""
+OUTPUT:
+Return only the fixed source file content.
+"""
 
-        try:
-            response = self.llm.client.chat.completions.create(
-                model=self.llm.model,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            fixed_code = response.choices[0].message.content
+            try:
+                fixed_code = self.llm.generate_text(prompt)
+                if not fixed_code:
+                    return merged
 
-            # Extract code from markdown if present
-            if "```c" in fixed_code:
-                fixed_code = fixed_code.split("```c", 1)[1].split("```", 1)[0]
-            elif "```" in fixed_code:
-                parts = fixed_code.split("```")
-                if len(parts) >= 2:
-                    fixed_code = parts[1]
+                # Extract code from markdown if present
+                if "```c" in fixed_code:
+                    fixed_code = fixed_code.split("```c", 1)[1].split("```", 1)[0]
+                elif "```" in fixed_code:
+                    parts = fixed_code.split("```")
+                    if len(parts) >= 2:
+                        fixed_code = parts[1]
 
-            fixed_code = fixed_code.strip()
+                fixed_code = fixed_code.strip()
 
-            # Sanity check
-            if len(fixed_code) < len(merged.code) * 0.3:
-                logger.warning("LLM returned suspiciously short code, using original")
+                # Sanity check
+                if len(fixed_code) < len(merged.code) * 0.3:
+                    logger.warning("LLM returned suspiciously short code, using original")
+                    return merged
+
+                # Optional: re-check compilation once on the patched code.
+                tmp_file.write_text(fixed_code)
+                result2 = subprocess.run(compile_cmd, capture_output=True)
+                if result2.returncode != 0:
+                    logger.warning("LLM patch still does not compile, keeping original merged code")
+                    return merged
+
+                logger.info("LLM patched merged code for compilation")
+                return MergedCode(
+                    code=fixed_code,
+                    location_map=merged.location_map,
+                    included_functions=merged.included_functions,
+                    included_types=merged.included_types,
+                )
+
+            except Exception as e:
+                logger.warning(f"LLM fix failed: {e}")
                 return merged
-
-            logger.info("LLM patched merged code for compilation")
-            return MergedCode(
-                code=fixed_code,
-                location_map=merged.location_map,
-                included_functions=merged.included_functions,
-                included_types=merged.included_types,
-            )
-
-        except Exception as e:
-            logger.warning(f"LLM fix failed: {e}")
-            return merged
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     @staticmethod
     def map_result_to_original(
