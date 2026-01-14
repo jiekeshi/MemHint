@@ -1,4 +1,4 @@
-"""OpenAI LLM client for memory safety annotation generation."""
+"""LLM client for memory safety annotation generation."""
 
 import json
 import logging

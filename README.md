@@ -31,7 +31,7 @@ brew install codeql
 ## Basic Usage
 
 ```bash
-export OPENAI_API_KEY="your_openai_api_key_here"
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your/keyfile.json"
 # Detect all memory safety issues
 python main.py --project ./data/example
 
