@@ -87,11 +87,27 @@ class CodeParser:
         return_exprs = set()
 
         declarator = None
+        pointer_depth = 0  # Track number of * in return type
+
         for child in node.children:
-            if child.type in ("declarator", "function_declarator", "pointer_declarator"):
+            if child.type == "pointer_declarator":
+                # Count pointer depth and find inner declarator
+                declarator, pointer_depth = self._unwrap_pointer_declarator(child, source)
+            elif child.type in ("declarator", "function_declarator"):
                 declarator = child
             elif child.type in ("primitive_type", "type_identifier", "sized_type_specifier"):
                 return_type = source[child.start_byte:child.end_byte].decode()
+            elif child.type == "type_qualifier":
+                # Handle const, volatile, etc.
+                qualifier = source[child.start_byte:child.end_byte].decode()
+                if return_type:
+                    return_type = qualifier + " " + return_type
+                else:
+                    return_type = qualifier
+
+        # Append pointer stars to return type
+        if pointer_depth > 0:
+            return_type = return_type + "*" * pointer_depth
 
         if declarator:
             name, arg_names, arg_types = self._parse_declarator(declarator, source)
@@ -133,6 +149,38 @@ class CodeParser:
             return_expressions=return_exprs,
             return_type=return_type,
         )
+
+    def _unwrap_pointer_declarator(self, node, source: bytes) -> tuple:
+        """Unwrap nested pointer_declarator to get the inner declarator and pointer depth.
+
+        For `char* foo()`, the AST is:
+            pointer_declarator
+              └── function_declarator
+                    └── identifier: "foo"
+
+        For `char** foo()`, the AST is:
+            pointer_declarator
+              └── pointer_declarator
+                    └── function_declarator
+                          └── identifier: "foo"
+
+        Returns: (inner_declarator, pointer_depth)
+        """
+        pointer_depth = 0
+        current = node
+
+        while current.type == "pointer_declarator":
+            pointer_depth += 1
+            # Find the child that's not '*'
+            for child in current.children:
+                if child.type in ("pointer_declarator", "function_declarator", "declarator"):
+                    current = child
+                    break
+            else:
+                # No declarator child found, break
+                break
+
+        return current, pointer_depth
 
     def _parse_declarator(self, node, source: bytes) -> tuple[str, list[str], list[str]]:
         """Parse function declarator for name and parameters."""

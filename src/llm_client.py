@@ -14,8 +14,20 @@ Hint Types:
 import json
 import logging
 import os
-import re
 import time
+
+
+try:
+    import vertexai
+    from vertexai.generative_models import GenerativeModel
+
+    VERTEX_AI_AVAILABLE = True
+except ImportError:  # pragma: no cover - environment may not have Vertex SDK
+    vertexai = None
+    GenerativeModel = None
+    VERTEX_AI_AVAILABLE = False
+
+
 
 from src.core.models import FunctionInfo, Hint, HintType, HintSet
 
@@ -26,58 +38,109 @@ logger = logging.getLogger(__name__)
 # Prompt Template for Hint Generation
 # =============================================================================
 
-HINT_GENERATION_PROMPT = """You are a memory safety expert analyzing C/C++ code.
+HINT_GENERATION_PROMPT = """You are a memory safety expert analyzing C/C++ code to identify function semantics that help static analyzers detect memory bugs.
 
-Analyze this function and identify its MEMORY SEMANTICS (not bugs):
+## Task
+Analyze this function and identify its MEMORY SEMANTICS and its behavioral properties relevant to memory safety.
 
-Function: {func_name}
-Return type: {return_type}
-Parameters: {parameters}
-
+**Function:** `{func_name}`
+**Return type:** `{return_type}`
+**Parameters:** `{parameters}`
 ```c
 {code}
 ```
 
 {context}
 
-Identify if this function has any of these semantics:
+## Semantic Categories
 
-1. **ALLOCATOR**: Returns newly allocated heap memory to caller
-   - Direct allocation: calls malloc/calloc/realloc/new and returns result
-   - Wrapper: wraps another allocator function
-   - NOT allocator if: returns static buffer, struct field, or doesn't return allocated memory
+### 1. ALLOCATOR
+Function returns **newly allocated heap memory** that caller must eventually free.
 
-2. **DEALLOCATOR**: Frees memory passed as argument
-   - Direct: calls free/delete on an argument
-   - Wrapper: wraps another deallocator function
-   - Specify which argument index (0-based) is freed
+**Positive indicators:**
+- Calls malloc/calloc/realloc/aligned_alloc/new/new[] and returns the result
+- Calls another known allocator (e.g., g_malloc, xmalloc, kmalloc) and returns result
+- Returns result of a wrapper function that allocates
 
-3. **NULLABLE**: May return NULL
-   - Explicit: has code path that returns NULL/0/nullptr
-   - Implicit: returns result of function that may return NULL
+**Negative indicators (NOT an allocator):**
+- Returns pointer to static/global buffer
+- Returns pointer to struct field or array member
+- Returns one of the input arguments
+- Allocates internally but doesn't return the allocated memory
+- Returns stack-allocated memory (dangling pointer bug, but not allocator semantic)
 
-4. **WRITES_BUFFER**: Writes to a buffer argument
-   - Like strcpy, memcpy, sprintf, etc.
-   - Specify which argument is the destination buffer
+### 2. DEALLOCATOR
+Function **frees/releases memory** passed as an argument.
 
-5. **SIZE_PARAM**: Has parameter that specifies buffer size
-   - Like strncpy's 'n' parameter
-   - Specify which parameter is the size
+**Positive indicators:**
+- Calls free/delete/delete[]/g_free/kfree on an argument
+- Calls another deallocator on an argument
+- Wrapper around resource cleanup
 
-Return JSON (only include applicable hints):
+**Specify:** Which argument (0-indexed) gets freed. If multiple arguments are freed, report each separately.
+
+### 3. NULLABLE
+Function's return value **may be NULL** under some conditions.
+
+**Positive indicators:**
+- Explicit `return NULL`, `return 0`, or `return nullptr`
+- Returns result of malloc/calloc (which may return NULL)
+- Returns result of another nullable function
+- Has error handling path that returns NULL
+- Lookup/search function that may not find element
+
+**Note:** All ALLOCATORs are implicitly NULLABLE (malloc can fail), so only report NULLABLE separately if the function is NOT an allocator but may still return NULL.
+
+### 4. WRITES_BUFFER
+Function **writes data to a buffer argument** (potential overflow risk).
+
+**Positive indicators:**
+- Calls strcpy/strcat/sprintf/memcpy/memmove targeting an argument
+- Uses loop to write into argument buffer
+- Assigns to dereferenced pointer argument: `*buf = ...` or `buf[i] = ...`
+
+**Specify:** Which argument (0-indexed) is the destination buffer.
+
+### 5. SIZE_PARAM
+A parameter **specifies buffer size or max length** (used for bounds checking).
+
+**Positive indicators:**
+- Parameter used as limit in strncpy/snprintf/memcpy size argument
+- Parameter used as loop bound when writing to buffer
+- Parameter named size/len/count/max/capacity/n/num_bytes
+
+**Specify:** Which parameter (0-indexed) is the size.
+
+## Analysis Guidelines
+
+1. **Trace data flow:** Follow where return values come from and where arguments flow to.
+2. **Consider all paths:** Check all branches and return statements.
+3. **Indirect calls matter:** If function calls helper that allocates/frees, propagate that semantic.
+4. **Be precise:** Only report semantics you can verify from the code.
+5. **Provide evidence:** Your reason should cite specific code elements (function calls, return statements, etc.)
+
+## Output Format
+
+Return a JSON object with hints array. Each hint must have:
+- `type`: One of ALLOCATOR, DEALLOCATOR, NULLABLE, WRITES_BUFFER, SIZE_PARAM
+- `target`: "return" for return value, or "argN" for argument N
+- `arg_index`: (required for DEALLOCATOR, WRITES_BUFFER, SIZE_PARAM) 0-based argument index
+- `reason`: Brief evidence from the code (cite specific lines/calls)
+```json
 {{
     "hints": [
-        {{"type": "ALLOCATOR", "target": "return", "reason": "wraps malloc"}},
-        {{"type": "DEALLOCATOR", "target": "arg0", "arg_index": 0, "reason": "calls free on first arg"}},
-        {{"type": "NULLABLE", "target": "return", "reason": "returns NULL on error"}},
-        {{"type": "WRITES_BUFFER", "target": "arg0", "arg_index": 0, "reason": "copies to dest buffer"}},
-        {{"type": "SIZE_PARAM", "target": "arg2", "arg_index": 2, "reason": "specifies max bytes"}}
+        {{"type": "ALLOCATOR", "target": "return", "reason": "line 5: returns malloc(size) result"}},
+        {{"type": "DEALLOCATOR", "target": "arg0", "arg_index": 0, "reason": "line 8: calls free(ptr)"}},
+        {{"type": "NULLABLE", "target": "return", "reason": "line 3: returns NULL if size==0"}},
+        {{"type": "WRITES_BUFFER", "target": "arg0", "arg_index": 0, "reason": "line 6: memcpy(dest, src, n)"}},
+        {{"type": "SIZE_PARAM", "target": "arg2", "arg_index": 2, "reason": "parameter 'n' limits memcpy length"}}
     ]
 }}
+```
 
-If no hints apply, return {{"hints": []}}
-"""
+If no memory semantics apply, return: `{{"hints": []}}`
 
+Now analyze the function above and return the JSON result."""
 
 # =============================================================================
 # Known Functions (Heuristic Fallback)
@@ -114,76 +177,100 @@ KNOWN_SIZE_PARAMS = {
 # =============================================================================
 
 class LLMClient:
-    """LLM client for hint generation using Vertex AI."""
+    """Gemini LLM client using service account / ADC (no API key)."""
 
     def __init__(
         self,
+        api_key: str = None,  # kept for compatibility; ignored
         model: str = "gemini-2.5-pro",
-        project_id: str = None,
+        base_url: str = None,  # kept for compatibility; unused
+        project_id: str | None = None,
         location: str = "us-central1",
         max_retries: int = 3,
     ):
-        self.model_name = model
+        """Initialize Gemini client via Vertex AI using ADC / service account.
+
+        Authentication flows:
+        - Recommended: set GOOGLE_APPLICATION_CREDENTIALS to the service account JSON.
+        - Or run under a GCP environment with default service account.
+
+        Args:
+            api_key: Ignored (present for backwards compatibility).
+            model: Gemini model name, e.g. "gemini-2.5-pro".
+            base_url: Unused for Vertex AI; kept for compatibility.
+            project_id: Optional explicit GCP project (fallback when key file missing project_id).
+            location: Vertex AI region (default us-central1).
+            max_retries: How many retries when calling Gemini.
+        """
+        self.model_name = model or "gemini-2.5-pro"
         self.location = location
         self.max_retries = max_retries
-        self.project_id = project_id or os.getenv("GOOGLE_CLOUD_PROJECT")
-        self._client = None
+        self.explicit_project = project_id or os.getenv("GOOGLE_CLOUD_PROJECT")
 
-    def _init_client(self):
-        """Initialize Vertex AI client lazily."""
-        if self._client is not None:
-            return True
-
-        try:
-            import vertexai
-            from vertexai.generative_models import GenerativeModel
-
-            credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-            if not credentials_path:
-                logger.warning("GOOGLE_APPLICATION_CREDENTIALS not set")
-                return False
-
-            # Get project ID from credentials if not set
-            if not self.project_id and credentials_path:
-                try:
-                    with open(credentials_path) as f:
-                        creds = json.load(f)
-                        self.project_id = creds.get("project_id")
-                except Exception:
-                    pass
-
-            if not self.project_id:
-                logger.warning("GCP project ID not found")
-                return False
-
-            vertexai.init(project=self.project_id, location=self.location)
-            self._client = GenerativeModel(self.model_name)
-            return True
-
-        except ImportError:
-            logger.warning("google-cloud-aiplatform not installed")
-            return False
-        except Exception as e:
-            logger.warning(f"Failed to init Vertex AI: {e}")
-            return False
+        # Ensure GOOGLE_APPLICATION_CREDENTIALS is set up front for clearer error early.
+        self.credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if not self.credentials_path:
+            raise ValueError(
+                "GOOGLE_APPLICATION_CREDENTIALS must point to a service account JSON file."
+            )
 
     def query(self, prompt: str) -> dict:
-        """Query LLM and return JSON response."""
-        if not self._init_client():
+        """Send query, prefer Vertex AI when service account credentials are configured."""
+        content = self._call_by_vertex_ai(prompt)
+        if not content:
             return {}
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            logger.warning("LLM response was not valid JSON. Raw content: %s", content[:200])
+            return {}
+
+    def _call_by_vertex_ai(self, prompt: str) -> str | None:
+        """Use Vertex AI SDK to call Gemini with service account credentials."""
+        if not VERTEX_AI_AVAILABLE:
+            raise ImportError(
+                "google-cloud-aiplatform is not installed. "
+                "Install it with: pip install google-cloud-aiplatform>=1.38"
+            )
+
+        if not os.path.exists(self.credentials_path):
+            raise FileNotFoundError(
+                f"Service account key file not found: {self.credentials_path}\n"
+                "Please check the path and try again."
+            )
+
+        project_id = self.explicit_project
+        if not project_id:
+            try:
+                with open(self.credentials_path, "r", encoding="utf-8") as f:
+                    creds_data = json.load(f)
+                project_id = creds_data.get("project_id")
+            except Exception as exc:  # pragma: no cover
+                raise ValueError(
+                    f"Failed to read project_id from service account file: {exc}"
+                ) from exc
+
+        if not project_id:
+            raise ValueError("GCP project_id not found. Set GOOGLE_CLOUD_PROJECT or include in key.")
+
+        # Initialize Vertex AI for every call to ensure fresh config if env changes.
+        vertexai.init(project=project_id, location=self.location)
+        model = GenerativeModel(self.model_name)
 
         for attempt in range(self.max_retries):
             try:
-                response = self._client.generate_content(
+                response = model.generate_content(
                     prompt,
-                    generation_config={"response_mime_type": "application/json"}
+                    generation_config={
+                        "response_mime_type": "application/json",
+                    },
                 )
-                return json.loads(response.text)
-            except Exception as e:
-                logger.debug(f"LLM query failed (attempt {attempt+1}): {e}")
+                return response.text
+            except Exception as exc:
+                logger.warning("Vertex AI call failed (attempt %d): %s", attempt + 1, exc)
                 if attempt < self.max_retries - 1:
                     time.sleep(1)
-        return {}
+        return None
 
 
 # =============================================================================
@@ -236,83 +323,15 @@ class HintGenerator:
         """Generate hints for a single function."""
         hints = []
 
-        # First, apply heuristics (fast and reliable)
-        heuristic_hints = self._heuristic_hints(func)
-        hints.extend(heuristic_hints)
-
-        # Then, optionally use LLM for additional analysis
-        if self.llm:
-            llm_hints = self._llm_hints(func, all_functions)
-            # Merge, avoiding duplicates
-            for llm_hint in llm_hints:
-                existing = next(
-                    (h for h in hints
-                     if h.hint_type == llm_hint.hint_type and h.target == llm_hint.target),
-                    None
-                )
-                if not existing:
-                    hints.append(llm_hint)
-
-        return hints
-
-    def _heuristic_hints(self, func: FunctionInfo) -> list[Hint]:
-        """Generate hints using heuristics for known patterns."""
-        hints = []
-        code_lower = func.code.lower()
-
-        # Check if function wraps known allocator
-        for alloc in KNOWN_ALLOCATORS:
-            if f"{alloc}(" in func.code and func.return_type and '*' in func.return_type:
-                # Check if it returns the allocation result
-                if f"return" in code_lower:
-                    hints.append(Hint(
-                        function_name=func.name,
-                        hint_type=HintType.ALLOCATOR,
-                        target="return",
-                        reason=f"Wraps {alloc} and returns pointer"
-                    ))
-                    # Allocators are implicitly nullable
-                    hints.append(Hint(
-                        function_name=func.name,
-                        hint_type=HintType.NULLABLE,
-                        target="return",
-                        reason="Allocator may return NULL"
-                    ))
-                    break
-
-        # Check if function wraps known deallocator
-        for dealloc in KNOWN_DEALLOCATORS:
-            for i, arg_name in enumerate(func.arg_names):
-                if f"{dealloc}({arg_name})" in func.code or f"{dealloc}( {arg_name} )" in func.code:
-                    hints.append(Hint(
-                        function_name=func.name,
-                        hint_type=HintType.DEALLOCATOR,
-                        target=f"arg{i}",
-                        arg_index=i,
-                        reason=f"Calls {dealloc} on argument {arg_name}"
-                    ))
-                    break
-
-        # Check for NULL return
-        if func.return_type and '*' in func.return_type:
-            if re.search(r'return\s+(NULL|0|nullptr)\s*;', func.code):
-                hints.append(Hint(
-                    function_name=func.name,
-                    hint_type=HintType.NULLABLE,
-                    target="return",
-                    reason="Explicitly returns NULL"
-                ))
-
-        # Check for known buffer writers
-        for writer, buf_idx in KNOWN_BUFFER_WRITERS.items():
-            if f"{writer}(" in func.code:
-                hints.append(Hint(
-                    function_name=func.name,
-                    hint_type=HintType.WRITES_BUFFER,
-                    target=f"arg{buf_idx}",
-                    arg_index=buf_idx,
-                    reason=f"Calls buffer writer {writer}"
-                ))
+        llm_hints = self._llm_hints(func, all_functions)
+        for llm_hint in llm_hints:
+            existing = next(
+                (h for h in hints
+                    if h.hint_type == llm_hint.hint_type and h.target == llm_hint.target),
+                None
+            )
+            if not existing:
+                hints.append(llm_hint)
 
         return hints
 
@@ -325,17 +344,15 @@ class HintGenerator:
         if not self.llm:
             return []
 
-        # Build context from callees
         context_parts = []
-        for callee in list(func.callees)[:5]:  # Limit context size
+        for callee in list(func.callees)[:5]:
             if callee in all_functions:
                 callee_code = all_functions[callee].code
-                if len(callee_code) < 500:  # Only include small functions
-                    context_parts.append(f"// Called function:\n{callee_code}")
+                context_parts.append(f"// Called function:\n{callee_code}")
+
         context = "\n\n".join(context_parts) if context_parts else ""
         context_str = f"Context (called functions):\n{context}" if context else ""
 
-        # Format parameters
         params = list(zip(func.arg_types, func.arg_names))
         params_str = ", ".join(f"{t} {n}" for t, n in params) if params else "void"
 
@@ -352,6 +369,7 @@ class HintGenerator:
 
         for h in result.get("hints", []):
             hint_type_str = h.get("type", "")
+
             try:
                 hint_type = HintType[hint_type_str]
             except KeyError:
