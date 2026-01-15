@@ -49,6 +49,8 @@ class Pipeline:
         max_iterations: int = 3,
         issue_types: list[MemoryIssueType] = None,
         use_merge: bool = False,  # Kept for compatibility
+        codeql_dir: Path = None,
+        cpp_queries_dir: Path = None,
     ):
         """Initialize pipeline.
 
@@ -59,6 +61,8 @@ class Pipeline:
             max_iterations: Max CEGAR iterations (for future refinement)
             issue_types: Which bug types to detect (default: all)
             use_merge: Whether to merge code (kept for compatibility)
+            codeql_dir: Optional custom CodeQL directory path (default: ~/.codeql)
+            cpp_queries_dir: Optional direct path to cpp-queries directory
         """
         # Components
         self.parser = CodeParser()
@@ -66,7 +70,7 @@ class Pipeline:
         self.hint_generator = HintGenerator(self.llm_client)
         self.hint_validator = HintValidator()
         self.warning_validator = None  # Initialized with known allocators
-        self.analyzer = CodeQLAnalyzer()
+        self.analyzer = CodeQLAnalyzer(codeql_dir=codeql_dir, cpp_queries_dir=cpp_queries_dir)
 
         # Configuration
         self.max_iterations = max_iterations
@@ -83,7 +87,12 @@ class Pipeline:
         self.hints = HintSet()
         self.conflicts: list[str] = []
 
-    def analyze(self, project_path: Path, output_dir: Path = None) -> AnalysisResult:
+    def analyze(
+        self,
+        project_path: Path,
+        output_dir: Path = None,
+        single_source: Path | None = None,
+    ) -> AnalysisResult:
         """Run the full analysis pipeline.
 
         Pipeline:
@@ -103,6 +112,7 @@ class Pipeline:
         project_path = Path(project_path).resolve()
         output_dir = output_dir or Path("./output")
         output_dir.mkdir(parents=True, exist_ok=True)
+        single_source = Path(single_source).resolve() if single_source else None
 
         logger.info(f"Analyzing {project_path}")
         logger.info(f"Bug types: {[t.name for t in self.issue_types]}")
@@ -111,7 +121,32 @@ class Pipeline:
         # Phase 1: Parse source code
         # =====================================================================
         logger.info("Phase 1: Parsing source code...")
-        self.functions = self.parser.parse_project(project_path)
+        if single_source is not None:
+            logger.info(f"  Single-source mode: parsing only {single_source}")
+            if not single_source.exists():
+                logger.error(f"Single source file not found: {single_source}")
+                return AnalysisResult(
+                    confirmed_bugs=[],
+                    hints=HintSet(),
+                    iterations=0,
+                    spurious_filtered=0,
+                )
+
+            # Parse just this one file
+            self.functions = self.parser.parse_file(single_source)
+            for info in self.functions.values():
+                # Ensure file_path is set for downstream components
+                if not getattr(info, "file_path", None):
+                    info.file_path = str(single_source)
+
+            # Best-effort call graph resolution within this subset
+            try:
+                # parse_project normally does this; call it explicitly here.
+                self.parser._resolve_calls(self.functions)  # type: ignore[attr-defined]
+            except Exception as e:
+                logger.warning(f"  Warning: could not resolve calls in single-source mode: {e}")
+        else:
+            self.functions = self.parser.parse_project(project_path)
         logger.info(f"  Found {len(self.functions)} functions")
 
         if not self.functions:
@@ -130,30 +165,59 @@ class Pipeline:
             self.hints = self._load_hints(hints_file)
         else:
             # =================================================================
-            # Phase 2: LLM generates hints
+            # Phase 2-3: Iterative hint generation and validation
             # =================================================================
-            logger.info("Phase 2: Generating hints with LLM...")
+            max_hint_iterations = 5
+            iteration = 0
+            all_conflicts = []
+            
+            # Initial hint generation
+            logger.info("Phase 2: Generating hints with LLM (iteration 1)...")
             self.hints = self.hint_generator.generate_hints(self.functions)
             logger.info(f"  {self.hints.summary()}")
-
-            # =================================================================
-            # Phase 3: Z3 validates hints
-            # =================================================================
-            logger.info("Phase 3: Validating hints with Z3...")
-            self.hints, conflicts = self.hint_validator.validate_hints(
-                self.hints, self.functions
-            )
-            self.conflicts.extend(conflicts)
-
-            if conflicts:
-                logger.info(f"  Removed {len(conflicts)} invalid hints:")
-                for c in conflicts[:5]:
-                    logger.info(f"    - {c}")
-                if len(conflicts) > 5:
-                    logger.info(f"    ... and {len(conflicts) - 5} more")
-
-            logger.info(f"  After validation: {self.hints.summary()}")
-
+            
+            while iteration < max_hint_iterations:
+                iteration += 1
+                
+                # =================================================================
+                # Phase 3: Z3 validates hints
+                # =================================================================
+                logger.info(f"Phase 3: Validating hints with Z3 (iteration {iteration})...")
+                self.hints, conflicts = self.hint_validator.validate_hints(
+                    self.hints, self.functions
+                )
+                # Tag conflicts with iteration number
+                for conflict in conflicts:
+                    all_conflicts.append(f"[Iteration {iteration}] {conflict}")
+                
+                if conflicts:
+                    logger.info(f"  Removed {len(conflicts)} invalid hints:")
+                    for c in conflicts[:5]:
+                        logger.info(f"    - {c}")
+                    if len(conflicts) > 5:
+                        logger.info(f"    ... and {len(conflicts) - 5} more")
+                    
+                    logger.info(f"  After validation: {self.hints.summary()}")
+                    
+                    # If we have conflicts and haven't reached max iterations, regenerate
+                    if iteration < max_hint_iterations:
+                        logger.info(f"Phase 2: Regenerating hints with conflict feedback (iteration {iteration + 1})...")
+                        # Regenerate hints with conflict feedback
+                        self.hints = self.hint_generator.generate_hints(
+                            self.functions,
+                            previous_conflicts=conflicts
+                        )
+                        logger.info(f"  {self.hints.summary()}")
+                    else:
+                        logger.warning(f"  Reached max iterations ({max_hint_iterations}), stopping refinement")
+                else:
+                    # No conflicts, we're done
+                    logger.info(f"  No conflicts found! Hints are consistent.")
+                    logger.info(f"  Final hints: {self.hints.summary()}")
+                    break
+            
+            self.conflicts.extend(all_conflicts)
+            
             # Save validated hints
             self._save_hints(hints_file)
 
@@ -269,6 +333,7 @@ class Pipeline:
         if self.conflicts:
             conflicts_file = output_dir / "validation_conflicts.txt"
             conflicts_file.write_text("\n".join(self.conflicts))
+            logger.info(f"  Validation conflicts saved to {conflicts_file}")
 
         # Human-readable report
         report = self._generate_report(confirmed)
