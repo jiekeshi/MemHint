@@ -105,25 +105,6 @@ If no memory semantics apply, return: `{{"hints": []}}`
 
 Now analyze the function above and return the JSON result."""
 
-# =============================================================================
-# Known Functions (Heuristic Fallback)
-# =============================================================================
-
-KNOWN_ALLOCATORS = {
-    "malloc", "calloc", "realloc", "strdup", "strndup",
-    "aligned_alloc", "memalign", "posix_memalign",
-    "g_malloc", "g_malloc0", "g_new", "g_new0",
-    "kmalloc", "kzalloc", "vmalloc",
-    "xmalloc", "xcalloc", "xrealloc",
-    # C++ operators
-    "new", "new[]",
-}
-
-KNOWN_DEALLOCATORS = {
-    "free", "cfree", "g_free", "kfree", "vfree", "xfree",
-    # C++ operators
-    "delete", "delete[]",
-}
 
 
 # =============================================================================
@@ -245,24 +226,46 @@ class HintGenerator:
 
     def generate_hints(
         self,
-        functions: dict[str, FunctionInfo]
+        functions: dict[str, FunctionInfo],
+        previous_conflicts: list[str] = None
     ) -> HintSet:
         """Generate hints for all functions in codebase.
 
         Args:
             functions: Dict of function name -> FunctionInfo
+            previous_conflicts: List of conflict messages from previous validation
+                              (format: "REMOVED func_name.HintType.name: reason")
 
         Returns:
             HintSet with all generated hints
         """
         hint_set = HintSet()
+        
+        # Parse conflicts to map function names to their conflict reasons
+        conflict_map = {}
+        if previous_conflicts:
+            for conflict in previous_conflicts:
+                # Parse "REMOVED func_name.HintType.name: reason"
+                if conflict.startswith("REMOVED "):
+                    parts = conflict[8:].split(": ", 1)
+                    if len(parts) == 2:
+                        func_hint = parts[0]
+                        reason = parts[1]
+                        # Extract function name (before the dot)
+                        if "." in func_hint:
+                            func_name = func_hint.split(".")[0]
+                            if func_name not in conflict_map:
+                                conflict_map[func_name] = []
+                            conflict_map[func_name].append(reason)
 
         for func_name, func in tqdm(functions.items()):
             # Skip main and test functions
             if func_name in ("main", "_main", "wmain") or "test" in func_name.lower():
                 continue
 
-            hints = self._generate_for_function(func, functions)
+            # Get conflicts for this function if any
+            func_conflicts = conflict_map.get(func_name, [])
+            hints = self._generate_for_function(func, functions, func_conflicts)
 
             for hint in hints:
                 hint_set.add(hint)
@@ -273,16 +276,23 @@ class HintGenerator:
         self,
         func: FunctionInfo,
         all_functions: dict[str, FunctionInfo],
+        previous_conflicts: list[str] = None,
     ) -> list[Hint]:
-        """Generate hints for a single function."""
-        hints = []
+        """Generate hints for a single function.
+        
+        Args:
+            func: Function to analyze
+            all_functions: All functions in codebase
+            previous_conflicts: List of conflict reasons for this function from previous iteration
+        """
+        hints: list[Hint] = []
 
-        llm_hints = self._llm_hints(func, all_functions)
+        #LLM-based hints, merged without duplicates.
+        llm_hints = self._llm_hints(func, all_functions, previous_conflicts)
         for llm_hint in llm_hints:
             existing = next(
-                (h for h in hints
-                    if h.hint_type == llm_hint.hint_type and h.target == llm_hint.target),
-                None
+                (h for h in hints if h.hint_type == llm_hint.hint_type and h.target == llm_hint.target),
+                None,
             )
             if not existing:
                 hints.append(llm_hint)
@@ -293,8 +303,15 @@ class HintGenerator:
         self,
         func: FunctionInfo,
         all_functions: dict[str, FunctionInfo],
+        previous_conflicts: list[str] = None,
     ) -> list[Hint]:
-        """Generate hints using LLM."""
+        """Generate hints using LLM.
+        
+        Args:
+            func: Function to analyze
+            all_functions: All functions in codebase
+            previous_conflicts: List of conflict reasons from previous validation iteration
+        """
         if not self.llm:
             return []
 
@@ -306,6 +323,21 @@ class HintGenerator:
 
         context = "\n\n".join(context_parts) if context_parts else ""
         context_str = f"Context (called functions):\n{context}" if context else ""
+        
+        # Add conflict feedback if available
+        conflict_feedback = ""
+        if previous_conflicts:
+            conflict_feedback = f"""
+## Previous Validation Feedback
+The following hints were rejected by static analysis validation:
+{chr(10).join(f"- {c}" for c in previous_conflicts)}
+
+Please reconsider your analysis. The hints must be consistent with the actual code structure:
+- ALLOCATOR: Function must actually call allocation functions (malloc/calloc/etc) and return the result
+- DEALLOCATOR: Function must actually call deallocation functions (free/delete/etc) on the specified argument
+
+Only suggest hints that you can verify from the code structure.
+"""
 
         params = list(zip(func.arg_types, func.arg_names))
         params_str = ", ".join(f"{t} {n}" for t, n in params) if params else "void"
@@ -315,7 +347,7 @@ class HintGenerator:
             return_type=func.return_type or "void",
             parameters=params_str,
             code=func.code,
-            context=context_str,
+            context=context_str + conflict_feedback,
         )
 
         result = self.llm.query(prompt)
