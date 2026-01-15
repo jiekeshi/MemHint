@@ -1,8 +1,10 @@
 import json
 import logging
+import re
 import subprocess
 import tempfile
 import shutil
+import yaml
 from pathlib import Path
 from shutil import which
 
@@ -36,9 +38,12 @@ CODEQL_ISSUE_MAP = {
 class CodeQLAnalyzer:
     """CodeQL analyzer with direct model injection into codeql/cpp-all ext directory."""
 
-    def __init__(self, binary: str = "codeql", timeout: int = 600):
+    def __init__(self, binary: str = "codeql", timeout: int = 600, codeql_dir: Path | None = None, cpp_queries_dir: Path | None = None, reuse_db: bool = True):
         self.binary = binary
         self.timeout = timeout
+        self.codeql_dir = codeql_dir  # Optional custom CodeQL directory
+        self.cpp_queries_dir = cpp_queries_dir  # Optional direct path to cpp-queries directory
+        self.reuse_db = reuse_db  # Whether to reuse existing databases
         self._injected_files: list[Path] = []  # 记录注入的文件，用于清理
 
     def analyze(
@@ -47,14 +52,14 @@ class CodeQLAnalyzer:
     ) -> list[Warning]:
         """Run CodeQL analysis with injected custom models."""
         output_dir = Path(tempfile.mkdtemp())
-        db_path = output_dir / "codeql-db"
         results_path = output_dir / "results.sarif"
 
         try:
-            # Step 1: Create database
-            logger.info("Step 1: Creating CodeQL database...")
-            if not self._create_database(project_path, db_path):
-                logger.error("Failed to create database")
+            # Step 1: Get or create database
+            logger.info("Step 1: Getting CodeQL database...")
+            db_path = self._get_or_create_database(project_path)
+            if not db_path:
+                logger.error("Failed to get or create database")
                 return []
 
             # Step 2: Inject custom memory models directly into codeql/cpp-all
@@ -82,9 +87,120 @@ class CodeQLAnalyzer:
 
             if output_dir.exists():
                 shutil.rmtree(output_dir, ignore_errors=True)
+    
+    def _get_db_path(self, project_path: Path) -> Path:
+        """Get the path where CodeQL database should be stored for this project."""
+        # Store database in project directory under .codeql-db
+        return project_path / ".codeql-db"
+    
+    def _is_valid_database(self, db_path: Path) -> bool:
+        logger.info(f"Checking if database at {db_path} is valid...")
+        """Check if a CodeQL database exists and is valid C++ database."""
+        if not db_path.exists():
+            logger.error(f"Database not found at {db_path}")
+            return False
+        
+        # Check if it's a valid CodeQL database by checking for database metadata
+        # CodeQL databases have a codeql-database.yml file
+        db_metadata = db_path / "codeql-database.yml"
+        if not db_metadata.exists():
+            logger.error(f"Database metadata not found at {db_metadata}")
+            return False
+        
+        # Verify database is not corrupted and is a C++ database
+        # Read the database metadata file directly instead of using CLI command
+        try:
+            with open(db_metadata, 'r') as f:
+                db_info = yaml.safe_load(f)
+            
+            # Check that it's a C++ database
+            primary_language = db_info.get('primaryLanguage', '').lower()
+            if primary_language not in ('cpp', 'c++'):
+                logger.warning(f"Database at {db_path} is not a C++ database (primaryLanguage: {primary_language})")
+                return False
+            
+            # Check if database is finalized (required for running queries)
+            is_finalized = db_info.get('finalised', False)
+            if not is_finalized:
+                logger.warning(f"Database at {db_path} is not finalized, will need to finalize before use")
+                # We'll finalize it if needed, but mark as valid for now
+                # The finalize step will be called if needed
+            
+            logger.info(f"Database is valid C++ database (primaryLanguage: {primary_language}, finalized: {is_finalized})")
+            return True
+        except yaml.YAMLError as e:
+            logger.error(f"Error parsing database metadata: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Error checking database validity: {e}")
+            return False
+    
+    def _get_or_create_database(self, project_path: Path) -> Path | None:
+        """Get existing database or create a new one.
+        
+        Returns:
+            Path to the database, or None if creation failed.
+        """
+        db_path = self._get_db_path(project_path)
+        
+        # Check if we should reuse existing database
+        if self.reuse_db and self._is_valid_database(db_path):
+            logger.info(f"Reusing existing CodeQL database at {db_path}")
+            # Ensure database is finalized before use
+            if not self._ensure_database_finalized(db_path):
+                logger.warning("Failed to finalize database, will recreate")
+                shutil.rmtree(db_path, ignore_errors=True)
+            else:
+                return db_path
+        
+        # Create new database
+        if self.reuse_db and db_path.exists():
+            logger.info(f"Existing database at {db_path} is invalid or corrupted, recreating...")
+            shutil.rmtree(db_path, ignore_errors=True)
+        
+        logger.info(f"Creating new CodeQL database at {db_path}")
+        if not self._create_database(project_path, db_path):
+            return None
+        
+        return db_path
 
     def _get_codeql_cpp_ext_dir(self) -> Path:
-        base = Path.home() / ".codeql" / "packages" / "codeql" / "cpp-queries"
+        # If direct cpp-queries directory is provided, use it
+        if self.cpp_queries_dir:
+            if not self.cpp_queries_dir.exists():
+                raise FileNotFoundError(f"CodeQL cpp-queries directory not found at {self.cpp_queries_dir}")
+            
+            # Direct path to cpp-queries, find cpp-all library
+            # Structure can be:
+            # Option 1: cpp-queries/version/.codeql/libraries/codeql/cpp-all/version/ext
+            # Option 2: cpp-queries/.codeql/libraries/codeql/cpp-all/version/ext
+            
+            # First, check if there's a version directory
+            version_dirs = [d for d in self.cpp_queries_dir.iterdir() if d.is_dir() and not d.name.startswith('.')]
+            if version_dirs:
+                # Use the latest version directory
+                version_dir = sorted(version_dirs, reverse=True)[0]
+                codeql_dir = version_dir / ".codeql" / "libraries" / "codeql" / "cpp-all"
+            else:
+                # No version directory, check directly
+                codeql_dir = self.cpp_queries_dir / ".codeql" / "libraries" / "codeql" / "cpp-all"
+            
+            if not codeql_dir.exists():
+                raise FileNotFoundError(f"CodeQL cpp-all library not found at {codeql_dir}")
+            
+            version_cpp_all = sorted([d for d in codeql_dir.iterdir() if d.is_dir()], reverse=True)
+            if not version_cpp_all:
+                raise FileNotFoundError(f"No versions found in {codeql_dir}")
+            
+            ext_dir = codeql_dir / version_cpp_all[0] / "ext"
+            logger.info(f"Using CodeQL cpp-all ext dir (direct path): {ext_dir}")
+            return ext_dir
+        
+        # Otherwise, use the standard approach with codeql_dir or default
+        if self.codeql_dir:
+            base = self.codeql_dir / "packages" / "codeql" / "cpp-queries"
+        else:
+            base = Path.home() / ".codeql" / "packages" / "codeql" / "cpp-queries"
 
         if not base.exists():
             raise FileNotFoundError(f"CodeQL cpp-queries not found at {base}")
@@ -181,7 +297,7 @@ class CodeQLAnalyzer:
     def _verify_injected_models(self) -> None:
         cmd = [
             self.binary, "resolve", "extensions",
-            "codeql/cpp-all",
+            "codeql/cpp-queries",
         ]
 
         result = subprocess.run(cmd, capture_output=True, timeout=60)
@@ -241,7 +357,7 @@ class CodeQLAnalyzer:
                 f"--source-root={project_path}",
                 "--language=cpp",
                 "--overwrite",
-                f"--command={build_cmd}",
+                "--command", build_cmd,
             ]
 
         result = subprocess.run(
@@ -249,14 +365,94 @@ class CodeQLAnalyzer:
         )
 
         if result.returncode != 0:
-            logger.error(f"Database creation failed:\n{result.stderr.decode()[:1000]}")
+            stderr_output = result.stderr.decode()
+            stdout_output = result.stdout.decode()
+            logger.error(f"Database creation failed:")
+            if stderr_output:
+                logger.error(f"stderr:\n{stderr_output}")
+            if stdout_output:
+                logger.error(f"stdout:\n{stdout_output}")
             return False
 
         logger.info("Database created successfully")
+        
+        # Finalize the database before running queries
+        logger.info("Finalizing database...")
+        if not self._finalize_database(db_path):
+            logger.error("Database finalization failed")
+            return False
+        
+        return True
+    
+    def _ensure_database_finalized(self, db_path: Path) -> bool:
+        """Check if database is finalized, and finalize if needed."""
+        try:
+            db_metadata = db_path / "codeql-database.yml"
+            if db_metadata.exists():
+                with open(db_metadata, 'r') as f:
+                    db_info = yaml.safe_load(f)
+                if db_info.get('finalised', False):
+                    logger.info("Database is already finalized")
+                    return True
+        except Exception as e:
+            logger.debug(f"Could not check finalization status: {e}")
+        
+        # Database is not finalized, finalize it
+        return self._finalize_database(db_path)
+    
+    def _finalize_database(self, db_path: Path) -> bool:
+        """Finalize a CodeQL database so it can be used for queries."""
+        # Check if already finalized first
+        try:
+            db_metadata = db_path / "codeql-database.yml"
+            if db_metadata.exists():
+                with open(db_metadata, 'r') as f:
+                    db_info = yaml.safe_load(f)
+                if db_info.get('finalised', False):
+                    logger.info("Database is already finalized")
+                    return True
+        except Exception:
+            pass  # Continue to try finalization
+        
+        cmd = [
+            self.binary, "database", "finalize",
+            str(db_path),
+        ]
+        
+        result = subprocess.run(
+            cmd, timeout=self.timeout, capture_output=True, text=True
+        )
+        
+        if result.returncode != 0:
+            # Check if error is because it's already finalized
+            error_msg = (result.stderr + result.stdout).lower()
+            if "already finalized" in error_msg or "is already finalized" in error_msg:
+                logger.info("Database is already finalized (detected from error message)")
+                return True
+            
+            logger.error(f"Database finalization failed:")
+            if result.stderr:
+                logger.error(f"stderr:\n{result.stderr}")
+            if result.stdout:
+                logger.error(f"stdout:\n{result.stdout}")
+            return False
+        
+        logger.info("Database finalized successfully")
         return True
 
     def _get_build_command(self, project_path: Path) -> str:
         """Determine appropriate build command."""
+        # configure_script = project_path / "configure"
+        # if configure_script.exists() and configure_script.is_file() and which("make"):
+        #     # Delete build directory if it exists
+        #     build_dir = project_path / "build"
+        #     if build_dir.exists() and build_dir.is_dir():
+        #         logger.info(f"Removing existing build directory: {build_dir}")
+        #         shutil.rmtree(build_dir)
+            
+        #     # Return command that runs both ./configure and make
+        #     return "./configure && make"
+        
         if (project_path / "Makefile").exists() and which("make"):
             return "make"
 
