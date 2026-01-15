@@ -139,10 +139,28 @@ class CodeParser:
         return functions
 
     def _iter_nodes(self, node):
-        """Iterate all nodes in the AST."""
-        yield node
-        for child in node.children:
-            yield from self._iter_nodes(child)
+        """Iterate all nodes in the AST without recursive calls.
+
+        Tree-sitter trees can be very deep; using recursion risks hitting
+        Python's recursion limit. This implementation uses an explicit stack
+        and also guards against accidental cycles.
+        """
+        stack = [node]
+        seen_ids: set[int] = set()
+
+        while stack:
+            current = stack.pop()
+            node_id = id(current)
+            if node_id in seen_ids:
+                continue
+            seen_ids.add(node_id)
+
+            yield current
+
+            # Preserve original traversal order: first child first.
+            if getattr(current, "children", None):
+                for child in reversed(current.children):
+                    stack.append(child)
 
     def _extract_function(self, node, source: bytes, file_path: str) -> Optional[FunctionInfo]:
         """Extract FunctionInfo from a function_definition node.
