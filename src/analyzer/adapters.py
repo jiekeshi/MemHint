@@ -1,4 +1,4 @@
-"""Static analyzer adapters for CodeQL and Facebook Infer.
+"""Static analyzer adapters for CodeQL.
 """
 
 import json
@@ -15,7 +15,7 @@ from src.core.models import Warning, HintSet, MemoryIssueType
 logger = logging.getLogger(__name__)
 
 CODEQL_ISSUE_MAP = {
-    # Memory leak queries
+    # Memory leak
     "memory-never-freed": MemoryIssueType.MEMORY_LEAK,
     "memory-may-not-be-freed": MemoryIssueType.MEMORY_LEAK,
     "cpp/memory-never-freed": MemoryIssueType.MEMORY_LEAK,
@@ -26,10 +26,6 @@ CODEQL_ISSUE_MAP = {
     # Use after free
     "use-after-free": MemoryIssueType.USE_AFTER_FREE,
     "cpp/use-after-free": MemoryIssueType.USE_AFTER_FREE,
-    # Null dereference
-    "null-dereference": MemoryIssueType.NULL_DEREFERENCE,
-    "missing-null-test": MemoryIssueType.NULL_DEREFERENCE,
-    "cpp/missing-null-test": MemoryIssueType.NULL_DEREFERENCE,
 }
 
 
@@ -64,7 +60,6 @@ class CodeQLAnalyzer:
                 has_custom_models = self._setup_model_pack(model_pack_dir, hints)
 
             # Step 3: Run queries
-
             logger.info("Step 3: Running queries with custom models...")
             success = self._run_memory_queries_with_models(db_path, model_pack_dir, results_path)
 
@@ -163,12 +158,10 @@ class CodeQLAnalyzer:
 
         # Collect function hints
         alloc_funcs = [f for f in hints.get_allocators() if f not in ("main", "_main")]
-        free_funcs = [fn for fn, _ in hints.get_deallocators()]
-        nullable_funcs = hints.get_nullable_functions()
+        free_funcs = hints.get_deallocators()  # List of (func_name, arg_index)
 
         logger.info(f"Allocators ({len(alloc_funcs)}): {alloc_funcs[:10]}...")
         logger.info(f"Deallocators ({len(free_funcs)}): {free_funcs[:10]}...")
-        logger.info(f"Nullable ({len(nullable_funcs)}): {nullable_funcs[:10]}...")
 
         if not alloc_funcs and not free_funcs:
             logger.warning("No custom allocators or deallocators found")
@@ -184,7 +177,7 @@ extensionTargets:
         (model_pack_dir / "qlpack.yml").write_text(qlpack_content)
 
         # Generate the .qll file
-        self._generate_model_library(model_pack_dir, alloc_funcs, free_funcs, nullable_funcs)
+        self._generate_model_library(model_pack_dir, alloc_funcs, free_funcs)
 
         # Install dependencies
         logger.info("Installing model pack dependencies...")
@@ -210,25 +203,59 @@ extensionTargets:
     def _generate_model_library(
         self, model_pack_dir: Path,
         alloc_funcs: list[str],
-        free_funcs: list[str],
-        nullable_funcs: list[str] = None
+        free_funcs: list[tuple[str, int]],
     ) -> None:
         """Generate CodeQL library extending AllocationFunction and DeallocationFunction.
-        """
-        if nullable_funcs is None:
-            nullable_funcs = []
 
-        # Build the function name lists for CodeQL IN clause
-        # Need at least one item to avoid syntax error
+        Args:
+            model_pack_dir: Directory to write the .qll file
+            alloc_funcs: List of allocator function names
+            free_funcs: List of (func_name, freed_arg_index) tuples
+        """
+        # Build allocator names for CodeQL IN clause
         if alloc_funcs:
             alloc_names = ", ".join(f'"{f}"' for f in alloc_funcs)
         else:
             alloc_names = '"__no_custom_allocator__"'
 
-        if free_funcs:
-            free_names = ", ".join(f'"{f}"' for f in free_funcs)
+        # Group deallocators by freed arg index
+        dealloc_by_arg: dict[int, list[str]] = {}
+        for func_name, arg_idx in free_funcs:
+            if arg_idx not in dealloc_by_arg:
+                dealloc_by_arg[arg_idx] = []
+            dealloc_by_arg[arg_idx].append(func_name)
+
+        # Generate deallocation classes - one per arg index
+        dealloc_classes = []
+        for arg_idx, funcs in sorted(dealloc_by_arg.items()):
+            func_names = ", ".join(f'"{f}"' for f in funcs)
+            class_name = f"HintDeallocationFunctionArg{arg_idx}"
+            dealloc_classes.append(f'''
+/**
+ * Custom deallocation functions (freed arg at index {arg_idx}).
+ */
+class {class_name} extends DeallocationFunction {{
+  {class_name}() {{
+    this.getName() in [{func_names}]
+  }}
+
+  override int getFreedArg() {{ result = {arg_idx} }}
+}}''')
+
+        if dealloc_classes:
+            dealloc_section = "\n".join(dealloc_classes)
         else:
-            free_names = '"__no_custom_deallocator__"'
+            dealloc_section = '''
+/**
+ * No custom deallocation functions.
+ */
+class HintDeallocationFunction extends DeallocationFunction {
+  HintDeallocationFunction() {
+    this.getName() in ["__no_custom_deallocator__"]
+  }
+
+  override int getFreedArg() { result = 0 }
+}'''
 
         # Generate .qll content
         qll_content = f'''/**
@@ -236,14 +263,6 @@ extensionTargets:
  *
  * Extends CodeQL's built-in AllocationFunction and DeallocationFunction
  * with custom functions identified by LLM annotations.
- *
- * This enables built-in queries like:
- * - MemoryNeverFreed.ql (uses AllocationExpr)
- * - MemoryMayNotBeFreed.ql (uses AllocationExpr)
- * - DoubleFree.ql (uses DeallocationExpr)
- * - UseAfterFree.ql (uses DeallocationExpr)
- * - MissingNullTest.ql (uses AllocationExpr - checks null before dereference)
- * to recognize our custom allocators and deallocators.
  */
 
 import cpp
@@ -252,40 +271,21 @@ private import semmle.code.cpp.models.interfaces.Deallocation
 
 /**
  * Custom allocation functions from LLM annotations.
- *
- * When a FunctionCall's target is HintAllocationFunction,
- * the call becomes an AllocationExpr, which:
- * - Memory leak queries detect (MemoryNeverFreed, MemoryMayNotBeFreed)
- * - MissingNullTest detects (checks if return value is null-checked before use)
  */
 class HintAllocationFunction extends AllocationFunction {{
   HintAllocationFunction() {{
     this.getName() in [{alloc_names}]
   }}
 
-  // This allocation requires deallocation - memory must be freed
   override predicate requiresDealloc() {{ any() }}
 }}
-
-/**
- * Custom deallocation functions from LLM annotations.
- *
- * When a FunctionCall's target is HintDeallocationFunction,
- * the call becomes a DeallocationExpr, which double-free
- * and use-after-free queries detect.
- */
-class HintDeallocationFunction extends DeallocationFunction {{
-  HintDeallocationFunction() {{
-    this.getName() in [{free_names}]
-  }}
-
-  // The first argument (index 0) is the pointer being freed
-  override int getFreedArg() {{ result = 0 }}
-}}
+{dealloc_section}
 '''
         qll_path = model_pack_dir / "HintMemoryModels.qll"
         qll_path.write_text(qll_content)
         logger.info(f"Generated: {qll_path}")
+        logger.info(f"  - Allocators: {len(alloc_funcs)}")
+        logger.info(f"  - Deallocators: {len(free_funcs)} ({len(dealloc_by_arg)} unique arg indices)")
 
         # Log the content for debugging
         logger.debug(f"QLL content:\n{qll_content}")
@@ -295,14 +295,11 @@ class HintDeallocationFunction extends DeallocationFunction {{
     ) -> bool:
         """Run built-in memory queries with custom model pack."""
         memory_queries = [
+            # Core memory safety queries - these benefit from Hint models
             "codeql/cpp-queries:Critical/MemoryNeverFreed.ql",
             "codeql/cpp-queries:Critical/MemoryMayNotBeFreed.ql",
             "codeql/cpp-queries:Critical/DoubleFree.ql",
             "codeql/cpp-queries:Critical/UseAfterFree.ql",
-            "codeql/cpp-queries:Critical/MissingNullTest.ql",
-            "codeql/cpp-queries:Critical/OverflowCalculated.ql",
-            "codeql/cpp-queries:Critical/OverflowDestination.ql",
-            "codeql/cpp-queries:Critical/OverflowStatic.ql",
         ]
 
         cmd = [
@@ -313,6 +310,14 @@ class HintDeallocationFunction extends DeallocationFunction {{
             f"--additional-packs={model_pack_dir}",
             "--download",
         ] + memory_queries
+
+        # cmd = [
+        #     self.binary, "database", "analyze",
+        #     str(db_path),
+        #     "--format=sarif-latest",
+        #     f"--output={results_path}",
+        #     "--download",
+        # ] + memory_queries
 
         logger.info(f"Running CodeQL analyze...")
         logger.debug(f"Command: {' '.join(cmd)}")
@@ -373,89 +378,3 @@ class HintDeallocationFunction extends DeallocationFunction {{
 
         return warnings
 
-
-class InferAnalyzer:
-    """Facebook Infer static analyzer adapter."""
-
-    def __init__(self, binary: str = "infer", timeout: int = 600):
-        self.binary = binary
-        self.timeout = timeout
-        self.issue_type_map = {
-            "NULL_DEREFERENCE": MemoryIssueType.NULL_DEREFERENCE,
-            "NULLPTR_DEREFERENCE": MemoryIssueType.NULL_DEREFERENCE,
-            "MEMORY_LEAK": MemoryIssueType.MEMORY_LEAK,
-            "RESOURCE_LEAK": MemoryIssueType.MEMORY_LEAK,
-            "USE_AFTER_FREE": MemoryIssueType.USE_AFTER_FREE,
-            "USE_AFTER_DELETE": MemoryIssueType.USE_AFTER_FREE,
-            "DOUBLE_FREE": MemoryIssueType.DOUBLE_FREE,
-        }
-
-    def analyze(self, project_path: Path, hints: HintSet = None, issue_types: list[MemoryIssueType] = None) -> list[Warning]:
-        output_dir = Path(tempfile.mkdtemp())
-        infer_out = output_dir / "infer-out"
-
-        if hints and len(hints.hints) > 0:
-            self._generate_inferconfig(project_path, hints)
-
-        try:
-            warnings = self._run_infer(project_path, infer_out)
-            if issue_types:
-                warnings = [w for w in warnings if w.issue_type in issue_types]
-            return warnings
-        except Exception as e:
-            logger.error(f"Infer failed: {e}")
-            return []
-        finally:
-            inferconfig = project_path / ".inferconfig"
-            if inferconfig.exists():
-                inferconfig.unlink(missing_ok=True)
-
-    def _run_infer(self, project_path: Path, infer_out: Path) -> list[Warning]:
-        if (project_path / "Makefile").exists():
-            subprocess.run(["make", "clean"], cwd=project_path, capture_output=True)
-            cmd = [self.binary, "run", "-o", str(infer_out), "--", "make", "-j4"]
-        elif (project_path / "compile_commands.json").exists():
-            cmd = [self.binary, "run", "-o", str(infer_out), "--compilation-database", str(project_path / "compile_commands.json")]
-        else:
-            c_files = list(project_path.glob("**/*.c")) + list(project_path.glob("**/*.cpp"))
-            if not c_files:
-                return []
-            for f in c_files[:50]:
-                subprocess.run([self.binary, "capture", "-o", str(infer_out), "--", "clang", "-c", str(f)], capture_output=True, timeout=60)
-            cmd = [self.binary, "analyze", "-o", str(infer_out)]
-
-        subprocess.run(cmd, cwd=project_path, capture_output=True, timeout=self.timeout)
-        return self._parse_results(infer_out)
-
-    def _parse_results(self, infer_out: Path) -> list[Warning]:
-        report_file = infer_out / "report.json"
-        if not report_file.exists():
-            return []
-
-        warnings = []
-        try:
-            for item in json.loads(report_file.read_text()):
-                bug_type = item.get("bug_type", "")
-                issue_type = self.issue_type_map.get(bug_type, MemoryIssueType.MEMORY_LEAK)
-                warnings.append(Warning(
-                    file_path=item.get("file", ""),
-                    line_number=item.get("line", 0),
-                    function_name=item.get("procedure", ""),
-                    warning_type=bug_type,
-                    message=item.get("qualifier", ""),
-                    issue_type=issue_type,
-                    trace=[],
-                ))
-        except Exception as e:
-            logger.error(f"Infer parse error: {e}")
-        return warnings
-
-    def _generate_inferconfig(self, project_path: Path, hints: HintSet) -> None:
-        config = {"pulse": True, "biabduction": True}
-        (project_path / ".inferconfig").write_text(json.dumps(config, indent=2))
-
-
-def create_analyzer(analyzer_type: str = "codeql", **kwargs):
-    if analyzer_type == "infer":
-        return InferAnalyzer(**kwargs)
-    return CodeQLAnalyzer(**kwargs)

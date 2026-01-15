@@ -16,6 +16,7 @@ import logging
 import os
 import time
 
+from tqdm import tqdm
 
 try:
     import vertexai
@@ -303,7 +304,7 @@ class HintGenerator:
         """
         hint_set = HintSet()
 
-        for func_name, func in functions.items():
+        for func_name, func in tqdm(functions.items()):
             # Skip main and test functions
             if func_name in ("main", "_main", "wmain") or "test" in func_name.lower():
                 continue
