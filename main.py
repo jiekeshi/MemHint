@@ -111,6 +111,11 @@ def main():
         type=Path,
         help="Optional: direct path to cpp-queries directory (e.g., /path/to/codeql/qlpacks/codeql/cpp-queries)"
     )
+    parser.add_argument(
+        "--no-reuse-db",
+        action="store_true",
+        help="Force recreation of CodeQL database (default: reuse existing database if available)"
+    )
 
     args = parser.parse_args()
 
@@ -151,6 +156,7 @@ def main():
         issue_types=bug_types,
         codeql_dir=args.codeql_dir,
         cpp_queries_dir=args.cpp_queries_dir,
+        reuse_db=not args.no_reuse_db,
     )
 
     result = pipeline.analyze(project_path, output_dir, single_source=single_source)
