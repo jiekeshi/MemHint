@@ -1,6 +1,3 @@
-"""Static analyzer adapters for CodeQL.
-"""
-
 import json
 import logging
 import subprocess
@@ -37,21 +34,21 @@ CODEQL_ISSUE_MAP = {
 
 
 class CodeQLAnalyzer:
-    """CodeQL analyzer with C/C++ model extension support."""
+    """CodeQL analyzer with direct model injection into codeql/cpp-all ext directory."""
 
     def __init__(self, binary: str = "codeql", timeout: int = 600):
         self.binary = binary
         self.timeout = timeout
+        self._injected_files: list[Path] = []  # 记录注入的文件，用于清理
 
     def analyze(
         self, project_path: Path, hints: HintSet = None,
         issue_types: list[MemoryIssueType] = None
     ) -> list[Warning]:
-        """Run CodeQL analysis with model extensions."""
+        """Run CodeQL analysis with injected custom models."""
         output_dir = Path(tempfile.mkdtemp())
         db_path = output_dir / "codeql-db"
         results_path = output_dir / "results.sarif"
-        model_pack_dir = output_dir / "model-pack"
 
         try:
             # Step 1: Create database
@@ -60,15 +57,16 @@ class CodeQLAnalyzer:
                 logger.error("Failed to create database")
                 return []
 
-            # Step 2: Generate library pack with custom models
-            has_custom_models = False
+            # Step 2: Inject custom memory models directly into codeql/cpp-all
             if hints and len(hints.hints) > 0:
-                logger.info("Step 2: Generating model pack...")
-                has_custom_models = self._setup_model_pack(model_pack_dir, hints)
+                logger.info("Step 2: Injecting custom memory models...")
+                self._inject_models(hints)
+
+                self._verify_injected_models()
 
             # Step 3: Run queries
             logger.info("Step 3: Running queries with custom models...")
-            success = self._run_memory_queries_with_models(db_path, model_pack_dir, results_path)
+            success = self._run_memory_queries(db_path, results_path)
 
             if success:
                 return self._parse_sarif(results_path)
@@ -80,8 +78,140 @@ class CodeQLAnalyzer:
             traceback.print_exc()
             return []
         finally:
+            self._cleanup_models()
+
             if output_dir.exists():
                 shutil.rmtree(output_dir, ignore_errors=True)
+
+    def _get_codeql_cpp_ext_dir(self) -> Path:
+        base = Path.home() / ".codeql" / "packages" / "codeql" / "cpp-queries"
+
+        if not base.exists():
+            raise FileNotFoundError(f"CodeQL cpp-queries not found at {base}")
+
+        version_codeql = sorted([d for d in base.iterdir() if d.is_dir()], reverse=True)
+        if not version_codeql:
+            raise FileNotFoundError(f"No versions found in {base}")
+
+        codeql_dir = version_codeql[0] / ".codeql" / "libraries" / "codeql" / "cpp-all"
+
+        version_cpp_all = sorted([d for d in codeql_dir.iterdir() if d.is_dir()], reverse=True)
+        if not version_cpp_all:
+            raise FileNotFoundError(f"No versions found in {base}")
+
+        ext_dir = codeql_dir / version_cpp_all[0] / "ext"
+
+        logger.info(f"Using CodeQL cpp-all ext dir: {ext_dir}")
+
+        return ext_dir
+
+    def _inject_models(self, hints: HintSet) -> None:
+        ext_dir = self._get_codeql_cpp_ext_dir()
+
+        alloc_funcs = [f for f in hints.get_allocators() if f not in ("main", "_main", "")]
+        free_funcs = [(f, idx) for f, idx in hints.get_deallocators() if f not in ("main", "_main", "")]
+
+        logger.info(f"Allocators ({len(alloc_funcs)}): {alloc_funcs[:10]}...")
+        logger.info(f"Deallocators ({len(free_funcs)}): {free_funcs[:10]}...")
+
+        # 注入 allocation models
+        if alloc_funcs:
+            alloc_path = self._write_allocation_model(ext_dir, alloc_funcs)
+            self._injected_files.append(alloc_path)
+
+        # 注入 deallocation models
+        if free_funcs:
+            dealloc_path = self._write_deallocation_model(ext_dir, free_funcs)
+            self._injected_files.append(dealloc_path)
+
+    def _write_allocation_model(self, ext_dir: Path, alloc_funcs: list[str]) -> Path:
+        """写入 allocation model 文件"""
+        allocation_dir = ext_dir / "allocation"
+        allocation_dir.mkdir(parents=True, exist_ok=True)
+
+        # 生成 YAML - 参考官方格式
+        # allocationFunctionModel(namespace, type, subtypes, name, sizeArg, multArg, reallocPtrArg, requiresDealloc)
+        lines = ["extensions:"]
+        lines.append("  - addsTo:")
+        lines.append("      pack: codeql/cpp-all")
+        lines.append("      extensible: allocationFunctionModel")
+        lines.append("    data:")
+
+        for func_name in alloc_funcs:
+            # ["", "", false, "func_name", "", "", "", true]
+            lines.append(f'      - ["", "", false, "{func_name}", "", "", "", true]')
+
+        yaml_content = "\n".join(lines) + "\n"
+
+        output_path = allocation_dir / "hint.allocation.model.yml"
+        output_path.write_text(yaml_content)
+
+        logger.info(f"Written allocation model: {output_path}")
+        logger.debug(f"Content:\n{yaml_content}")
+
+        return output_path
+
+    def _write_deallocation_model(self, ext_dir: Path, free_funcs: list[tuple[str, int]]) -> Path:
+        """写入 deallocation model 文件"""
+        deallocation_dir = ext_dir / "deallocation"
+        deallocation_dir.mkdir(parents=True, exist_ok=True)
+
+        # 生成 YAML
+        # deallocationFunctionModel(namespace, type, subtypes, name, freedArg)
+        lines = ["extensions:"]
+        lines.append("  - addsTo:")
+        lines.append("      pack: codeql/cpp-all")
+        lines.append("      extensible: deallocationFunctionModel")
+        lines.append("    data:")
+
+        for func_name, arg_idx in free_funcs:
+            freed_arg = f"Argument[{arg_idx}]"
+            lines.append(f'      - ["", "", false, "{func_name}", "{freed_arg}"]')
+
+        yaml_content = "\n".join(lines) + "\n"
+
+        output_path = deallocation_dir / "hint.deallocation.model.yml"
+        output_path.write_text(yaml_content)
+
+        logger.info(f"Written deallocation model: {output_path}")
+        logger.debug(f"Content:\n{yaml_content}")
+
+        return output_path
+
+    def _verify_injected_models(self) -> None:
+        cmd = [
+            self.binary, "resolve", "extensions",
+            "codeql/cpp-all",
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
+
+        if result.returncode == 0:
+            try:
+                data = json.loads(result.stdout.decode())
+                all_files = []
+                for pack_path, entries in data.get("data", {}).items():
+                    for entry in entries:
+                        all_files.append(entry.get("file", ""))
+
+                for injected in self._injected_files:
+                    found = any(str(injected) in f for f in all_files)
+                    if found:
+                        logger.info(f"✓ Verified: {injected.name} is loaded")
+                    else:
+                        logger.warning(f"✗ NOT FOUND: {injected.name}")
+
+            except json.JSONDecodeError:
+                logger.warning(f"Could not parse resolve extensions output")
+        else:
+            logger.warning(f"resolve extensions failed: {result.stderr.decode()}")
+
+    def _cleanup_models(self) -> None:
+        for f in self._injected_files:
+            if f.exists():
+                f.unlink()
+                logger.info(f"Cleaned up: {f}")
+        self._injected_files.clear()
 
     def _create_database(self, project_path: Path, db_path: Path) -> bool:
         """Create CodeQL database."""
@@ -156,153 +286,9 @@ class CodeQLAnalyzer:
 
         return None
 
-    def _setup_model_pack(self, model_pack_dir: Path, hints: HintSet) -> bool:
-        """Create a CodeQL library pack with custom allocation/deallocation models.
-
-        Returns True if models were created successfully.
-        """
-        model_pack_dir.mkdir(parents=True, exist_ok=True)
-
-        # Collect function hints
-        alloc_funcs = [f for f in hints.get_allocators() if f not in ("main", "_main")]
-        free_funcs = hints.get_deallocators()  # List of (func_name, arg_index)
-
-        logger.info(f"Allocators ({len(alloc_funcs)}): {alloc_funcs[:10]}...")
-        logger.info(f"Deallocators ({len(free_funcs)}): {free_funcs[:10]}...")
-
-        if not alloc_funcs and not free_funcs:
-            logger.warning("No custom allocators or deallocators found")
-            return False
-
-        # Create qlpack.yml - LIBRARY pack that extends codeql/cpp-all
-        qlpack_content = """name: hint/memory-models
-version: 0.0.1
-library: true
-extensionTargets:
-  codeql/cpp-all: "*"
-"""
-        (model_pack_dir / "qlpack.yml").write_text(qlpack_content)
-
-        # Generate the .qll file
-        self._generate_model_library(model_pack_dir, alloc_funcs, free_funcs)
-
-        # Install dependencies
-        logger.info("Installing model pack dependencies...")
-        result = subprocess.run(
-            [self.binary, "pack", "install", str(model_pack_dir)],
-            capture_output=True, timeout=300
-        )
-
-        stdout = result.stdout.decode()
-        stderr = result.stderr.decode()
-
-        if result.returncode != 0:
-            logger.error(f"Pack install failed!")
-            logger.error(f"stdout: {stdout}")
-            logger.error(f"stderr: {stderr}")
-            return False
-
-        logger.info(f"Pack install successful")
-        logger.debug(f"stdout: {stdout}")
-
-        return True
-
-    def _generate_model_library(
-        self, model_pack_dir: Path,
-        alloc_funcs: list[str],
-        free_funcs: list[tuple[str, int]],
-    ) -> None:
-        """Generate CodeQL library extending AllocationFunction and DeallocationFunction.
-
-        Args:
-            model_pack_dir: Directory to write the .qll file
-            alloc_funcs: List of allocator function names
-            free_funcs: List of (func_name, freed_arg_index) tuples
-        """
-        # Build allocator names for CodeQL IN clause
-        if alloc_funcs:
-            alloc_names = ", ".join(f'"{f}"' for f in alloc_funcs)
-        else:
-            alloc_names = '"__no_custom_allocator__"'
-
-        # Group deallocators by freed arg index
-        dealloc_by_arg: dict[int, list[str]] = {}
-        for func_name, arg_idx in free_funcs:
-            if arg_idx not in dealloc_by_arg:
-                dealloc_by_arg[arg_idx] = []
-            dealloc_by_arg[arg_idx].append(func_name)
-
-        # Generate deallocation classes - one per arg index
-        dealloc_classes = []
-        for arg_idx, funcs in sorted(dealloc_by_arg.items()):
-            func_names = ", ".join(f'"{f}"' for f in funcs)
-            class_name = f"HintDeallocationFunctionArg{arg_idx}"
-            dealloc_classes.append(f'''
-/**
- * Custom deallocation functions (freed arg at index {arg_idx}).
- */
-class {class_name} extends DeallocationFunction {{
-  {class_name}() {{
-    this.getName() in [{func_names}]
-  }}
-
-  override int getFreedArg() {{ result = {arg_idx} }}
-}}''')
-
-        if dealloc_classes:
-            dealloc_section = "\n".join(dealloc_classes)
-        else:
-            dealloc_section = '''
-/**
- * No custom deallocation functions.
- */
-class HintDeallocationFunction extends DeallocationFunction {
-  HintDeallocationFunction() {
-    this.getName() in ["__no_custom_deallocator__"]
-  }
-
-  override int getFreedArg() { result = 0 }
-}'''
-
-        # Generate .qll content
-        qll_content = f'''/**
- * HINT Custom Memory Models
- *
- * Extends CodeQL's built-in AllocationFunction and DeallocationFunction
- * with custom functions identified by LLM annotations.
- */
-
-import cpp
-private import semmle.code.cpp.models.interfaces.Allocation
-private import semmle.code.cpp.models.interfaces.Deallocation
-
-/**
- * Custom allocation functions from LLM annotations.
- */
-class HintAllocationFunction extends AllocationFunction {{
-  HintAllocationFunction() {{
-    this.getName() in [{alloc_names}]
-  }}
-
-  override predicate requiresDealloc() {{ any() }}
-}}
-{dealloc_section}
-'''
-        qll_path = model_pack_dir / "HintMemoryModels.qll"
-        qll_path.write_text(qll_content)
-        logger.info(f"Generated: {qll_path}")
-        logger.info(f"  - Allocators: {len(alloc_funcs)}")
-        logger.info(f"  - Deallocators: {len(free_funcs)} ({len(dealloc_by_arg)} unique arg indices)")
-
-        # Log the content for debugging
-        logger.debug(f"QLL content:\n{qll_content}")
-
-    def _run_memory_queries_with_models(
-        self, db_path: Path, model_pack_dir: Path, results_path: Path
-    ) -> bool:
-        """Run built-in memory queries with custom model pack."""
+    def _run_memory_queries(self, db_path: Path, results_path: Path) -> bool:
         memory_queries = [
-            # Core memory safety queries - these benefit from Hint models
+            # Core memory safety queries
             "codeql/cpp-queries:Critical/MemoryNeverFreed.ql",
             "codeql/cpp-queries:Critical/MemoryMayNotBeFreed.ql",
             "codeql/cpp-queries:Critical/DoubleFree.ql",
@@ -318,8 +304,8 @@ class HintAllocationFunction extends AllocationFunction {{
             str(db_path),
             "--format=sarif-latest",
             f"--output={results_path}",
-            f"--additional-packs={model_pack_dir}",
             "--download",
+            "-v",
         ] + memory_queries
 
         logger.info(f"Running CodeQL analyze...")
@@ -332,9 +318,9 @@ class HintAllocationFunction extends AllocationFunction {{
 
         logger.info(f"CodeQL analyze return code: {result.returncode}")
         if stdout:
-            logger.debug(f"stdout:\n{stdout[:2000]}")
+            logger.debug(f"stdout:\n{stdout}")
         if stderr:
-            logger.info(f"stderr:\n{stderr[:2000]}")
+            logger.info(f"stderr:\n{stderr}")
 
         return results_path.exists()
 
