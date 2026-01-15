@@ -88,7 +88,7 @@ class CodeQLAnalyzer:
             success = self._run_memory_queries(db_path, results_path)
 
             if success:
-                return self._parse_sarif(results_path)
+                return self._parse_sarif(results_path, project_path)
             return []
 
         except Exception as e:
@@ -690,7 +690,37 @@ class CodeQLAnalyzer:
 
         return results_path.exists()
 
-    def _parse_sarif(self, sarif_path: Path) -> list[Warning]:
+    def _find_function_at_line(self, file_path: str, line_number: int, project_path: Path) -> str:
+        """Find the function name that contains the given line number."""
+        if not file_path or not line_number:
+            return ""
+        
+        try:
+            # Resolve file path relative to project
+            if not Path(file_path).is_absolute():
+                full_path = project_path / file_path
+            else:
+                full_path = Path(file_path)
+            
+            if not full_path.exists():
+                return ""
+            
+            # Parse the file to get functions
+            from src.tree_sitter_parser import CodeParser
+            parser = CodeParser()
+            functions = parser.parse_file(full_path)
+            
+            # Find function containing this line
+            for func_name, func_info in functions.items():
+                if func_info.start_line <= line_number <= func_info.end_line:
+                    return func_name
+            
+        except Exception as e:
+            logger.debug(f"Could not find function at line {line_number} in {file_path}: {e}")
+        
+        return ""
+
+    def _parse_sarif(self, sarif_path: Path, project_path: Path = None) -> list[Warning]:
         """Parse SARIF results."""
         if not sarif_path.exists():
             logger.warning(f"SARIF not found: {sarif_path}")
@@ -715,11 +745,18 @@ class CodeQLAnalyzer:
                         continue
 
                     loc = locs[0].get("physicalLocation", {})
+                    file_path = loc.get("artifactLocation", {}).get("uri", "")
+                    line_number = loc.get("region", {}).get("startLine", 0)
+                    
+                    # Find function name by parsing the source file
+                    function_name = ""
+                    if project_path and file_path and line_number:
+                        function_name = self._find_function_at_line(file_path, line_number, project_path)
 
                     warnings.append(Warning(
-                        file_path=loc.get("artifactLocation", {}).get("uri", ""),
-                        line_number=loc.get("region", {}).get("startLine", 0),
-                        function_name="",
+                        file_path=file_path,
+                        line_number=line_number,
+                        function_name=function_name,
                         warning_type=rule_id,
                         message=result.get("message", {}).get("text", ""),
                         issue_type=issue_type,
