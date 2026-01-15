@@ -3,7 +3,7 @@ HINT: LLM-Assisted Memory-Semantics Annotation for Static Analysis
 
 Pipeline flow:
 1. Parse source code (tree-sitter)
-2. LLM generates memory safety hints (ALLOCATOR, DEALLOCATOR, NULLABLE, etc.)
+2. LLM generates memory safety hints (ALLOCATOR, DEALLOCATOR)
 3. Z3 validates hints consistency
 4. CodeQL scans with hint-based model extensions
 5. Z3 filters false positives by path feasibility
@@ -12,12 +12,11 @@ Supports detection of:
 1. Memory leaks (allocation without free on some feasible path)
 2. Double-free (two frees on same pointer on some feasible path)
 3. Use-after-free (use of pointer after free on some feasible path)
-4. Null pointer dereference (dereference when pointer might be NULL)
-5. Buffer overflow (access beyond buffer bounds)
+4. Allocation/deallocation mismatch (new[]/delete, new/free, malloc/delete)
 
 Usage:
     python main.py --project /path/to/code
-    python main.py --project /path/to/code --issues leak double-free
+    python main.py --project /path/to/code --issues leak double-free mismatch
 """
 
 import argparse
@@ -36,10 +35,8 @@ BUG_TYPE_MAP = {
     "double-free": MemoryIssueType.DOUBLE_FREE,
     "uaf": MemoryIssueType.USE_AFTER_FREE,
     "use-after-free": MemoryIssueType.USE_AFTER_FREE,
-    "null": MemoryIssueType.NULL_DEREFERENCE,
-    "null-deref": MemoryIssueType.NULL_DEREFERENCE,
-    "overflow": MemoryIssueType.BUFFER_OVERFLOW,
-    "buffer-overflow": MemoryIssueType.BUFFER_OVERFLOW,
+    "mismatch": MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
+    "alloc-dealloc-mismatch": MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
 }
 
 
@@ -89,7 +86,7 @@ def main():
     )
     parser.add_argument(
         "--issues", "-i", nargs="+", metavar="TYPE",
-        help="Bug types to detect: leak, double-free, uaf, null, overflow (default: all)"
+        help="Bug types to detect: leak, double-free, uaf, mismatch (default: all)"
     )
     parser.add_argument(
         "--model", default="gemini-2.5-pro",
@@ -139,7 +136,6 @@ def main():
     print(result.summary())
     print(f"\nResults saved to: {output_dir}")
     print(f"  - hints.json              (LLM-generated hints)")
-    print(f"  - codeql_model.yml        (CodeQL model extension)")
     print(f"  - memory_safety_bugs.json (confirmed bugs)")
     print(f"  - filtered_warnings.json  (Z3-filtered false positives)")
     print(f"  - report.md               (human-readable report)")

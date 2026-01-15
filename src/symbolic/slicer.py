@@ -878,7 +878,6 @@ def analyze_with_slicing(code: str, alloc_funcs: set[str] = None) -> dict[str, l
         "MEMORY_LEAK": [],
         "DOUBLE_FREE": [],
         "USE_AFTER_FREE": [],
-        "NULL_DEREFERENCE": [],
     }
 
     # Memory leak
@@ -898,11 +897,5 @@ def analyze_with_slicing(code: str, alloc_funcs: set[str] = None) -> dict[str, l
         result = analyzer.check_uaf(slice_obj)
         if result.feasible:
             results["USE_AFTER_FREE"].append(result)
-
-    # Null dereference
-    for slice_obj in slicer.slice_for_null_deref(code):
-        result = analyzer.check_null_deref(slice_obj)
-        if result.feasible:
-            results["NULL_DEREFERENCE"].append(result)
 
     return results

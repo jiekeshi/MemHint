@@ -263,10 +263,8 @@ class HintValidator:
             return self._validate_allocator(hint, func)
         elif hint.hint_type == HintType.DEALLOCATOR:
             return self._validate_deallocator(hint, func)
-        elif hint.hint_type == HintType.NULLABLE:
-            return self._validate_nullable(hint, func)
         else:
-            # Other hints are harder to validate, accept them
+            # Other hints are accepted (shouldn't happen with simplified types)
             return ValidationResult(is_valid=True, reason="accepted")
 
     def _validate_allocator(self, hint: Hint, func: FunctionInfo) -> ValidationResult:
@@ -335,29 +333,6 @@ class HintValidator:
 
         return ValidationResult(is_valid=True, reason="validated")
 
-    def _validate_nullable(self, hint: Hint, func: FunctionInfo) -> ValidationResult:
-        """Validate NULLABLE hint.
-
-        Check: Function has code path that returns NULL/0/nullptr
-        """
-        code = func.code
-
-        # Check for explicit NULL return
-        if re.search(r'return\s+(NULL|0|nullptr)\s*;', code):
-            return ValidationResult(is_valid=True, reason="explicit NULL return")
-
-        # Check for returning result of nullable function
-        nullable_funcs = ["malloc", "calloc", "realloc", "strdup", "fopen",
-                         "fgets", "strchr", "strstr"]
-        for nf in nullable_funcs:
-            if f"return {nf}(" in code or f"return\n{nf}(" in code:
-                return ValidationResult(is_valid=True, reason=f"returns {nf} result")
-
-        return ValidationResult(
-            is_valid=False,
-            reason="No NULL return path found"
-        )
-
 
 # =============================================================================
 # Warning Validator (Path Feasibility)
@@ -423,8 +398,9 @@ class WarningValidator:
                 return self._check_double_free_feasibility(cfg, warning)
             elif warning.issue_type == MemoryIssueType.USE_AFTER_FREE:
                 return self._check_uaf_feasibility(cfg, warning)
-            elif warning.issue_type == MemoryIssueType.NULL_DEREFERENCE:
-                return self._check_null_deref_feasibility(cfg, warning)
+            elif warning.issue_type == MemoryIssueType.ALLOC_DEALLOC_MISMATCH:
+                # Mismatch bugs are structural, always feasible if CodeQL found them
+                return PathFeasibilityResult(is_feasible=True, reason="mismatch is structural")
             else:
                 # Can't validate, assume feasible
                 return PathFeasibilityResult(is_feasible=True, reason="unhandled bug type")
@@ -527,30 +503,3 @@ class WarningValidator:
         # For a proper check, we'd need to track uses after free
         # For now, if there's a free and code after it, consider potentially feasible
         return PathFeasibilityResult(is_feasible=True, reason="free found, needs detailed analysis")
-
-    def _check_null_deref_feasibility(
-        self,
-        cfg: dict[int, CFGNode],
-        warning: Warning,
-    ) -> PathFeasibilityResult:
-        """Check if null dereference path is feasible."""
-        # Check if there's an allocation that could fail
-        alloc_nodes = [n for n in cfg.values() if n.node_type == NodeType.ALLOC]
-
-        if not alloc_nodes:
-            return PathFeasibilityResult(is_feasible=False, reason="no allocation found")
-
-        # Check if there's a null check branch
-        branch_nodes = [n for n in cfg.values() if n.node_type == NodeType.BRANCH]
-
-        for branch in branch_nodes:
-            cond = branch.condition.lower()
-            # If there's a null check, the path after the check might be safe
-            if "null" in cond or "== 0" in cond or "!= 0" in cond:
-                return PathFeasibilityResult(
-                    is_feasible=True,
-                    reason="null check exists but path may bypass it"
-                )
-
-        # No null check found, definitely feasible
-        return PathFeasibilityResult(is_feasible=True, reason="no null check found")

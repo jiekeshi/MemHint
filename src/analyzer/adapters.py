@@ -26,6 +26,13 @@ CODEQL_ISSUE_MAP = {
     # Use after free
     "use-after-free": MemoryIssueType.USE_AFTER_FREE,
     "cpp/use-after-free": MemoryIssueType.USE_AFTER_FREE,
+    # Allocation/deallocation mismatch
+    "new-array-delete-mismatch": MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
+    "cpp/new-array-delete-mismatch": MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
+    "new-free-mismatch": MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
+    "cpp/new-free-mismatch": MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
+    "new-delete-array-mismatch": MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
+    "cpp/new-delete-array-mismatch": MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
 }
 
 
@@ -300,6 +307,10 @@ class HintAllocationFunction extends AllocationFunction {{
             "codeql/cpp-queries:Critical/MemoryMayNotBeFreed.ql",
             "codeql/cpp-queries:Critical/DoubleFree.ql",
             "codeql/cpp-queries:Critical/UseAfterFree.ql",
+            # Allocation/deallocation mismatch queries
+            "codeql/cpp-queries:Critical/NewArrayDeleteMismatch.ql",
+            "codeql/cpp-queries:Critical/NewFreeMismatch.ql",
+            "codeql/cpp-queries:Critical/NewDeleteArrayMismatch.ql",
         ]
 
         cmd = [
@@ -310,14 +321,6 @@ class HintAllocationFunction extends AllocationFunction {{
             f"--additional-packs={model_pack_dir}",
             "--download",
         ] + memory_queries
-
-        # cmd = [
-        #     self.binary, "database", "analyze",
-        #     str(db_path),
-        #     "--format=sarif-latest",
-        #     f"--output={results_path}",
-        #     "--download",
-        # ] + memory_queries
 
         logger.info(f"Running CodeQL analyze...")
         logger.debug(f"Command: {' '.join(cmd)}")
@@ -377,4 +380,3 @@ class HintAllocationFunction extends AllocationFunction {{
             logger.error(f"SARIF parse error: {e}")
 
         return warnings
-

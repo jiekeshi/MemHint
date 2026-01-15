@@ -2,7 +2,7 @@
 
 Pipeline flow:
 1. Parse: Extract functions from source code (tree-sitter)
-2. Generate: LLM generates memory safety hints (ALLOCATOR, DEALLOCATOR, etc.)
+2. Generate: LLM generates memory safety hints (ALLOCATOR, DEALLOCATOR)
 3. Validate Hints: Z3 validates hints are consistent with code
 4. Analyze: CodeQL scans with custom model extensions based on hints
 5. Filter: Z3 filters false positives by path feasibility
@@ -75,8 +75,7 @@ class Pipeline:
             MemoryIssueType.MEMORY_LEAK,
             MemoryIssueType.DOUBLE_FREE,
             MemoryIssueType.USE_AFTER_FREE,
-            MemoryIssueType.NULL_DEREFERENCE,
-            MemoryIssueType.BUFFER_OVERFLOW,
+            MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
         ]
 
         # State
@@ -163,9 +162,6 @@ class Pipeline:
         # =====================================================================
         logger.info("Phase 4: Running CodeQL with hint-based models...")
 
-        # Export hints as CodeQL model extensions
-        self._export_codeql_models(output_dir)
-
         # Run CodeQL
         warnings = self.analyzer.analyze(
             project_path,
@@ -227,15 +223,10 @@ class Pipeline:
 
     def _export_codeql_models(self, output_dir: Path) -> None:
         """Export hints as CodeQL model extensions."""
-        # YAML model file
-        model_yaml = output_dir / "codeql_model.yml"
-        model_yaml.write_text(self.hints.to_codeql_model())
 
-        # Also create model pack for CodeQL
-        if isinstance(self.analyzer, CodeQLAnalyzer):
-            query_pack_dir = output_dir / "query-pack"
-            self.analyzer._setup_model_pack(query_pack_dir, self.hints)
-            logger.info(f"  Created CodeQL query pack at {query_pack_dir}")
+        query_pack_dir = output_dir / "query-pack"
+        self.analyzer._setup_model_pack(query_pack_dir, self.hints)
+        logger.info(f"  Created CodeQL query pack at {query_pack_dir}")
 
     def _export_results(
         self,
@@ -329,7 +320,6 @@ class Pipeline:
             MemoryIssueType.MEMORY_LEAK: "Free allocated memory before function exit",
             MemoryIssueType.DOUBLE_FREE: "Remove duplicate free() or add null guard",
             MemoryIssueType.USE_AFTER_FREE: "Use memory before freeing, not after",
-            MemoryIssueType.NULL_DEREFERENCE: "Add null check before pointer use",
-            MemoryIssueType.BUFFER_OVERFLOW: "Validate buffer bounds before access",
+            MemoryIssueType.ALLOC_DEALLOC_MISMATCH: "Match allocator with correct deallocator (new[]/delete[], new/delete, malloc/free)",
         }
         return fixes.get(warning.issue_type, "Review memory safety issue")

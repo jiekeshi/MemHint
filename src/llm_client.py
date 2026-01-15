@@ -6,9 +6,6 @@ Hints describe function SEMANTICS that help CodeQL understand custom functions.
 Hint Types:
 - ALLOCATOR: Function returns newly allocated heap memory
 - DEALLOCATOR: Function frees memory passed as argument
-- NULLABLE: Function may return NULL
-- WRITES_BUFFER: Function writes to buffer argument
-- SIZE_PARAM: Parameter specifies buffer size
 """
 
 import json
@@ -42,7 +39,7 @@ logger = logging.getLogger(__name__)
 HINT_GENERATION_PROMPT = """You are a memory safety expert analyzing C/C++ code to identify function semantics that help static analyzers detect memory bugs.
 
 ## Task
-Analyze this function and identify its MEMORY SEMANTICS and its behavioral properties relevant to memory safety.
+Analyze this function and identify its MEMORY SEMANTICS relevant to allocation and deallocation.
 
 **Function:** `{func_name}`
 **Return type:** `{return_type}`
@@ -80,38 +77,6 @@ Function **frees/releases memory** passed as an argument.
 
 **Specify:** Which argument (0-indexed) gets freed. If multiple arguments are freed, report each separately.
 
-### 3. NULLABLE
-Function's return value **may be NULL** under some conditions.
-
-**Positive indicators:**
-- Explicit `return NULL`, `return 0`, or `return nullptr`
-- Returns result of malloc/calloc (which may return NULL)
-- Returns result of another nullable function
-- Has error handling path that returns NULL
-- Lookup/search function that may not find element
-
-**Note:** All ALLOCATORs are implicitly NULLABLE (malloc can fail), so only report NULLABLE separately if the function is NOT an allocator but may still return NULL.
-
-### 4. WRITES_BUFFER
-Function **writes data to a buffer argument** (potential overflow risk).
-
-**Positive indicators:**
-- Calls strcpy/strcat/sprintf/memcpy/memmove targeting an argument
-- Uses loop to write into argument buffer
-- Assigns to dereferenced pointer argument: `*buf = ...` or `buf[i] = ...`
-
-**Specify:** Which argument (0-indexed) is the destination buffer.
-
-### 5. SIZE_PARAM
-A parameter **specifies buffer size or max length** (used for bounds checking).
-
-**Positive indicators:**
-- Parameter used as limit in strncpy/snprintf/memcpy size argument
-- Parameter used as loop bound when writing to buffer
-- Parameter named size/len/count/max/capacity/n/num_bytes
-
-**Specify:** Which parameter (0-indexed) is the size.
-
 ## Analysis Guidelines
 
 1. **Trace data flow:** Follow where return values come from and where arguments flow to.
@@ -123,18 +88,15 @@ A parameter **specifies buffer size or max length** (used for bounds checking).
 ## Output Format
 
 Return a JSON object with hints array. Each hint must have:
-- `type`: One of ALLOCATOR, DEALLOCATOR, NULLABLE, WRITES_BUFFER, SIZE_PARAM
+- `type`: One of ALLOCATOR, DEALLOCATOR
 - `target`: "return" for return value, or "argN" for argument N
-- `arg_index`: (required for DEALLOCATOR, WRITES_BUFFER, SIZE_PARAM) 0-based argument index
+- `arg_index`: (required for DEALLOCATOR) 0-based argument index
 - `reason`: Brief evidence from the code (cite specific lines/calls)
 ```json
 {{
     "hints": [
         {{"type": "ALLOCATOR", "target": "return", "reason": "line 5: returns malloc(size) result"}},
-        {{"type": "DEALLOCATOR", "target": "arg0", "arg_index": 0, "reason": "line 8: calls free(ptr)"}},
-        {{"type": "NULLABLE", "target": "return", "reason": "line 3: returns NULL if size==0"}},
-        {{"type": "WRITES_BUFFER", "target": "arg0", "arg_index": 0, "reason": "line 6: memcpy(dest, src, n)"}},
-        {{"type": "SIZE_PARAM", "target": "arg2", "arg_index": 2, "reason": "parameter 'n' limits memcpy length"}}
+        {{"type": "DEALLOCATOR", "target": "arg0", "arg_index": 0, "reason": "line 8: calls free(ptr)"}}
     ]
 }}
 ```
@@ -153,23 +115,14 @@ KNOWN_ALLOCATORS = {
     "g_malloc", "g_malloc0", "g_new", "g_new0",
     "kmalloc", "kzalloc", "vmalloc",
     "xmalloc", "xcalloc", "xrealloc",
+    # C++ operators
+    "new", "new[]",
 }
 
 KNOWN_DEALLOCATORS = {
     "free", "cfree", "g_free", "kfree", "vfree", "xfree",
-}
-
-KNOWN_BUFFER_WRITERS = {
-    "strcpy": 0, "strncpy": 0, "strcat": 0, "strncat": 0,
-    "sprintf": 0, "snprintf": 0, "vsprintf": 0, "vsnprintf": 0,
-    "memcpy": 0, "memmove": 0, "memset": 0,
-    "gets": 0, "fgets": 0, "read": 1, "recv": 1,
-}
-
-KNOWN_SIZE_PARAMS = {
-    "strncpy": 2, "strncat": 2, "snprintf": 1, "vsnprintf": 1,
-    "memcpy": 2, "memmove": 2, "memset": 2,
-    "fgets": 1, "read": 2, "recv": 2,
+    # C++ operators
+    "delete", "delete[]",
 }
 
 

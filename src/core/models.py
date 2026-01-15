@@ -3,9 +3,6 @@
 We define memory safety hints that guide static analyzers:
 - ALLOCATOR: Returns newly allocated heap memory
 - DEALLOCATOR: Frees memory at argument N
-- NULLABLE: May return NULL
-- WRITES_BUFFER: Writes to buffer argument
-- SIZE_PARAM: Parameter specifies buffer size
 
 Pipeline flow:
 1. LLM generates Hints (function semantics)
@@ -36,20 +33,10 @@ class HintType(Enum):
     Examples:
         ALLOCATOR: my_malloc, create_buffer, pool_alloc
         DEALLOCATOR: my_free, destroy_buffer, pool_release
-        NULLABLE: find_element, lookup_config (may return NULL)
-        WRITES_BUFFER: my_strcpy, fill_data
-        SIZE_PARAM: my_strncpy's 'n' parameter
     """
-    # Memory management (for detecting leak/UAF/double-free)
+    # Memory management (for detecting leak/UAF/double-free/mismatch)
     ALLOCATOR = auto()        # Returns newly allocated heap memory
     DEALLOCATOR = auto()      # Frees memory at argument N
-
-    # Nullability (for detecting null-deref)
-    NULLABLE = auto()         # May return NULL
-
-    # Buffer safety (for detecting overflow)
-    WRITES_BUFFER = auto()    # Writes to buffer argument
-    SIZE_PARAM = auto()       # Parameter specifies buffer size
 
 
 class MemoryIssueType(Enum):
@@ -57,19 +44,15 @@ class MemoryIssueType(Enum):
     MEMORY_LEAK = auto()        # Allocated memory never freed
     USE_AFTER_FREE = auto()     # Accessing freed memory
     DOUBLE_FREE = auto()        # Freeing already freed memory
-    NULL_DEREFERENCE = auto()   # Dereferencing NULL pointer
-    BUFFER_OVERFLOW = auto()    # Writing beyond buffer bounds
+    ALLOC_DEALLOC_MISMATCH = auto()  # new[]/delete, new/free, malloc/delete mismatch
 
 
 # Mapping: Which hints help detect which bugs
 HINT_TO_BUGS = {
     HintType.ALLOCATOR: [MemoryIssueType.MEMORY_LEAK, MemoryIssueType.USE_AFTER_FREE,
-                         MemoryIssueType.DOUBLE_FREE, MemoryIssueType.NULL_DEREFERENCE],
+                         MemoryIssueType.DOUBLE_FREE, MemoryIssueType.ALLOC_DEALLOC_MISMATCH],
     HintType.DEALLOCATOR: [MemoryIssueType.MEMORY_LEAK, MemoryIssueType.USE_AFTER_FREE,
-                           MemoryIssueType.DOUBLE_FREE],
-    HintType.NULLABLE: [MemoryIssueType.NULL_DEREFERENCE],
-    HintType.WRITES_BUFFER: [MemoryIssueType.BUFFER_OVERFLOW],
-    HintType.SIZE_PARAM: [MemoryIssueType.BUFFER_OVERFLOW],
+                           MemoryIssueType.DOUBLE_FREE, MemoryIssueType.ALLOC_DEALLOC_MISMATCH],
 }
 
 
@@ -107,7 +90,7 @@ class Hint:
     function_name: str
     hint_type: HintType
     target: str = "return"    # "return", "arg0", "arg1", etc.
-    arg_index: int = -1       # For DEALLOCATOR/WRITES_BUFFER/SIZE_PARAM: which argument
+    arg_index: int = -1       # For DEALLOCATOR: which argument
     reason: str = ""
 
 
@@ -158,31 +141,6 @@ class HintSet:
             result.append((fn, arg_idx))
         return result
 
-    def get_nullable_functions(self) -> list[str]:
-        """Get all functions that may return NULL (including allocators)."""
-        nullable = set()
-        for fn, _ in self.get_by_type(HintType.NULLABLE):
-            nullable.add(fn)
-        # Allocators implicitly may return NULL
-        nullable.update(self.get_allocators())
-        return list(nullable)
-
-    def get_buffer_writers(self) -> list[tuple[str, int]]:
-        """Get functions that write to buffer with their buffer argument index."""
-        result = []
-        for fn, h in self.get_by_type(HintType.WRITES_BUFFER):
-            arg_idx = h.arg_index if h.arg_index >= 0 else 0
-            result.append((fn, arg_idx))
-        return result
-
-    def get_size_params(self) -> list[tuple[str, int]]:
-        """Get functions with size parameter and the parameter index."""
-        result = []
-        for fn, h in self.get_by_type(HintType.SIZE_PARAM):
-            arg_idx = h.arg_index if h.arg_index >= 0 else -1
-            result.append((fn, arg_idx))
-        return result
-
     def to_json(self) -> dict:
         """Export as JSON format."""
         result = {"hints": {}}
@@ -213,68 +171,14 @@ class HintSet:
                 ))
         return hint_set
 
-    def to_codeql_model(self) -> str:
-        """Export as CodeQL model extension YAML.
-
-        Generates data extensions for CodeQL to recognize custom functions:
-        - ALLOCATOR -> sourceModel (allocation kind)
-        - DEALLOCATOR -> sinkModel (deallocation kind)
-        - NULLABLE -> sourceModel (nullable kind)
-        """
-        lines = ["extensions:"]
-
-        # Allocators -> sourceModel
-        allocators = self.get_allocators()
-        if allocators:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: sourceModel",
-                "    data:",
-            ])
-            for func_name in allocators:
-                lines.append(f'      - ["", "", false, "{func_name}", "", "", "ReturnValue", "allocation", "manual"]')
-
-        # Deallocators -> sinkModel
-        deallocators = self.get_deallocators()
-        if deallocators:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: sinkModel",
-                "    data:",
-            ])
-            for func_name, arg_idx in deallocators:
-                lines.append(f'      - ["", "", false, "{func_name}", "", "", "Argument[{arg_idx}]", "deallocation", "manual"]')
-
-        # Nullable functions -> sourceModel
-        nullable_only = [fn for fn, _ in self.get_by_type(HintType.NULLABLE)]
-        if nullable_only:
-            lines.extend([
-                "  - addsTo:",
-                "      pack: codeql/cpp-all",
-                "      extensible: sourceModel",
-                "    data:",
-            ])
-            for func_name in nullable_only:
-                lines.append(f'      - ["", "", false, "{func_name}", "", "", "ReturnValue", "nullable", "manual"]')
-
-        return "\n".join(lines)
-
     def summary(self) -> str:
         """Return a summary of hints."""
         n_alloc = len(self.get_allocators())
         n_dealloc = len(self.get_deallocators())
-        n_nullable = len(self.get_nullable_functions())
-        n_buf_write = len(self.get_buffer_writers())
-        n_size = len(self.get_size_params())
 
         parts = []
         if n_alloc: parts.append(f"{n_alloc} allocators")
         if n_dealloc: parts.append(f"{n_dealloc} deallocators")
-        if n_nullable: parts.append(f"{n_nullable} nullable")
-        if n_buf_write: parts.append(f"{n_buf_write} buffer writers")
-        if n_size: parts.append(f"{n_size} size params")
 
         return f"Hints: {len(self.hints)} functions ({', '.join(parts) if parts else 'none'})"
 
