@@ -51,6 +51,7 @@ class Pipeline:
         use_merge: bool = False,  # Kept for compatibility
         codeql_dir: Path = None,
         cpp_queries_dir: Path = None,
+        reuse_db: bool = True,
     ):
         """Initialize pipeline.
 
@@ -63,6 +64,7 @@ class Pipeline:
             use_merge: Whether to merge code (kept for compatibility)
             codeql_dir: Optional custom CodeQL directory path (default: ~/.codeql)
             cpp_queries_dir: Optional direct path to cpp-queries directory
+            reuse_db: Whether to reuse existing CodeQL database (default: True)
         """
         # Components
         self.parser = CodeParser()
@@ -70,7 +72,7 @@ class Pipeline:
         self.hint_generator = HintGenerator(self.llm_client)
         self.hint_validator = HintValidator()
         self.warning_validator = None  # Initialized with known allocators
-        self.analyzer = CodeQLAnalyzer(codeql_dir=codeql_dir, cpp_queries_dir=cpp_queries_dir)
+        self.analyzer = CodeQLAnalyzer(codeql_dir=codeql_dir, cpp_queries_dir=cpp_queries_dir, reuse_db=reuse_db)
 
         # Configuration
         self.max_iterations = max_iterations
