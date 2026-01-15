@@ -96,6 +96,21 @@ def main():
         "--max-iterations", type=int, default=3,
         help="Max CEGAR iterations (default: 3)"
     )
+    parser.add_argument(
+        "--single-source",
+        help="Optional: path to a single C/C++ source file to feed to the LLM/hint phases "
+             "instead of parsing the entire project (for small tests).",
+    )
+    parser.add_argument(
+        "--codeql-dir",
+        type=Path,
+        help="Optional: custom CodeQL directory path (default: ~/.codeql)"
+    )
+    parser.add_argument(
+        "--cpp-queries-dir",
+        type=Path,
+        help="Optional: direct path to cpp-queries directory (e.g., /path/to/codeql/qlpacks/codeql/cpp-queries)"
+    )
 
     args = parser.parse_args()
 
@@ -114,6 +129,13 @@ def main():
         logger.error(f"Project not found: {project_path}")
         sys.exit(1)
 
+    single_source = None
+    if args.single_source:
+        single_source = Path(args.single_source)
+        if not single_source.exists():
+            logger.error(f"Single source file not found: {single_source}")
+            sys.exit(1)
+
     # Parse bug types
     bug_types = parse_bug_types(args.issues)
     if bug_types:
@@ -127,9 +149,11 @@ def main():
         analyzer_type=args.analyzer,
         max_iterations=args.max_iterations,
         issue_types=bug_types,
+        codeql_dir=args.codeql_dir,
+        cpp_queries_dir=args.cpp_queries_dir,
     )
 
-    result = pipeline.analyze(project_path, output_dir)
+    result = pipeline.analyze(project_path, output_dir, single_source=single_source)
 
     # Print summary
     print("\n" + "=" * 60)
