@@ -1,0 +1,18 @@
+{
+    "njs": {
+        "prepare_for_build": [
+            {
+                "command": "make clean && make -B V=1",
+                "can_error": true
+            },
+            {
+                "command": "./configure",
+                "can_error": false
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
+    }
+}
