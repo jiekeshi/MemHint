@@ -45,6 +45,20 @@ class CodeQLAnalyzer:
         self.cpp_queries_dir = cpp_queries_dir  # Optional direct path to cpp-queries directory
         self.reuse_db = reuse_db  # Whether to reuse existing databases
         self._injected_files: list[Path] = []  # 记录注入的文件，用于清理
+    
+    def _delete_database(self, db_path: Path) -> bool:
+        """Delete an existing CodeQL database."""
+        if not db_path.exists():
+            return True
+        
+        try:
+            logger.info(f"Deleting existing database at {db_path}")
+            shutil.rmtree(db_path)
+            logger.info(f"Database deleted successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete database at {db_path}: {e}")
+            return False
 
     def analyze(
         self, project_path: Path, hints: HintSet = None,
@@ -142,6 +156,12 @@ class CodeQLAnalyzer:
             Path to the database, or None if creation failed.
         """
         db_path = self._get_db_path(project_path)
+        
+        # If reuse_db is False, delete existing database first
+        if not self.reuse_db and db_path.exists():
+            if not self._delete_database(db_path):
+                logger.error("Failed to delete existing database, aborting")
+                return None
         
         # Check if we should reuse existing database
         if self.reuse_db and self._is_valid_database(db_path):
@@ -329,9 +349,143 @@ class CodeQLAnalyzer:
                 logger.info(f"Cleaned up: {f}")
         self._injected_files.clear()
 
+    def _load_project_build_config(self, project_path: Path) -> dict | None:
+        """Load project build configuration from centralized JSON file.
+        
+        Looks for /home/huihuihuang/Hint/proj_build_command.json
+        Structure: { "project_name": { "prepare_for_build": "command", "build_command": "command" } }
+        Uses the last directory name from project_path to match the JSON field.
+        Example: /home/huihuihuang/Hint/defect4c_clone_proj/njs -> matches "njs"
+        """
+        config_file = Path("/home/huihuihuang/Hint/proj_build_command.json")
+        if not config_file.exists():
+            logger.debug(f"Config file not found at {config_file}")
+            return None
+        
+        try:
+            with open(config_file, 'r') as f:
+                all_configs = json.load(f)
+            
+            # Use the last directory name from the project path to match JSON field
+            # Example: /home/huihuihuang/Hint/defect4c_clone_proj/njs -> "njs"
+            project_name = project_path.name
+            
+            if project_name in all_configs:
+                config = all_configs[project_name]
+                logger.info(f"Found build config for project '{project_name}' in {config_file}")
+                return config
+            
+            logger.debug(f"No build config found for project '{project_name}' in {config_file}")
+            return None
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid JSON in {config_file}: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Error reading {config_file}: {e}")
+            return None
+    
+    def _run_pre_build_commands(self, project_path: Path, commands_config: list | str) -> bool:
+        """Run pre-build commands before creating CodeQL database.
+        
+        The commands are executed inside the project directory.
+        Supports both old format (string) and new format (list of objects with can_error flag).
+        """
+        if not commands_config:
+            return True
+        
+        # Verify project directory exists
+        if not project_path.exists():
+            logger.error(f"Project directory does not exist: {project_path}")
+            return False
+        
+        # Handle new format: list of objects with command and can_error
+        if isinstance(commands_config, list):
+            commands = []
+            for item in commands_config:
+                if isinstance(item, dict):
+                    cmd = item.get("command", "")
+                    can_error = item.get("can_error", False)
+                    commands.append({"command": cmd, "can_error": can_error})
+                elif isinstance(item, str):
+                    # Fallback: treat string as command that can error
+                    commands.append({"command": item, "can_error": True})
+        # Handle old format: string (split by &&)
+        elif isinstance(commands_config, str):
+            cmd_str = commands_config.strip()
+            if not cmd_str:
+                return True
+            # Split by && and treat all as can_error=True for backward compatibility
+            commands = [{"command": cmd.strip(), "can_error": True} 
+                       for cmd in cmd_str.split('&&')]
+        else:
+            logger.warning(f"Unknown prepare_for_build format: {type(commands_config)}")
+            return True
+        
+        if not commands:
+            return True
+        
+        logger.info(f"Running {len(commands)} pre-build command(s) in {project_path}")
+        
+        for i, cmd_info in enumerate(commands, 1):
+            cmd = cmd_info["command"]
+            can_error = cmd_info["can_error"]
+            
+            if not cmd or not cmd.strip():
+                continue
+            
+            logger.info(f"Running command {i}/{len(commands)}: {cmd} (can_error={can_error})")
+            
+            # Use shell=True to support commands with operators
+            # cwd ensures the command runs inside the project directory
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                cwd=str(project_path),
+                timeout=self.timeout,
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode != 0:
+                if can_error:
+                    # Log as warning but note that failure is expected/okay for this command
+                    logger.warning(f"Command {i} failed (exit code {result.returncode}): {cmd} - This is expected and okay, continuing...")
+                    if result.stderr:
+                        stderr_preview = result.stderr.strip()[:200]
+                        logger.warning(f"  Error (expected): {stderr_preview}")
+                        if len(result.stderr.strip()) > 200:
+                            logger.debug(f"  Full stderr:\n{result.stderr}")
+                    if result.stdout:
+                        logger.debug(f"  stdout:\n{result.stdout}")
+                else:
+                    # Command that cannot error has failed - abort
+                    logger.error(f"Command {i} failed (exit code {result.returncode}): {cmd}")
+                    if result.stderr:
+                        logger.error(f"  Error:\n{result.stderr}")
+                    if result.stdout:
+                        logger.error(f"  Output:\n{result.stdout}")
+                    return False
+            else:
+                logger.info(f"Command {i} completed successfully")
+                if result.stdout:
+                    logger.debug(f"  Output:\n{result.stdout}")
+        
+        logger.info("All pre-build commands processed")
+        return True
+
     def _create_database(self, project_path: Path, db_path: Path) -> bool:
         """Create CodeQL database."""
         logger.info(f"Project: {project_path}")
+
+        # Load project-specific build configuration from centralized file
+        config = self._load_project_build_config(project_path)
+        if config:
+            # Run pre-build commands if specified
+            pre_build_cmd = config.get("prepare_for_build", "")
+            if pre_build_cmd:
+                if not self._run_pre_build_commands(project_path, pre_build_cmd):
+                    logger.error("Pre-build command failed, aborting database creation")
+                    return False
 
         compile_commands = project_path / "compile_commands.json"
         if compile_commands.exists():
@@ -345,10 +499,26 @@ class CodeQLAnalyzer:
                 f"--compilation-database={compile_commands}",
             ]
         else:
-            build_cmd = self._get_build_command(project_path)
+            # Check if config overrides the build command
+            build_cmd = None
+            if config and "build_command" in config:
+                build_cmd_config = config["build_command"]
+                # Handle new format: object with command field
+                if isinstance(build_cmd_config, dict):
+                    build_cmd = build_cmd_config.get("command", "")
+                # Handle old format: string
+                elif isinstance(build_cmd_config, str):
+                    build_cmd = build_cmd_config
+                
+                if build_cmd:
+                    logger.info(f"Using build command from config: {build_cmd}")
+            
+            # Otherwise, auto-detect build command
             if not build_cmd:
-                logger.error("Could not determine build command")
-                return False
+                build_cmd = self._get_build_command(project_path)
+                if not build_cmd:
+                    logger.error("Could not determine build command")
+                    return False
 
             logger.info(f"Build command: {build_cmd}")
             cmd = [
