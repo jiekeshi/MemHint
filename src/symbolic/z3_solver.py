@@ -398,9 +398,6 @@ class WarningValidator:
                 return self._check_double_free_feasibility(cfg, warning)
             elif warning.issue_type == MemoryIssueType.USE_AFTER_FREE:
                 return self._check_uaf_feasibility(cfg, warning)
-            elif warning.issue_type == MemoryIssueType.ALLOC_DEALLOC_MISMATCH:
-                # Mismatch bugs are structural, always feasible if CodeQL found them
-                return PathFeasibilityResult(is_feasible=True, reason="mismatch is structural")
             else:
                 # Can't validate, assume feasible
                 return PathFeasibilityResult(is_feasible=True, reason="unhandled bug type")
