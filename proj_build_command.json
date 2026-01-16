@@ -30,5 +30,37 @@
             "command": "make",
             "can_error": false
         }
+    },
+    "CWE415_Double_Free": {
+        "prepare_for_build": [
+            {
+                "command": "cd ../../ && python juliet.py 415 --clean",
+                "can_error": true
+            },
+            {
+                "command": "cd ../../ && python juliet.py 415 --generate",
+                "can_error": false
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
+    },
+    "CWE416_Use_After_Free": {
+        "prepare_for_build": [
+            {
+                "command": "cd ../../ && python juliet.py 416 --clean",
+                "can_error": true
+            },
+            {
+                "command": "cd ../../ && python juliet.py 416 --generate",
+                "can_error": false
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
     }
 }
