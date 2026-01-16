@@ -12,11 +12,10 @@ Supports detection of:
 1. Memory leaks (allocation without free on some feasible path)
 2. Double-free (two frees on same pointer on some feasible path)
 3. Use-after-free (use of pointer after free on some feasible path)
-4. Allocation/deallocation mismatch (new[]/delete, new/free, malloc/delete)
 
 Usage:
     python main.py --project /path/to/code
-    python main.py --project /path/to/code --issues leak double-free mismatch
+    python main.py --project /path/to/code --issues leak double-free 
 """
 
 import argparse
@@ -35,8 +34,6 @@ BUG_TYPE_MAP = {
     "double-free": MemoryIssueType.DOUBLE_FREE,
     "uaf": MemoryIssueType.USE_AFTER_FREE,
     "use-after-free": MemoryIssueType.USE_AFTER_FREE,
-    "mismatch": MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
-    "alloc-dealloc-mismatch": MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
 }
 
 
@@ -86,14 +83,14 @@ def main():
     )
     parser.add_argument(
         "--issues", "-i", nargs="+", metavar="TYPE",
-        help="Bug types to detect: leak, double-free, uaf, mismatch (default: all)"
+        help="Bug types to detect: leak, double-free, uaf (default: all)"
     )
     parser.add_argument(
         "--model", default="gemini-2.5-pro",
         help="LLM model (default: gemini-2.5-pro)"
     )
     parser.add_argument(
-        "--max-iterations", type=int, default=3,
+        "--max-hint-iterations", type=int, default=2,
         help="Max CEGAR iterations (default: 3)"
     )
     parser.add_argument(
@@ -152,7 +149,7 @@ def main():
     pipeline = Pipeline(
         model=args.model,
         analyzer_type=args.analyzer,
-        max_iterations=args.max_iterations,
+        max_hint_iterations=args.max_hint_iterations,
         issue_types=bug_types,
         codeql_dir=args.codeql_dir,
         cpp_queries_dir=args.cpp_queries_dir,
