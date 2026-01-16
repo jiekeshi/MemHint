@@ -25,13 +25,6 @@ CODEQL_ISSUE_MAP = {
     # Use after free
     "use-after-free": MemoryIssueType.USE_AFTER_FREE,
     "cpp/use-after-free": MemoryIssueType.USE_AFTER_FREE,
-    # Allocation/deallocation mismatch
-    "new-array-delete-mismatch": MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
-    "cpp/new-array-delete-mismatch": MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
-    "new-free-mismatch": MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
-    "cpp/new-free-mismatch": MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
-    "new-delete-array-mismatch": MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
-    "cpp/new-delete-array-mismatch": MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
 }
 
 
@@ -352,12 +345,11 @@ class CodeQLAnalyzer:
     def _load_project_build_config(self, project_path: Path) -> dict | None:
         """Load project build configuration from centralized JSON file.
         
-        Looks for /home/huihuihuang/Hint/proj_build_command.json
+        Looks for ../../proj_build_command.json
         Structure: { "project_name": { "prepare_for_build": "command", "build_command": "command" } }
         Uses the last directory name from project_path to match the JSON field.
-        Example: /home/huihuihuang/Hint/defect4c_clone_proj/njs -> matches "njs"
         """
-        config_file = Path("/home/huihuihuang/Hint/proj_build_command.json")
+        config_file = Path("../../proj_build_command.json")
         if not config_file.exists():
             logger.debug(f"Config file not found at {config_file}")
             return None
@@ -367,7 +359,6 @@ class CodeQLAnalyzer:
                 all_configs = json.load(f)
             
             # Use the last directory name from the project path to match JSON field
-            # Example: /home/huihuihuang/Hint/defect4c_clone_proj/njs -> "njs"
             project_name = project_path.name
             
             if project_name in all_configs:
@@ -612,17 +603,6 @@ class CodeQLAnalyzer:
 
     def _get_build_command(self, project_path: Path) -> str:
         """Determine appropriate build command."""
-        # configure_script = project_path / "configure"
-        # if configure_script.exists() and configure_script.is_file() and which("make"):
-        #     # Delete build directory if it exists
-        #     build_dir = project_path / "build"
-        #     if build_dir.exists() and build_dir.is_dir():
-        #         logger.info(f"Removing existing build directory: {build_dir}")
-        #         shutil.rmtree(build_dir)
-            
-        #     # Return command that runs both ./configure and make
-        #     return "./configure && make"
-        
         if (project_path / "Makefile").exists() and which("make"):
             return "make"
 
@@ -659,10 +639,6 @@ class CodeQLAnalyzer:
             "codeql/cpp-queries:Critical/MemoryMayNotBeFreed.ql",
             "codeql/cpp-queries:Critical/DoubleFree.ql",
             "codeql/cpp-queries:Critical/UseAfterFree.ql",
-            # Allocation/deallocation mismatch queries
-            "codeql/cpp-queries:Critical/NewArrayDeleteMismatch.ql",
-            "codeql/cpp-queries:Critical/NewFreeMismatch.ql",
-            "codeql/cpp-queries:Critical/NewDeleteArrayMismatch.ql",
         ]
 
         cmd = [
