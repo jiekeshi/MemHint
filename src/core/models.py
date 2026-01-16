@@ -34,7 +34,7 @@ class HintType(Enum):
         ALLOCATOR: my_malloc, create_buffer, pool_alloc
         DEALLOCATOR: my_free, destroy_buffer, pool_release
     """
-    # Memory management (for detecting leak/UAF/double-free/mismatch)
+    # Memory management (for detecting leak/UAF/double-free)
     ALLOCATOR = auto()        # Returns newly allocated heap memory
     DEALLOCATOR = auto()      # Frees memory at argument N
 
@@ -44,15 +44,14 @@ class MemoryIssueType(Enum):
     MEMORY_LEAK = auto()        # Allocated memory never freed
     USE_AFTER_FREE = auto()     # Accessing freed memory
     DOUBLE_FREE = auto()        # Freeing already freed memory
-    ALLOC_DEALLOC_MISMATCH = auto()  # new[]/delete, new/free, malloc/delete mismatch
 
 
 # Mapping: Which hints help detect which bugs
 HINT_TO_BUGS = {
     HintType.ALLOCATOR: [MemoryIssueType.MEMORY_LEAK, MemoryIssueType.USE_AFTER_FREE,
-                         MemoryIssueType.DOUBLE_FREE, MemoryIssueType.ALLOC_DEALLOC_MISMATCH],
+                         MemoryIssueType.DOUBLE_FREE],
     HintType.DEALLOCATOR: [MemoryIssueType.MEMORY_LEAK, MemoryIssueType.USE_AFTER_FREE,
-                           MemoryIssueType.DOUBLE_FREE, MemoryIssueType.ALLOC_DEALLOC_MISMATCH],
+                           MemoryIssueType.DOUBLE_FREE],
 }
 
 
