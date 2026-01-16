@@ -272,6 +272,60 @@ class HintGenerator:
 
         return hint_set
 
+    def regenerate_hints_for_functions(
+        self,
+        functions: dict[str, FunctionInfo],
+        conflict_functions: set[str],
+        previous_conflicts: list[str] = None
+    ) -> HintSet:
+        """Regenerate hints only for functions that had conflicts.
+        
+        Args:
+            functions: Dict of all function name -> FunctionInfo
+            conflict_functions: Set of function names that had conflicts
+            previous_conflicts: List of conflict messages from previous validation
+                              (format: "REMOVED func_name.HintType.name: reason")
+        
+        Returns:
+            HintSet with regenerated hints for conflict functions only
+        """
+        hint_set = HintSet()
+        
+        # Parse conflicts to map function names to their conflict reasons
+        conflict_map = {}
+        if previous_conflicts:
+            for conflict in previous_conflicts:
+                # Parse "REMOVED func_name.HintType.name: reason"
+                if conflict.startswith("REMOVED "):
+                    parts = conflict[8:].split(": ", 1)
+                    if len(parts) == 2:
+                        func_hint = parts[0]
+                        reason = parts[1]
+                        # Extract function name (before the dot)
+                        if "." in func_hint:
+                            func_name = func_hint.split(".")[0]
+                            if func_name not in conflict_map:
+                                conflict_map[func_name] = []
+                            conflict_map[func_name].append(reason)
+
+        # Only process conflict functions
+        for func_name in conflict_functions:
+            if func_name not in functions:
+                continue
+            # Skip main and test functions
+            if func_name in ("main", "_main", "wmain") or "test" in func_name.lower():
+                continue
+            
+            func = functions[func_name]
+            # Get conflicts for this function if any
+            func_conflicts = conflict_map.get(func_name, [])
+            hints = self._generate_for_function(func, functions, func_conflicts)
+            
+            for hint in hints:
+                hint_set.add(hint)
+        
+        return hint_set
+
     def _generate_for_function(
         self,
         func: FunctionInfo,
@@ -324,19 +378,15 @@ class HintGenerator:
         context = "\n\n".join(context_parts) if context_parts else ""
         context_str = f"Context (called functions):\n{context}" if context else ""
         
-        # Add conflict feedback if available
+        # Add Z3 validation feedback if available
         conflict_feedback = ""
         if previous_conflicts:
             conflict_feedback = f"""
-## Previous Validation Feedback
-The following hints were rejected by static analysis validation:
+## Z3 Validation Feedback
+The following hints were rejected by Z3 validation:
 {chr(10).join(f"- {c}" for c in previous_conflicts)}
 
-Please reconsider your analysis. The hints must be consistent with the actual code structure:
-- ALLOCATOR: Function must actually call allocation functions (malloc/calloc/etc) and return the result
-- DEALLOCATOR: Function must actually call deallocation functions (free/delete/etc) on the specified argument
-
-Only suggest hints that you can verify from the code structure.
+Z3 does not think there is a memory leak (or the rejected semantic) here. Please reconsider your analysis.
 """
 
         params = list(zip(func.arg_types, func.arg_names))
