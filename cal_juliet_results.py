@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Script to scan for CWE401 files in a directory and find matching entries in manifest.xml
+Script to scan for CWE files in a directory and find matching entries in manifest.xml
 """
 
 import os
 import sys
 import json
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from collections import defaultdict
@@ -20,39 +21,71 @@ except ImportError:
     print("Warning: tree_sitter_parser not available, falling back to regex-based parsing")
 
 
-def find_cwe401_files(directory):
+def extract_cwe_number(directory):
     """
-    Recursively scan directory for files starting with CWE401 and having extensions .c, .cpp, or .h
+    Extract CWE number from directory path (e.g., "CWE415_Double_Free" -> "CWE415")
     
     Args:
         directory: Path to scan
         
     Returns:
+        CWE number string (e.g., "CWE415") or None if not found
+    """
+    # Try to extract from directory name
+    dir_name = os.path.basename(os.path.normpath(directory))
+    match = re.match(r'(CWE\d+)', dir_name)
+    if match:
+        return match.group(1)
+    
+    # Try to find CWE pattern in any part of the path
+    path_parts = Path(directory).parts
+    for part in reversed(path_parts):
+        match = re.match(r'(CWE\d+)', part)
+        if match:
+            return match.group(1)
+    
+    return None
+
+
+def find_cwe_files(directory, cwe_number):
+    """
+    Recursively scan directory for files starting with the specified CWE number and having extensions .c, .cpp, or .h
+    
+    Args:
+        directory: Path to scan
+        cwe_number: CWE number to search for (e.g., "CWE401", "CWE415")
+        
+    Returns:
         List of file paths
     """
-    cwe401_files = []
+    cwe_files = []
     directory_path = Path(directory)
     
     if not directory_path.exists():
         print(f"Error: Directory {directory} does not exist")
-        return cwe401_files
+        return cwe_files
     
-    # Recursively find all files starting with CWE401
+    if not cwe_number:
+        print(f"Error: CWE number not found in directory path")
+        return cwe_files
+    
+    # Recursively find all files starting with the CWE number
     for ext in ['.c', '.cpp', '.h']:
-        pattern = f'CWE401*{ext}'
+        pattern = f'{cwe_number}*{ext}'
         for file_path in directory_path.rglob(pattern):
-            if file_path.is_file() and file_path.name.startswith('CWE401'):
-                cwe401_files.append(file_path)
+            if file_path.is_file() and file_path.name.startswith(cwe_number):
+                cwe_files.append(file_path)
     
-    return sorted(cwe401_files)
+    return sorted(cwe_files)
 
 
-def parse_manifest(manifest_path):
+def parse_manifest(manifest_path, cwe_number):
     """
-    Parse manifest.xml and extract testcase entries
+    Parse manifest.xml and extract testcase entries for the specified CWE number
     
     Args:
         manifest_path: Path to manifest.xml
+        cwe_number: CWE number to filter for (e.g., "CWE401", "CWE415")
         
     Returns:
         Dictionary mapping filename to list of testcase entries (as XML elements)
@@ -66,6 +99,10 @@ def parse_manifest(manifest_path):
         root = tree.getroot()
     except ET.ParseError as e:
         print(f"Error parsing XML: {e}")
+        return {}, {}
+    
+    if not cwe_number:
+        print(f"Error: CWE number not provided")
         return {}, {}
     
     # Dictionary to store filename -> list of testcase entries
@@ -83,7 +120,7 @@ def parse_manifest(manifest_path):
         
         for file_elem in file_elems:
             file_path_attr = file_elem.get('path')
-            if file_path_attr and file_path_attr.startswith('CWE401'):
+            if file_path_attr and file_path_attr.startswith(cwe_number):
                 filename = os.path.basename(file_path_attr)
                 entry = {
                     'testcase': testcase,
@@ -127,7 +164,6 @@ def find_function_at_line(file_path, target_line):
             pass
     
     # Fallback: simple regex-based approach (less accurate but works without tree-sitter)
-    import re
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             lines = f.readlines()
@@ -392,8 +428,8 @@ def calculate_precision_recall(ground_truth_results, predictions_file):
 def main():
     # Default directory and manifest path
     default_dir = "/home/huihuihuang/Hint/juliet-test-suite-c/testcases/CWE401_Memory_Leak"
+    default_predictions = "/home/huihuihuang/Hint/output/juliet-test-suite-c/CWE401_Memory_Leak/output_codeql_only/memory_safety_bugs.json"
     default_manifest = "/home/huihuihuang/Hint/juliet-test-suite-c/manifest.xml"
-    default_predictions = "/home/huihuihuang/Hint/output/juliet-test-suite-c/CWE401_Memory_Leak/output/memory_safety_bugs.json"
     
     # Get directory from command line or use default
     if len(sys.argv) > 1:
@@ -401,19 +437,23 @@ def main():
     else:
         scan_dir = default_dir
     
-    # Get output file from command line or use default
-    if len(sys.argv) > 2:
-        output_file = sys.argv[2]
-    else:
-        # Default output file name based on directory
-        dir_name = os.path.basename(os.path.normpath(scan_dir))
-        output_file = f"cwe401_results_{dir_name}.json"
-    
     # Get predictions file from command line or use default
     if len(sys.argv) > 3:
         predictions_file = sys.argv[3]
     else:
         predictions_file = default_predictions
+    
+    # Extract directory name and subdirectory for file naming
+    dir_name = os.path.basename(os.path.normpath(scan_dir))
+    predictions_path = Path(predictions_file)
+    subdir_name = predictions_path.parent.name if predictions_path.parent else ""
+    
+    # Get output file from command line or use default
+    if len(sys.argv) > 2:
+        output_file = sys.argv[2]
+    else:
+        # Default output file name for ground truth: {dir_name}_gt.json
+        output_file = f"{dir_name}_gt.json"
     
     # Check if output file exists
     if os.path.exists(output_file):
@@ -431,23 +471,33 @@ def main():
     
     # Calculate results if not loaded from file
     if results is None:
-        # Find all CWE401 files
-        cwe401_files = find_cwe401_files(scan_dir)
+        # Extract CWE number from directory path
+        cwe_number = extract_cwe_number(scan_dir)
+        if not cwe_number:
+            print(f"Error: Could not extract CWE number from directory path: {scan_dir}")
+            print("Please ensure the directory path contains a CWE number (e.g., CWE401, CWE415)")
+            sys.exit(1)
+        
+        print(f"Detected CWE number: {cwe_number}")
+        
+        # Find all CWE files
+        cwe_files = find_cwe_files(scan_dir, cwe_number)
         
         # Parse manifest
-        manifest_entries, testcase_files = parse_manifest(default_manifest)
+        manifest_entries, testcase_files = parse_manifest(default_manifest, cwe_number)
         
-        # Count total unique testcases for CWE401
+        # Count total unique testcases for this CWE
         total_testcases = len(testcase_files)
         
         # Collect results
         results = {
             'scan_directory': scan_dir,
-            'total_files_found': len(cwe401_files),
+            'cwe_number': cwe_number,
+            'total_files_found': len(cwe_files),
             'matched_files': [],
             'unmatched_files': [],
             'summary': {
-                'total_cwe401_files': len(cwe401_files),
+                'total_cwe_files': len(cwe_files),
                 'total_testcases': total_testcases,
                 'matched_with_manifest': 0,
                 'not_found_in_manifest': 0,
@@ -460,7 +510,7 @@ def main():
         processed_testcases = set()
         
         # Match files with manifest entries
-        for file_path in cwe401_files:
+        for file_path in cwe_files:
             filename = file_path.name
             file_path_str = str(file_path)
             
@@ -521,9 +571,11 @@ def main():
     
     if metrics:
         # Create a separate file for evaluation metrics
-        # Use the output file name as base and add "_evaluation_metrics.json"
-        base_name = os.path.splitext(output_file)[0]
-        metrics_file = f"{base_name}_evaluation_metrics.json"
+        # Format: {dir_name}_{subdir_name}_results.json
+        if subdir_name:
+            metrics_file = f"{dir_name}_{subdir_name}_results.json"
+        else:
+            metrics_file = f"{dir_name}_results.json"
         
         # Add metadata to metrics
         metrics_with_meta = {
