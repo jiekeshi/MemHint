@@ -113,6 +113,11 @@ def main():
         action="store_true",
         help="Force recreation of CodeQL database (default: reuse existing database if available)"
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging"
+    )
 
     args = parser.parse_args()
 
@@ -122,7 +127,8 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = output_dir / f"hint_{timestamp}.log"
 
-    setup_logging("INFO", str(log_file))
+    log_level = "DEBUG" if args.debug else "INFO"
+    setup_logging(log_level, str(log_file))
     logger = logging.getLogger(__name__)
 
     # Validate project path
