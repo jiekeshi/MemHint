@@ -343,13 +343,16 @@ class CodeQLAnalyzer:
         self._injected_files.clear()
 
     def _load_project_build_config(self, project_path: Path) -> dict | None:
+        logger.info(f"Loading project build configuration for {project_path}")
         """Load project build configuration from centralized JSON file.
         
-        Looks for ../../proj_build_command.json
+        Looks for proj_build_command.json in the project root directory.
         Structure: { "project_name": { "prepare_for_build": "command", "build_command": "command" } }
         Uses the last directory name from project_path to match the JSON field.
         """
-        config_file = Path("../../proj_build_command.json")
+        # Get path relative to this file's location (src/analyzer/adapters.py -> project root)
+        project_root = Path(__file__).parent.parent.parent
+        config_file = project_root / "proj_build_command.json"
         if not config_file.exists():
             logger.debug(f"Config file not found at {config_file}")
             return None
@@ -471,6 +474,7 @@ class CodeQLAnalyzer:
         # Load project-specific build configuration from centralized file
         config = self._load_project_build_config(project_path)
         if config:
+            logger.info(f"Build config: {config}")
             # Run pre-build commands if specified
             pre_build_cmd = config.get("prepare_for_build", "")
             if pre_build_cmd:
