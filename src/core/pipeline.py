@@ -46,7 +46,7 @@ class Pipeline:
         api_key: str = None,  # Kept for compatibility, not used with Vertex AI
         model: str = "gemini-2.5-pro",
         analyzer_type: str = "codeql",
-        max_iterations: int = 3,
+        max_hint_iterations: int = None,
         issue_types: list[MemoryIssueType] = None,
         use_merge: bool = False,  # Kept for compatibility
         codeql_dir: Path = None,
@@ -59,7 +59,7 @@ class Pipeline:
             api_key: Unused (Vertex AI uses service account)
             model: LLM model name
             analyzer_type: "codeql" or "infer"
-            max_iterations: Max CEGAR iterations (for future refinement)
+            max_hint_iterations: Max CEGAR iterations (for future refinement)
             issue_types: Which bug types to detect (default: all)
             use_merge: Whether to merge code (kept for compatibility)
             codeql_dir: Optional custom CodeQL directory path (default: ~/.codeql)
@@ -75,13 +75,12 @@ class Pipeline:
         self.analyzer = CodeQLAnalyzer(codeql_dir=codeql_dir, cpp_queries_dir=cpp_queries_dir, reuse_db=reuse_db)
 
         # Configuration
-        self.max_iterations = max_iterations
+        self.max_hint_iterations = max_hint_iterations
         self.use_merge = use_merge
         self.issue_types = issue_types or [
             MemoryIssueType.MEMORY_LEAK,
             MemoryIssueType.DOUBLE_FREE,
             MemoryIssueType.USE_AFTER_FREE,
-            MemoryIssueType.ALLOC_DEALLOC_MISMATCH,
         ]
 
         # State
@@ -169,7 +168,6 @@ class Pipeline:
             # =================================================================
             # Phase 2-3: Iterative hint generation and validation
             # =================================================================
-            max_hint_iterations = 5
             iteration = 0
             all_conflicts = []
             
@@ -178,7 +176,7 @@ class Pipeline:
             self.hints = self.hint_generator.generate_hints(self.functions)
             logger.info(f"  {self.hints.summary()}")
             
-            while iteration < max_hint_iterations:
+            while iteration < self.max_hint_iterations:
                 iteration += 1
                 
                 # =================================================================
@@ -202,16 +200,34 @@ class Pipeline:
                     logger.info(f"  After validation: {self.hints.summary()}")
                     
                     # If we have conflicts and haven't reached max iterations, regenerate
-                    if iteration < max_hint_iterations:
-                        logger.info(f"Phase 2: Regenerating hints with conflict feedback (iteration {iteration + 1})...")
-                        # Regenerate hints with conflict feedback
-                        self.hints = self.hint_generator.generate_hints(
+                    if iteration < self.max_hint_iterations:
+                        # Extract function names that had conflicts in THIS iteration only
+                        # (conflicts variable contains only conflicts from current validation)
+                        conflict_functions = set()
+                        for conflict in conflicts:
+                            if conflict.startswith("REMOVED "):
+                                parts = conflict[8:].split(": ", 1)
+                                if len(parts) >= 1:
+                                    func_hint = parts[0]
+                                    # Extract function name (before the dot)
+                                    if "." in func_hint:
+                                        func_name = func_hint.split(".")[0]
+                                        conflict_functions.add(func_name)
+                        
+                        logger.info(f"Phase 2: Regenerating hints for {len(conflict_functions)} conflict function(s) from this iteration (iteration {iteration + 1})...")
+                        # Regenerate hints only for functions that had conflicts in this iteration
+                        new_hints = self.hint_generator.regenerate_hints_for_functions(
                             self.functions,
-                            previous_conflicts=conflicts
+                            conflict_functions,
+                            previous_conflicts=conflicts  # Pass current iteration's conflicts for LLM feedback
                         )
+                        # Merge new hints with existing validated hints
+                        for func_name, func_hints in new_hints.hints.items():
+                            for hint in func_hints:
+                                self.hints.add(hint)
                         logger.info(f"  {self.hints.summary()}")
                     else:
-                        logger.warning(f"  Reached max iterations ({max_hint_iterations}), stopping refinement")
+                        logger.warning(f"  Reached max iterations ({self.max_hint_iterations}), stopping refinement")
                 else:
                     # No conflicts, we're done
                     logger.info(f"  No conflicts found! Hints are consistent.")
@@ -387,6 +403,5 @@ class Pipeline:
             MemoryIssueType.MEMORY_LEAK: "Free allocated memory before function exit",
             MemoryIssueType.DOUBLE_FREE: "Remove duplicate free() or add null guard",
             MemoryIssueType.USE_AFTER_FREE: "Use memory before freeing, not after",
-            MemoryIssueType.ALLOC_DEALLOC_MISMATCH: "Match allocator with correct deallocator (new[]/delete[], new/delete, malloc/free)",
         }
         return fixes.get(warning.issue_type, "Review memory safety issue")
