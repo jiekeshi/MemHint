@@ -54,17 +54,20 @@ Analyze this function and identify its MEMORY SEMANTICS relevant to allocation a
 
 ### 1. ALLOCATOR
 Function returns **newly allocated heap memory** that caller must eventually free.
+IMPORTANT: A function can be an ALLOCATOR even if it returns void.
+Do NOT rely on the function's return type when deciding allocator semantics.
 
 **Positive indicators:**
 - Calls malloc/calloc/realloc/aligned_alloc/new/new[] and returns the result
 - Calls another known allocator (e.g., g_malloc, xmalloc, kmalloc) and returns result
 - Returns result of a wrapper function that allocates
+- Allocates memory and stores it into a local variable, even if that variable is not returned or passed out (still an ALLOCATOR)
+- Calls strdup/wcsdup/_strdup/wmemdup or similar duplication functions that allocate using malloc internally
 
 **Negative indicators (NOT an allocator):**
 - Returns pointer to static/global buffer
 - Returns pointer to struct field or array member
 - Returns one of the input arguments
-- Allocates internally but doesn't return the allocated memory
 - Returns stack-allocated memory (dangling pointer bug, but not allocator semantic)
 
 ### 2. DEALLOCATOR
