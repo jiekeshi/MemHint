@@ -92,7 +92,7 @@ class Pipeline:
         self,
         project_path: Path,
         output_dir: Path = None,
-        single_source: Path | None = None,
+        single_sources: list[Path] | None = None,
     ) -> AnalysisResult:
         """Run the full analysis pipeline.
 
@@ -113,7 +113,7 @@ class Pipeline:
         project_path = Path(project_path).resolve()
         output_dir = output_dir or Path("./output")
         output_dir.mkdir(parents=True, exist_ok=True)
-        single_source = Path(single_source).resolve() if single_source else None
+        single_sources = [Path(p).resolve() for p in single_sources] if single_sources else None
 
         logger.info(f"Analyzing {project_path}")
         logger.info(f"Bug types: {[t.name for t in self.issue_types]}")
@@ -122,23 +122,32 @@ class Pipeline:
         # Phase 1: Parse source code
         # =====================================================================
         logger.info("Phase 1: Parsing source code...")
-        if single_source is not None:
-            logger.info(f"  Single-source mode: parsing only {single_source}")
-            if not single_source.exists():
-                logger.error(f"Single source file not found: {single_source}")
-                return AnalysisResult(
-                    confirmed_bugs=[],
-                    hints=HintSet(),
-                    iterations=0,
-                    spurious_filtered=0,
-                )
+        if single_sources is not None:
+            logger.info(f"  Single-source mode: parsing {len(single_sources)} file(s)")
+            for single_source in single_sources:
+                if not single_source.exists():
+                    logger.error(f"Single source file not found: {single_source}")
+                    return AnalysisResult(
+                        confirmed_bugs=[],
+                        hints=HintSet(),
+                        iterations=0,
+                        spurious_filtered=0,
+                    )
 
-            # Parse just this one file
-            self.functions = self.parser.parse_file(single_source)
-            for info in self.functions.values():
-                # Ensure file_path is set for downstream components
-                if not getattr(info, "file_path", None):
-                    info.file_path = str(single_source)
+            # Parse all specified files and merge results
+            self.functions = {}
+            for single_source in single_sources:
+                logger.info(f"    Parsing {single_source}")
+                file_functions = self.parser.parse_file(single_source)
+                for func_name, info in file_functions.items():
+                    # Ensure file_path is set for downstream components
+                    if not getattr(info, "file_path", None):
+                        info.file_path = str(single_source)
+                    # Handle function name conflicts by prefixing with file name if needed
+                    if func_name in self.functions:
+                        logger.warning(f"    Function {func_name} found in multiple files, keeping first occurrence")
+                    else:
+                        self.functions[func_name] = info
 
             # Best-effort call graph resolution within this subset
             try:
