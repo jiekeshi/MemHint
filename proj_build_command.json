@@ -14,5 +14,21 @@
             "command": "make",
             "can_error": false
         }
+    },
+    "CWE401_Memory_Leak": {
+        "prepare_for_build": [
+            {
+                "command": "cd ../../ && python juliet.py 401 --clean",
+                "can_error": true
+            },
+            {
+                "command": "cd ../../ && python juliet.py 401 --generate",
+                "can_error": false
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
     }
 }
