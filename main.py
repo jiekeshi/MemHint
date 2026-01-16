@@ -95,8 +95,9 @@ def main():
     )
     parser.add_argument(
         "--single-source",
-        help="Optional: path to a single C/C++ source file to feed to the LLM/hint phases "
-             "instead of parsing the entire project (for small tests).",
+        nargs="+",
+        help="Optional: path(s) to one or more C/C++ source files to feed to the LLM/hint phases "
+             "instead of parsing the entire project (for small tests). Can specify multiple files.",
     )
     parser.add_argument(
         "--codeql-dir",
@@ -137,12 +138,13 @@ def main():
         logger.error(f"Project not found: {project_path}")
         sys.exit(1)
 
-    single_source = None
+    single_sources = None
     if args.single_source:
-        single_source = Path(args.single_source)
-        if not single_source.exists():
-            logger.error(f"Single source file not found: {single_source}")
-            sys.exit(1)
+        single_sources = [Path(p) for p in args.single_source]
+        for single_source in single_sources:
+            if not single_source.exists():
+                logger.error(f"Single source file not found: {single_source}")
+                sys.exit(1)
 
     # Parse bug types
     bug_types = parse_bug_types(args.issues)
@@ -162,7 +164,7 @@ def main():
         reuse_db=not args.no_reuse_db,
     )
 
-    result = pipeline.analyze(project_path, output_dir, single_source=single_source)
+    result = pipeline.analyze(project_path, output_dir, single_sources=single_sources)
 
     # Print summary
     print("\n" + "=" * 60)
