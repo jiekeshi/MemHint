@@ -128,15 +128,30 @@ class HintSet:
                     result.append((func_name, h))
         return result
 
-    def get_allocators(self) -> list[str]:
-        """Get all allocator function names."""
-        return [fn for fn, _ in self.get_by_type(HintType.ALLOCATOR)]
+    def get_allocators(self) -> list[tuple[str, int]]:
+        """Get all allocator function names with their output index.
+
+        Returns:
+            List of (function_name, arg_index) where:
+            - arg_index = -1 means return value
+            - arg_index >= 0 means output parameter at that index
+        """
+        result = []
+        for fn, h in self.get_by_type(HintType.ALLOCATOR):
+            arg_idx = h.arg_index if h.arg_index is not None else -1
+            result.append((fn, arg_idx))
+        return result
 
     def get_deallocators(self) -> list[tuple[str, int]]:
-        """Get all deallocator function names with their freed argument index."""
+        """Get all deallocator function names with their freed argument index.
+
+        Returns:
+            List of (function_name, arg_index) where arg_index is the 0-based
+            index of the argument that gets freed.
+        """
         result = []
         for fn, h in self.get_by_type(HintType.DEALLOCATOR):
-            arg_idx = h.arg_index if h.arg_index >= 0 else 0
+            arg_idx = h.arg_index if h.arg_index is not None and h.arg_index >= 0 else 0
             result.append((fn, arg_idx))
         return result
 

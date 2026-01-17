@@ -15,7 +15,7 @@ Supports detection of:
 
 Usage:
     python main.py --project /path/to/code
-    python main.py --project /path/to/code --issues leak double-free 
+    python main.py --project /path/to/code --issues leak double-free
 """
 
 import argparse
@@ -90,10 +90,6 @@ def main():
         help="LLM model (default: gemini-2.5-pro)"
     )
     parser.add_argument(
-        "--max-hint-iterations", type=int, default=2,
-        help="Max CEGAR iterations (default: 3)"
-    )
-    parser.add_argument(
         "--single-source",
         nargs="+",
         help="Optional: path(s) to one or more C/C++ source files to feed to the LLM/hint phases "
@@ -157,7 +153,6 @@ def main():
     pipeline = Pipeline(
         model=args.model,
         analyzer_type=args.analyzer,
-        max_hint_iterations=args.max_hint_iterations,
         issue_types=bug_types,
         codeql_dir=args.codeql_dir,
         cpp_queries_dir=args.cpp_queries_dir,

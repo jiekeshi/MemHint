@@ -215,3 +215,4 @@ codeql/
 huihui-472807-b8069b88637c.json
 bugscpp/
 keyfile.json
+*.codeql*

@@ -44,10 +44,10 @@ Analyze this function and identify its MEMORY SEMANTICS relevant to allocation a
 **Function:** `{func_name}`
 **Return type:** `{return_type}`
 **Parameters:** `{parameters}`
+
 ```c
 {code}
 ```
-
 {context}
 
 ## Semantic Categories
@@ -66,6 +66,8 @@ Function returns **newly allocated heap memory** that caller must eventually fre
 - Returns one of the input arguments
 - Allocates internally but doesn't return the allocated memory
 - Returns stack-allocated memory (dangling pointer bug, but not allocator semantic)
+
+**Specify:** Use "return" if allocated memory is returned, or "argN" if allocated memory is written to an output parameter (e.g., `int alloc(void **out)` writes to arg0).
 
 ### 2. DEALLOCATOR
 Function **frees/releases memory** passed as an argument.
@@ -90,13 +92,14 @@ Function **frees/releases memory** passed as an argument.
 Return a JSON object with hints array. Each hint must have:
 - `type`: One of ALLOCATOR, DEALLOCATOR
 - `target`: "return" for return value, or "argN" for argument N
-- `arg_index`: (required for DEALLOCATOR) 0-based argument index
+- `arg_index`: 0-based index (-1 for return value, 0+ for arguments)
 - `reason`: Brief evidence from the code (cite specific lines/calls)
 ```json
 {{
     "hints": [
-        {{"type": "ALLOCATOR", "target": "return", "reason": "line 5: returns malloc(size) result"}},
-        {{"type": "DEALLOCATOR", "target": "arg0", "arg_index": 0, "reason": "line 8: calls free(ptr)"}}
+{{"type": "ALLOCATOR", "target": "return", "arg_index": -1, "reason": "line 5: returns malloc(size) result"}},
+{{"type": "ALLOCATOR", "target": "arg0", "arg_index": 0, "reason": "line 6: writes calloc() result to *out parameter"}},
+{{"type": "DEALLOCATOR", "target": "arg0", "arg_index": 0, "reason": "line 8: calls free(ptr)"}}
     ]
 }}
 ```
@@ -240,7 +243,7 @@ class HintGenerator:
             HintSet with all generated hints
         """
         hint_set = HintSet()
-        
+
         # Parse conflicts to map function names to their conflict reasons
         conflict_map = {}
         if previous_conflicts:
@@ -279,18 +282,18 @@ class HintGenerator:
         previous_conflicts: list[str] = None
     ) -> HintSet:
         """Regenerate hints only for functions that had conflicts.
-        
+
         Args:
             functions: Dict of all function name -> FunctionInfo
             conflict_functions: Set of function names that had conflicts
             previous_conflicts: List of conflict messages from previous validation
                               (format: "REMOVED func_name.HintType.name: reason")
-        
+
         Returns:
             HintSet with regenerated hints for conflict functions only
         """
         hint_set = HintSet()
-        
+
         # Parse conflicts to map function names to their conflict reasons
         conflict_map = {}
         if previous_conflicts:
@@ -315,15 +318,15 @@ class HintGenerator:
             # Skip main and test functions
             if func_name in ("main", "_main", "wmain") or "test" in func_name.lower():
                 continue
-            
+
             func = functions[func_name]
             # Get conflicts for this function if any
             func_conflicts = conflict_map.get(func_name, [])
             hints = self._generate_for_function(func, functions, func_conflicts)
-            
+
             for hint in hints:
                 hint_set.add(hint)
-        
+
         return hint_set
 
     def _generate_for_function(
@@ -333,7 +336,7 @@ class HintGenerator:
         previous_conflicts: list[str] = None,
     ) -> list[Hint]:
         """Generate hints for a single function.
-        
+
         Args:
             func: Function to analyze
             all_functions: All functions in codebase
@@ -360,7 +363,7 @@ class HintGenerator:
         previous_conflicts: list[str] = None,
     ) -> list[Hint]:
         """Generate hints using LLM.
-        
+
         Args:
             func: Function to analyze
             all_functions: All functions in codebase
@@ -377,18 +380,21 @@ class HintGenerator:
 
         context = "\n\n".join(context_parts) if context_parts else ""
         context_str = f"Context (called functions):\n{context}" if context else ""
-        
+
         # Add Z3 validation feedback if available
         conflict_feedback = ""
         if previous_conflicts:
             conflict_feedback = f"""
 ## Z3 Validation Feedback
-The following hints were rejected by Z3 validation:
+
+The following hints were **rejected** by Z3's constraint solving and path feasibility analysis:
+
 {chr(10).join(f"- {c}" for c in previous_conflicts)}
 
-Z3 does not think there is a memory leak (or the rejected semantic) here. Please reconsider your analysis.
+The rejected hints are inconsistent with the code structure. Please:
+1. Re-examine if the memory operation actually occurs in this function
+2. Only re-submit hints you are confident are correct
 """
-
         params = list(zip(func.arg_types, func.arg_names))
         params_str = ", ".join(f"{t} {n}" for t, n in params) if params else "void"
 
