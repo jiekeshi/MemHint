@@ -62,5 +62,49 @@
             "command": "make",
             "can_error": false
         }
+    },
+    "redis": {
+        "prepare_for_build": [
+            {
+                "command": "make clean",
+                "can_error": true
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
+    },
+    "htop":{
+        "prepare_for_build": [
+            {
+                "command": "./autogen.sh",
+                "can_error": false
+            },
+            {
+                "command": "./configure",
+                "can_error": false
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
+    },
+    "tmux": {
+        "prepare_for_build": [
+            {
+                "command": "./autogen.sh",
+                "can_error": false
+            },
+            {
+                "command": "./configure",
+                "can_error": false
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
     }
 }
