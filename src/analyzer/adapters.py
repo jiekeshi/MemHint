@@ -104,7 +104,7 @@ class CodeQLAnalyzer:
         logger.info(f"Checking if database at {db_path} is valid...")
         """Check if a CodeQL database exists and is valid C++ database."""
         if not db_path.exists():
-            logger.error(f"Database not found at {db_path}")
+            logger.warning(f"Database not found at {db_path}")
             return False
         
         # Check if it's a valid CodeQL database by checking for database metadata
@@ -268,7 +268,7 @@ class CodeQLAnalyzer:
 
         for func_name in alloc_funcs:
             # ["", "", false, "func_name", "", "", "", true]
-            lines.append(f'      - ["", "", false, "{func_name}", "", "", "", true]')
+            lines.append(f'      - ["", "", False, "{func_name}", "", "", "", True]')
 
         yaml_content = "\n".join(lines) + "\n"
 
@@ -295,7 +295,7 @@ class CodeQLAnalyzer:
 
         for func_name, arg_idx in free_funcs:
             freed_arg = f"Argument[{arg_idx}]"
-            lines.append(f'      - ["", "", false, "{func_name}", "{freed_arg}"]')
+            lines.append(f'      - ["", "", False, "{func_name}", "{freed_arg}"]')
 
         yaml_content = "\n".join(lines) + "\n"
 
