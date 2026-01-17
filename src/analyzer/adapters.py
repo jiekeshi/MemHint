@@ -560,7 +560,7 @@ class CodeQLAnalyzer:
 
             query_files.append(enhanced_path)
             cleanup_files.append(enhanced_path)
-            logger.info(f"  Written: {enhanced_path.name}")
+            logger.info(f"  Written: {enhanced_path}")
 
         return query_files, cleanup_files
 
