@@ -613,7 +613,7 @@ class CodeQLAnalyzer:
         result = subprocess.run(cmd, timeout=self.timeout, capture_output=True)
 
         if result.returncode != 0:
-            logger.warning(f"CodeQL stderr: {result.stderr.decode()[:500]}")
+            logger.warning(f"CodeQL stderr: {result.stderr.decode()}")
 
         return results_path.exists()
 
