@@ -216,3 +216,15 @@ huihui-472807-b8069b88637c.json
 bugscpp/
 keyfile.json
 *.codeql*
+defects4c/
+cve_memory_analysis_deduped.json
+cve_memory_analysis.json
+extract_buggy_function.py
+extract_cve_case_defect4c.py
+memory_cve_bugs.json
+leak_guard_tool-master/
+results/
+goshwk/
+juliet-test-suite-c/
+defect4c_clone_proj/
+cloned_proj/
