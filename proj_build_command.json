@@ -91,7 +91,7 @@
             "can_error": false
         }
     },
-    "tmux": {
+    "tmux_pr3937": {
         "prepare_for_build": [
             {
                 "command": "./autogen.sh",
