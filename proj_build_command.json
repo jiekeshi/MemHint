@@ -78,6 +78,10 @@
     "htop":{
         "prepare_for_build": [
             {
+                "command": "make clean",
+                "can_error": true
+            },
+            {
                 "command": "./autogen.sh",
                 "can_error": false
             },
@@ -91,15 +95,111 @@
             "can_error": false
         }
     },
-    "tmux_pr3937": {
+    "tmux_pr3941_before": {
         "prepare_for_build": [
             {
-                "command": "./autogen.sh",
+                "command": "make clean",
+                "can_error": true
+            },
+            {
+                "command": "sh autogen.sh",
                 "can_error": false
             },
             {
                 "command": "./configure",
                 "can_error": false
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
+    },
+    "tmux_pr3972_before": {
+        "prepare_for_build": [
+            {
+                "command": "make clean",
+                "can_error": true
+            },
+            {
+                "command": "sh autogen.sh",
+                "can_error": false
+            },
+            {
+                "command": "./configure",
+                "can_error": false
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
+    },
+    "tmux_20240420": {
+        "prepare_for_build": [
+            {
+                "command": "make clean",
+                "can_error": true
+            },
+            {
+                "command": "sh autogen.sh",
+                "can_error": false
+            },
+            {
+                "command": "./configure",
+                "can_error": false
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
+    },
+    "tmux_20241213": {
+        "prepare_for_build": [
+            {
+                "command": "make clean",
+                "can_error": true
+            },
+            {
+                "command": "sh autogen.sh",
+                "can_error": false
+            },
+            {
+                "command": "./configure",
+                "can_error": false
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
+    },
+    "tmux_20250303": {
+        "prepare_for_build": [
+            {
+                "command": "make clean",
+                "can_error": true
+            },
+            {
+                "command": "sh autogen.sh",
+                "can_error": false
+            },
+            {
+                "command": "./configure",
+                "can_error": false
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
+    },
+    "zstd_pr4115_before": {
+        "prepare_for_build": [
+            {
+                "command": "make clean",
+                "can_error": true
             }
         ],
         "build_command": {
