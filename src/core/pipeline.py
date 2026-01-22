@@ -51,6 +51,8 @@ class Pipeline:
         codeql_dir: Path = None,
         cpp_queries_dir: Path = None,
         reuse_db: bool = True,
+        skip_hint_injection: bool = False,
+        use_enhanced_queries: bool = True,
     ):
         """Initialize pipeline.
 
@@ -74,6 +76,8 @@ class Pipeline:
 
         # Configuration
         self.use_merge = use_merge
+        self.skip_hint_injection = skip_hint_injection
+        self.use_enhanced_queries = use_enhanced_queries
         self.issue_types = issue_types or [
             MemoryIssueType.MEMORY_LEAK,
             MemoryIssueType.DOUBLE_FREE,
@@ -155,6 +159,10 @@ class Pipeline:
         else:
             self.functions = self.parser.parse_project(project_path)
         logger.info(f"  Found {len(self.functions)} functions")
+        # Log which files/functions will be scanned
+        for func_name, func_info in self.functions.items():
+            file_hint = getattr(func_info, "file_path", "unknown")
+            logger.debug(f"    Scan target function: {func_name} (file: {file_hint})")
 
         if not self.functions:
             logger.warning("No functions found")
@@ -165,69 +173,73 @@ class Pipeline:
                 spurious_filtered=0,
             )
 
-        # Check for cached hints
-        hints_file = output_dir / "hints.json"
-        if hints_file.exists():
-            logger.info(f"  Loading cached hints from {hints_file}")
-            self.hints = self._load_hints(hints_file)
+        if self.skip_hint_injection:
+            logger.info("Hint injection disabled: skipping hint generation/validation (phases 2-3).")
+            self.hints = HintSet()
         else:
-            # =================================================================
-            # Phase 2-3: hint generation and validation
-            # =================================================================
-
-            all_conflicts = []
-
-            # Initial hint generation
-            logger.info("Phase 2: Generating hints with LLM...")
-            self.hints = self.hint_generator.generate_hints(self.functions)
-            logger.info(f"  {self.hints.summary()}")
-
-            # =================================================================
-            # Phase 3: Z3 validates hints
-            # =================================================================
-            logger.info(f"Phase 3: Validating hints with Z3...")
-            self.hints, conflicts = self.hint_validator.validate_hints(
-                self.hints, self.functions
-            )
-            for conflict in conflicts:
-                all_conflicts.append(conflict)
-
-            if conflicts:
-                logger.info(f" Z3 suggested to remove {len(conflicts)} hints:")
-                for c in conflicts:
-                    logger.info(f"    - {c}")
-
-                conflict_functions = set()
-                for conflict in conflicts:
-                    if conflict.startswith("REMOVED "):
-                        parts = conflict[8:].split(": ", 1)
-                        if len(parts) >= 1:
-                            func_hint = parts[0]
-                            if "." in func_hint:
-                                func_name = func_hint.split(".")[0]
-                                conflict_functions.add(func_name)
-
-                logger.info(f"Phase 2: Regenerating hints for {len(conflict_functions)} conflict function(s) ...")
-                # Regenerate hints only for functions that had conflicts in this iteration
-                new_hints = self.hint_generator.regenerate_hints_for_functions(
-                    self.functions,
-                    conflict_functions,
-                    previous_conflicts=conflicts  # Pass current iteration's conflicts for LLM feedback
-                )
-                # Merge new hints with existing validated hints
-                for func_name, func_hints in new_hints.hints.items():
-                    for hint in func_hints:
-                        self.hints.add(hint)
-                logger.info(f"  After validation: {self.hints.summary()}")
+            # Check for cached hints
+            hints_file = output_dir / "hints.json"
+            if hints_file.exists():
+                logger.info(f"  Loading cached hints from {hints_file}")
+                self.hints = self._load_hints(hints_file)
             else:
-                # No conflicts, we're done
-                logger.info(f"  No conflicts found! Hints are consistent.")
-                logger.info(f"  Final hints: {self.hints.summary()}")
+                # =================================================================
+                # Phase 2-3: hint generation and validation
+                # =================================================================
 
-            self.conflicts.extend(all_conflicts)
+                all_conflicts = []
 
-            # Save validated hints
-            self._save_hints(hints_file)
+                # Initial hint generation
+                logger.info("Phase 2: Generating hints with LLM...")
+                self.hints = self.hint_generator.generate_hints(self.functions)
+                logger.info(f"  {self.hints.summary()}")
+
+                # =================================================================
+                # Phase 3: Z3 validates hints
+                # =================================================================
+                logger.info(f"Phase 3: Validating hints with Z3...")
+                self.hints, conflicts = self.hint_validator.validate_hints(
+                    self.hints, self.functions
+                )
+                for conflict in conflicts:
+                    all_conflicts.append(conflict)
+
+                if conflicts:
+                    logger.info(f" Z3 suggested to remove {len(conflicts)} hints:")
+                    for c in conflicts:
+                        logger.info(f"    - {c}")
+
+                    conflict_functions = set()
+                    for conflict in conflicts:
+                        if conflict.startswith("REMOVED "):
+                            parts = conflict[8:].split(": ", 1)
+                            if len(parts) >= 1:
+                                func_hint = parts[0]
+                                if "." in func_hint:
+                                    func_name = func_hint.split(".")[0]
+                                    conflict_functions.add(func_name)
+
+                    logger.info(f"Phase 2: Regenerating hints for {len(conflict_functions)} conflict function(s) ...")
+                    # Regenerate hints only for functions that had conflicts in this iteration
+                    new_hints = self.hint_generator.regenerate_hints_for_functions(
+                        self.functions,
+                        conflict_functions,
+                        previous_conflicts=conflicts  # Pass current iteration's conflicts for LLM feedback
+                    )
+                    # Merge new hints with existing validated hints
+                    for func_name, func_hints in new_hints.hints.items():
+                        for hint in func_hints:
+                            self.hints.add(hint)
+                    logger.info(f"  After validation: {self.hints.summary()}")
+                else:
+                    # No conflicts, we're done
+                    logger.info(f"  No conflicts found! Hints are consistent.")
+                    logger.info(f"  Final hints: {self.hints.summary()}")
+
+                self.conflicts.extend(all_conflicts)
+
+                # Save validated hints
+                self._save_hints(hints_file)
 
         # =====================================================================
         # Phase 4: CodeQL analysis with hints
@@ -239,6 +251,7 @@ class Pipeline:
             project_path,
             self.hints,
             self.issue_types,
+            use_enhanced_queries=self.use_enhanced_queries,
         )
         logger.info(f"  CodeQL found {len(warnings)} warnings")
 

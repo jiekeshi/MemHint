@@ -115,6 +115,16 @@ def main():
         action="store_true",
         help="Enable debug logging"
     )
+    parser.add_argument(
+        "--skip-hints",
+        action="store_true",
+        help="Skip LLM hint generation/validation and run CodeQL without hint injection"
+    )
+    parser.add_argument(
+        "--no-enhanced-queries",
+        action="store_true",
+        help="Disable enhanced (hardcoded) CodeQL queries and use standard CodeQL queries instead",
+    )
 
     args = parser.parse_args()
 
@@ -157,6 +167,8 @@ def main():
         codeql_dir=args.codeql_dir,
         cpp_queries_dir=args.cpp_queries_dir,
         reuse_db=not args.no_reuse_db,
+        skip_hint_injection=args.skip_hints,
+        use_enhanced_queries=not args.no_enhanced_queries,
     )
 
     result = pipeline.analyze(project_path, output_dir, single_sources=single_sources)

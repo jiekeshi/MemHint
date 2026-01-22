@@ -481,7 +481,8 @@ class CodeQLAnalyzer:
         Args:
             project_path: Project to analyze
             hints: Allocator/deallocator hints
-            use_enhanced_queries: Whether to use enhanced queries instead of standard ones
+            issue_types: Which issue types to map/return (currently parsed from SARIF ruleId)
+            use_enhanced_queries: If True, write and run hardcoded enhanced queries; otherwise run standard CodeQL queries
         """
         output_dir = Path(tempfile.mkdtemp())
         results_path = output_dir / "results.sarif"
@@ -628,18 +629,25 @@ class CodeQLAnalyzer:
         db_path = self._get_db_path(project_path)
 
         if not self.reuse_db and db_path.exists():
+            logger.debug(f"Removing existing CodeQL database (reuse_db=False): {db_path}")
             shutil.rmtree(db_path, ignore_errors=True)
 
         if self.reuse_db and self._is_valid_database(db_path):
+            logger.debug(f"Reusing existing CodeQL database: {db_path}")
             if self._finalize_database(db_path):
                 return db_path
+            logger.debug(f"Existing database invalid or could not be finalized, recreating: {db_path}")
             shutil.rmtree(db_path, ignore_errors=True)
 
         if db_path.exists():
+            logger.debug(f"Cleaning up old CodeQL database before recreation: {db_path}")
             shutil.rmtree(db_path, ignore_errors=True)
 
+        logger.debug(f"Creating new CodeQL database at: {db_path}")
         if self._create_database(project_path, db_path):
+            logger.debug(f"Successfully created CodeQL database: {db_path}")
             return db_path
+        logger.error(f"Failed to create CodeQL database at: {db_path}")
         return None
 
     def _is_valid_database(self, db_path: Path) -> bool:
@@ -676,10 +684,12 @@ class CodeQLAnalyzer:
         if config:
             pre_build = config.get("prepare_for_build")
             if pre_build:
+                logger.info(f"Running pre-build commands for {project_path}")
                 self._run_commands(project_path, pre_build)
 
         compile_commands = project_path / "compile_commands.json"
         if compile_commands.exists():
+            logger.info(f"Using compile_commands.json for database creation: {compile_commands}")
             cmd = [
                 self.binary, "database", "create", str(db_path),
                 f"--source-root={project_path}",
@@ -697,6 +707,7 @@ class CodeQLAnalyzer:
                 logger.error("Could not determine build command")
                 return False
 
+            logger.info(f"Using build command for CodeQL database creation: {build_cmd}")
             cmd = [
                 self.binary, "database", "create", str(db_path),
                 f"--source-root={project_path}",
@@ -704,6 +715,7 @@ class CodeQLAnalyzer:
                 "--command", build_cmd
             ]
 
+        logger.info(f"Running CodeQL database create: {' '.join(cmd)}")
         result = subprocess.run(cmd, timeout=self.timeout, capture_output=True, cwd=str(project_path))
         if result.returncode != 0:
             logger.error(f"Database creation failed: {result.stderr.decode()[:500]}")
