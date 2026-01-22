@@ -206,5 +206,61 @@
             "command": "make",
             "can_error": false
         }
+    },
+    "swoole_issue5416": {
+        "prepare_for_build": [
+            {
+                "command": "make clean",
+                "can_error": true
+            },
+            {
+                "command": "phpize",
+                "can_error": false
+            },
+            {
+                "command": "./configure",
+                "can_error": false
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
+    },
+    "vim_pr14241_before": {
+        "prepare_for_build": [
+            {
+                "command": "make clean",
+                "can_error": true
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
+    },
+    "vim_pr14260_before": {
+        "prepare_for_build": [
+            {
+                "command": "make clean",
+                "can_error": true
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
+    },
+    "vim_915f3_before": {
+        "prepare_for_build": [
+            {
+                "command": "make clean",
+                "can_error": true
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
     }
 }
