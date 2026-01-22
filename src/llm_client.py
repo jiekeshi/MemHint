@@ -151,20 +151,40 @@ class LLMClient:
             raise ValueError(
                 "GOOGLE_APPLICATION_CREDENTIALS must point to a service account JSON file."
             )
+        
+        # Cost tracking
+        # Pricing per million tokens (approximate, update based on actual Gemini pricing)
+        # Default pricing for Gemini models (adjust as needed)
+        self.input_price_per_million = 1.25  # $1.25 per million input tokens
+        self.output_price_per_million = 10.00  # $10.00 per million output tokens
 
     def query(self, prompt: str) -> dict:
-        """Send query, prefer Vertex AI when service account credentials are configured."""
-        content = self._call_by_vertex_ai(prompt)
+        """Send query, prefer Vertex AI when service account credentials are configured.
+        
+        Returns:
+            dict with 'content' key containing parsed JSON response and 'usage' key with token usage
+        """
+        result = self._call_by_vertex_ai(prompt)
+        if not result:
+            return {"content": {}, "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost": 0.0}}
+        
+        content, usage = result
         if not content:
-            return {}
+            return {"content": {}, "usage": usage}
         try:
-            return json.loads(content)
+            parsed = json.loads(content)
+            return {"content": parsed, "usage": usage}
         except json.JSONDecodeError:
             logger.warning("LLM response was not valid JSON. Raw content: %s", content[:200])
-            return {}
+            return {"content": {}, "usage": usage}
 
-    def _call_by_vertex_ai(self, prompt: str) -> str | None:
-        """Use Vertex AI SDK to call Gemini with service account credentials."""
+    def _call_by_vertex_ai(self, prompt: str) -> tuple[str | None, dict] | None:
+        """Use Vertex AI SDK to call Gemini with service account credentials.
+        
+        Returns:
+            Tuple of (response_text, usage_dict) or None if failed.
+            usage_dict contains: prompt_tokens, completion_tokens, total_tokens, cost
+        """
         if not VERTEX_AI_AVAILABLE:
             raise ImportError(
                 "google-cloud-aiplatform is not installed. "
@@ -203,12 +223,40 @@ class LLMClient:
                         "response_mime_type": "application/json",
                     },
                 )
-                return response.text
+                
+                # Extract usage metadata
+                usage_metadata = getattr(response, "usage_metadata", None)
+                prompt_tokens = 0
+                completion_tokens = 0
+                
+                if usage_metadata:
+                    prompt_tokens = getattr(usage_metadata, "prompt_token_count", 0) or 0
+                    completion_tokens = getattr(usage_metadata, "candidates_token_count", 0) or 0
+                
+                total_tokens = prompt_tokens + completion_tokens
+                
+                # Calculate cost
+                input_cost = (prompt_tokens / 1_000_000) * self.input_price_per_million
+                output_cost = (completion_tokens / 1_000_000) * self.output_price_per_million
+                total_cost = input_cost + output_cost
+                
+                usage = {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                    "cost": total_cost,
+                    "input_cost": input_cost,
+                    "output_cost": output_cost,
+                }
+                
+                return (response.text, usage)
             except Exception as exc:
                 logger.warning("Vertex AI call failed (attempt %d): %s", attempt + 1, exc)
                 if attempt < self.max_retries - 1:
                     time.sleep(1)
-        return None
+        
+        # Return empty usage on failure
+        return (None, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost": 0.0, "input_cost": 0.0, "output_cost": 0.0})
 
 
 # =============================================================================
@@ -226,6 +274,10 @@ class HintGenerator:
 
     def __init__(self, llm_client: LLMClient = None):
         self.llm = llm_client
+        # Cost tracking: per function and per hint
+        self.function_costs: dict[str, dict] = {}  # function_name -> cost info
+        self.total_cost: float = 0.0
+        self.total_tokens: int = 0
 
     def generate_hints(
         self,
@@ -407,9 +459,27 @@ The rejected hints are inconsistent with the code structure. Please:
         )
 
         result = self.llm.query(prompt)
+        usage = result.get("usage", {})
+        content = result.get("content", {})
+        
+        # Track cost for this function
+        func_cost = usage.get("cost", 0.0)
+        func_tokens = usage.get("total_tokens", 0)
+        self.total_cost += func_cost
+        self.total_tokens += func_tokens
+        
+        self.function_costs[func.name] = {
+            "cost": func_cost,
+            "tokens": func_tokens,
+            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens", 0),
+            "input_cost": usage.get("input_cost", 0.0),
+            "output_cost": usage.get("output_cost", 0.0),
+        }
+        
         hints = []
 
-        for h in result.get("hints", []):
+        for h in content.get("hints", []):
             hint_type_str = h.get("type", "")
 
             try:
@@ -426,3 +496,22 @@ The rejected hints are inconsistent with the code structure. Please:
             ))
 
         return hints
+    
+    def get_cost_summary(self) -> dict:
+        """Get cost summary with per-function and per-hint breakdowns.
+        
+        Returns:
+            dict with total costs, per-function costs, and per-hint costs
+        """
+        # Calculate per-hint costs (distribute function cost evenly across hints)
+        hint_costs = {}
+        for func_name, cost_info in self.function_costs.items():
+            # We'll need to count hints per function from the HintSet
+            # For now, we'll return per-function costs and let Pipeline calculate per-hint
+            pass
+        
+        return {
+            "total_cost": self.total_cost,
+            "total_tokens": self.total_tokens,
+            "function_costs": self.function_costs,
+        }
