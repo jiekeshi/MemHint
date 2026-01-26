@@ -287,7 +287,7 @@ class HintGenerator:
         """Generate hints for all functions in codebase.
 
         Args:
-            functions: Dict of function name -> FunctionInfo
+            functions: Dict of function name -> FunctionInfo (includes converted macros)
             previous_conflicts: List of conflict messages from previous validation
                               (format: "REMOVED func_name.HintType.name: reason")
 
@@ -313,7 +313,7 @@ class HintGenerator:
                                 conflict_map[func_name] = []
                             conflict_map[func_name].append(reason)
 
-        for func_name, func in tqdm(functions.items()):
+        for func_name, func in tqdm(functions.items(), desc="Generating hints"):
             # Skip main and test functions
             if func_name in ("main", "_main", "wmain") or "test" in func_name.lower():
                 continue

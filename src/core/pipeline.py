@@ -86,6 +86,7 @@ class Pipeline:
 
         # State
         self.functions: dict[str, FunctionInfo] = {}
+        self.macro_names: set[str] = set()  # Track which function names are from macros
         self.hints = HintSet()
         self.conflicts: list[str] = []
         self.validated_hints_count: int = 0  # Track number of hints that passed Z3 validation
@@ -138,9 +139,10 @@ class Pipeline:
 
             # Parse all specified files and merge results
             self.functions = {}
+            self.macro_names = set()
             for single_source in single_sources:
                 logger.info(f"    Parsing {single_source}")
-                file_functions = self.parser.parse_file(single_source)
+                file_functions, file_macros = self.parser.parse_file_with_macros(single_source, preprocess=False)
                 for func_name, info in file_functions.items():
                     # Ensure file_path is set for downstream components
                     if not getattr(info, "file_path", None):
@@ -150,6 +152,32 @@ class Pipeline:
                         logger.warning(f"    Function {func_name} found in multiple files, keeping first occurrence")
                     else:
                         self.functions[func_name] = info
+                # Convert function-like macros to FunctionInfo and add to functions
+                for macro_name, macro_info in file_macros.items():
+                    if macro_info.is_function_like:
+                        # Include expansion in code so LLM can see what the macro expands to
+                        macro_code = macro_info.code
+                        if macro_info.expansion:
+                            macro_code += f"\n// Expands to: {macro_info.expansion}"
+                        
+                        func_info = FunctionInfo(
+                            name=macro_name,
+                            code=macro_code,
+                            file_path=macro_info.file_path or str(single_source),
+                            start_line=macro_info.start_line,
+                            end_line=macro_info.end_line,
+                            arg_names=macro_info.arg_names,
+                            arg_types=[""] * len(macro_info.arg_names),
+                            return_type="",
+                            callees=set(),
+                            callers=set(),
+                            return_expressions={macro_info.expansion} if macro_info.expansion else set(),
+                        )
+                        if macro_name not in self.functions:
+                            self.functions[macro_name] = func_info
+                            self.macro_names.add(macro_name)
+                        else:
+                            logger.warning(f"    Macro/Function {macro_name} found in multiple files, keeping first occurrence")
 
             # Best-effort call graph resolution within this subset
             try:
@@ -159,11 +187,22 @@ class Pipeline:
                 logger.warning(f"  Warning: could not resolve calls in single-source mode: {e}")
         else:
             self.functions = self.parser.parse_project(project_path)
-        logger.info(f"  Found {len(self.functions)} functions")
+            self.macro_names = set()  # Full project mode doesn't extract macros yet
+        
+        # Count functions vs macros
+        num_functions = len(self.functions) - len(self.macro_names)
+        num_macros = len(self.macro_names)
+        if num_macros > 0:
+            logger.info(f"  Found {num_functions} functions and {num_macros} macros (total: {len(self.functions)})")
+        else:
+            logger.info(f"  Found {num_functions} functions")
         # Log which files/functions will be scanned
         for func_name, func_info in self.functions.items():
             file_hint = getattr(func_info, "file_path", "unknown")
-            logger.debug(f"    Scan target function: {func_name} (file: {file_hint})")
+            if func_name in self.macro_names:
+                logger.debug(f"    Scan target macro: {func_name} (file: {file_hint})")
+            else:
+                logger.debug(f"    Scan target function: {func_name} (file: {file_hint})")
 
         if not self.functions:
             logger.warning("No functions found")

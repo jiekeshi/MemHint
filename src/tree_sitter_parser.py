@@ -7,6 +7,8 @@ Key design: Extract raw text from AST nodes instead of reconstructing types.
 """
 
 import logging
+import subprocess
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -52,18 +54,99 @@ class FunctionInfo:
     return_expressions: set[str] = field(default_factory=set)
 
 
+@dataclass
+class MacroInfo:
+    """Macro definition information extracted from source code."""
+    name: str
+    code: str
+    file_path: str = ""
+    start_line: int = 0
+    end_line: int = 0
+    arg_names: list[str] = field(default_factory=list)
+    expansion: str = ""  # The expansion text (right side of #define)
+    is_function_like: bool = False  # True if macro has parameters like MACRO(x, y)
+
+
 class CodeParser:
     """Extract functions from C/C++ source using tree-sitter."""
 
     def __init__(self):
         pass
 
-    def parse_file(self, file_path: Path) -> dict[str, FunctionInfo]:
-        """Parse a single file and extract all functions."""
+    def _preprocess_file(self, file_path: Path) -> bytes:
+        """Preprocess a file to expand macros.
+        
+        Uses gcc or clang to preprocess the file. Tries clang first, then gcc.
+        
+        Args:
+            file_path: Path to the source file
+            
+        Returns:
+            Preprocessed source code as bytes
+            
+        Raises:
+            RuntimeError: If preprocessing fails or no compiler is found
+        """
+        # Determine if it's C++ based on extension
+        cpp_extensions = {".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".C", ".CPP"}
+        is_cpp = file_path.suffix in cpp_extensions
+        
+        # Try to find a compiler
+        compiler = None
+        for cmd in ["clang", "gcc"]:
+            if shutil.which(cmd):
+                compiler = cmd
+                break
+        
+        if not compiler:
+            raise RuntimeError("No C/C++ compiler found (clang or gcc required for preprocessing)")
+        
+        # Build compiler command
+        cmd = [compiler, "-E"]
+        if is_cpp:
+            cmd.append("-x")
+            cmd.append("c++")
+        else:
+            cmd.append("-x")
+            cmd.append("c")
+        
+        # Add standard includes if needed (optional, helps with system headers)
+        # cmd.extend(["-I", "/usr/include", "-I", "/usr/local/include"])
+        
+        cmd.append(str(file_path))
+        
         try:
-            source = file_path.read_bytes()
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=False,
+                timeout=30,  # 30 second timeout
+            )
+            
+            if result.returncode != 0:
+                error_msg = result.stderr.decode('utf-8', errors='ignore')
+                raise RuntimeError(f"Preprocessing failed: {error_msg}")
+            
+            return result.stdout
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Preprocessing timed out for {file_path}")
         except Exception as e:
-            logger.warning(f"Cannot read {file_path}: {e}")
+            raise RuntimeError(f"Preprocessing error: {e}")
+
+    def parse_file(self, file_path: Path, preprocess: bool = False) -> dict[str, FunctionInfo]:
+        """Parse a single file and extract all functions.
+        
+        Args:
+            file_path: Path to the source file
+            preprocess: If True, preprocess the file first to expand macros
+        """
+        try:
+            if preprocess:
+                source = self._preprocess_file(file_path)
+            else:
+                source = file_path.read_bytes()
+        except Exception as e:
+            logger.warning(f"Cannot read/preprocess {file_path}: {e}")
             return {}
 
         # Select parser based on extension
@@ -95,6 +178,55 @@ class CodeParser:
 
         return functions
 
+    def parse_file_with_macros(self, file_path: Path, preprocess: bool = False) -> tuple[dict[str, FunctionInfo], dict[str, MacroInfo]]:
+        """Parse a single file and extract both functions and macros.
+        
+        Args:
+            file_path: Path to the source file
+            preprocess: If True, preprocess the file first to expand macros
+                       Note: If preprocess=True, macros will already be expanded
+                       and won't be extractable. Use preprocess=False to extract macros.
+        
+        Returns:
+            Tuple of (functions dict, macros dict)
+        """
+        try:
+            source = file_path.read_bytes()
+        except Exception as e:
+            logger.warning(f"Cannot read {file_path}: {e}")
+            return {}, {}
+
+        # Select parser based on extension
+        cpp_extensions = {".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".C", ".CPP"}
+        c_only_extensions = {".c"}
+        ambiguous_extensions = {".h", ".hh", ".inc"}
+
+        if file_path.suffix in cpp_extensions:
+            parser = _get_cpp_parser()
+        elif file_path.suffix in c_only_extensions:
+            parser = _get_c_parser()
+        elif file_path.suffix in ambiguous_extensions:
+            parser = _get_cpp_parser()
+        else:
+            parser = _get_c_parser()
+
+        tree = parser.parse(source)
+        functions = {}
+        macros = {}
+
+        # Extract both functions and macros
+        for node in self._iter_nodes(tree.root_node):
+            if node.type == "function_definition":
+                func_info = self._extract_function(node, source, str(file_path))
+                if func_info and func_info.name:
+                    functions[func_info.name] = func_info
+            elif node.type in ("preproc_def", "preproc_function_def"):
+                macro_info = self._extract_macro(node, source, str(file_path))
+                if macro_info and macro_info.name:
+                    macros[macro_info.name] = macro_info
+
+        return functions, macros
+
     def parse_source(self, source: str | bytes, filename: str = "<string>", is_cpp: bool = True) -> dict[str, FunctionInfo]:
         """Parse source code string and extract all functions."""
         if isinstance(source, str):
@@ -112,8 +244,13 @@ class CodeParser:
 
         return functions
 
-    def parse_project(self, project_path: Path) -> dict[str, FunctionInfo]:
-        """Parse all C/C++ files in a project directory."""
+    def parse_project(self, project_path: Path, preprocess: bool = False) -> dict[str, FunctionInfo]:
+        """Parse all C/C++ files in a project directory.
+        
+        Args:
+            project_path: Path to the project directory
+            preprocess: If True, preprocess files first to expand macros
+        """
         functions = {}
         extensions = {".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx"}
 
@@ -126,7 +263,7 @@ class CodeParser:
                 except ValueError:
                     rel_path = str(file_path)
 
-                file_funcs = self.parse_file(file_path)
+                file_funcs = self.parse_file(file_path, preprocess=preprocess)
                 for name, info in file_funcs.items():
                     info.file_path = rel_path
                     # Keep longer definition if duplicate
@@ -465,6 +602,90 @@ class CodeParser:
                 return source[child.start_byte:child.end_byte].decode().strip()
         return ""
 
+    def _extract_macro(self, node, source: bytes, file_path: str) -> Optional[MacroInfo]:
+        """Extract MacroInfo from a preproc_def or preproc_function_def node.
+        
+        AST structure:
+        - preproc_def (object-like macro):
+            - #define
+            - identifier (macro name)
+            - preproc_arg (optional expansion text)
+        
+        - preproc_function_def (function-like macro):
+            - #define
+            - identifier (macro name)
+            - preproc_params (parameter list)
+            - preproc_arg (expansion text)
+        """
+        children = list(node.children)
+        if len(children) < 2:
+            return None
+        
+        # Skip the first child if it's '#define'
+        start_idx = 0
+        if children[0].type == "#define":
+            start_idx = 1
+        
+        if start_idx >= len(children):
+            return None
+        
+        # Next child should be the macro name (identifier)
+        name_node = children[start_idx]
+        if name_node.type != "identifier":
+            return None
+        
+        name = source[name_node.start_byte:name_node.end_byte].decode()
+        
+        # Check if it's a function-like macro (has preproc_params)
+        is_function_like = node.type == "preproc_function_def"
+        arg_names = []
+        expansion = ""
+        
+        # Look for preproc_params (function-like macro parameters)
+        params_node = None
+        expansion_start_idx = start_idx + 1
+        
+        for i, child in enumerate(children[start_idx + 1:], start=start_idx + 1):
+            if child.type == "preproc_params":
+                is_function_like = True
+                params_node = child
+                expansion_start_idx = i + 1
+                break
+        
+        # Extract parameters if function-like
+        if params_node:
+            for param_child in params_node.children:
+                if param_child.type == "identifier":
+                    param_name = source[param_child.start_byte:param_child.end_byte].decode()
+                    arg_names.append(param_name)
+        
+        # Extract expansion text (preproc_arg or everything after name/params)
+        if expansion_start_idx < len(children):
+            expansion_node = children[expansion_start_idx]
+            if expansion_node.type == "preproc_arg":
+                expansion = source[expansion_node.start_byte:expansion_node.end_byte].decode().strip()
+            else:
+                # Fallback: get everything after name/params
+                expansion_start = expansion_node.start_byte
+                expansion_end = node.end_byte
+                expansion = source[expansion_start:expansion_end].decode().strip()
+            # Remove leading/trailing whitespace and newlines
+            expansion = " ".join(expansion.split())
+        
+        # Full macro code
+        code = source[node.start_byte:node.end_byte].decode()
+        
+        return MacroInfo(
+            name=name,
+            code=code,
+            file_path=file_path,
+            start_line=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
+            arg_names=arg_names,
+            expansion=expansion,
+            is_function_like=is_function_like,
+        )
+
     def _resolve_calls(self, functions: dict[str, FunctionInfo]) -> None:
         """Resolve caller/callee relationships between functions."""
         func_names = set(functions.keys())
@@ -481,22 +702,40 @@ class CodeParser:
 
 
 # Convenience function
-def extract_functions(source: str | bytes | Path, is_cpp: bool = True) -> dict[str, FunctionInfo]:
+def extract_functions(source: str | bytes | Path, is_cpp: bool = True, preprocess: bool = False) -> dict[str, FunctionInfo]:
     """Extract functions from source code or file.
 
     Args:
         source: Source code string, bytes, or Path to file
         is_cpp: Whether to parse as C++ (default) or C
+        preprocess: If True and source is a Path, preprocess the file first to expand macros
 
     Returns:
         Dict mapping function names to FunctionInfo objects
     """
-    extractor = FunctionExtractor()
+    extractor = CodeParser()
 
     if isinstance(source, Path):
-        return extractor.parse_file(source)
+        return extractor.parse_file(source, preprocess=preprocess)
     else:
         return extractor.parse_source(source, is_cpp=is_cpp)
+
+
+def extract_functions_and_macros(source: Path, preprocess: bool = False) -> tuple[dict[str, FunctionInfo], dict[str, MacroInfo]]:
+    """Extract both functions and macros from a file.
+
+    Args:
+        source: Path to the source file
+        preprocess: If True, preprocess the file first (macros will be expanded and not extractable)
+
+    Returns:
+        Tuple of (functions dict, macros dict)
+    """
+    extractor = CodeParser()
+    if isinstance(source, Path):
+        return extractor.parse_file_with_macros(source, preprocess=preprocess)
+    else:
+        raise ValueError("extract_functions_and_macros only accepts Path objects")
 
 
 # =============================================================================
@@ -509,8 +748,47 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         # Parse file from command line
         file_path = Path(sys.argv[1])
-        extractor = FunctionExtractor()
-        functions = extractor.parse_file(file_path)
+        preprocess = "--preprocess" in sys.argv or "-p" in sys.argv
+        extract_macros = "--macros" in sys.argv or "-m" in sys.argv
+        
+        extractor = CodeParser()
+        
+        if extract_macros:
+            functions, macros = extractor.parse_file_with_macros(file_path, preprocess=False)
+            print(f"Found {len(functions)} functions and {len(macros)} macros:\n")
+            
+            if macros:
+                print("Macros:")
+                for name, info in macros.items():
+                    print(f"  {name}")
+                    if info.is_function_like:
+                        print(f"    Type: Function-like macro")
+                        print(f"    Parameters: {', '.join(info.arg_names) if info.arg_names else 'none'}")
+                    else:
+                        print(f"    Type: Object-like macro")
+                    print(f"    Expansion: {info.expansion}")
+                    print(f"    File: {info.file_path}:{info.start_line}")
+                    print()
+            
+            if functions:
+                print("\nFunctions:")
+                for name, info in functions.items():
+                    print(f"  {name}")
+                    print(f"    File: {info.file_path}:{info.start_line}-{info.end_line}")
+                    print(f"    Return type: '{info.return_type}'")
+        else:
+            functions = extractor.parse_file(file_path, preprocess=preprocess)
+            print(f"Found {len(functions)} functions:\n")
+            for name, info in functions.items():
+                print(f"Function: {name}")
+                print(f"  File: {info.file_path}:{info.start_line}-{info.end_line}")
+                print(f"  Return type: '{info.return_type}'")
+                print(f"  Parameters:")
+                for i, (ptype, pname) in enumerate(zip(info.arg_types, info.arg_names)):
+                    print(f"    [{i}] {ptype} {pname}")
+                print(f"  Callees: {info.callees}")
+                print(f"  Return expressions: {info.return_expressions}")
+                print()
     else:
         # Test with sample code
         sample = '''
@@ -537,16 +815,14 @@ MyClass::MyClass(int value) : m_value(value) {
 }
 '''
         functions = extract_functions(sample, is_cpp=True)
-
-    # Print results
-    print(f"Found {len(functions)} functions:\n")
-    for name, info in functions.items():
-        print(f"Function: {name}")
-        print(f"  File: {info.file_path}:{info.start_line}-{info.end_line}")
-        print(f"  Return type: '{info.return_type}'")
-        print(f"  Parameters:")
-        for i, (ptype, pname) in enumerate(zip(info.arg_types, info.arg_names)):
-            print(f"    [{i}] {ptype} {pname}")
-        print(f"  Callees: {info.callees}")
-        print(f"  Return expressions: {info.return_expressions}")
-        print()
+        print(f"Found {len(functions)} functions:\n")
+        for name, info in functions.items():
+            print(f"Function: {name}")
+            print(f"  File: {info.file_path}:{info.start_line}-{info.end_line}")
+            print(f"  Return type: '{info.return_type}'")
+            print(f"  Parameters:")
+            for i, (ptype, pname) in enumerate(zip(info.arg_types, info.arg_names)):
+                print(f"    [{i}] {ptype} {pname}")
+            print(f"  Callees: {info.callees}")
+            print(f"  Return expressions: {info.return_expressions}")
+            print()
