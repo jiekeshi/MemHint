@@ -458,6 +458,9 @@ The rejected hints are inconsistent with the code structure. Please:
             context=context_str + conflict_feedback,
         )
 
+        # Log the complete prompt for debugging
+        logger.debug(f"LLM prompt for function {func.name}:\n{'='*80}\n{prompt}\n{'='*80}")
+
         result = self.llm.query(prompt)
         usage = result.get("usage", {})
         content = result.get("content", {})
