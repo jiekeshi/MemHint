@@ -318,7 +318,7 @@ class Pipeline:
 
         self.warning_validator = WarningValidator(alloc_funcs, free_funcs)
         confirmed_warnings, filtered_warnings = self.warning_validator.validate_warnings(
-            warnings, self.functions
+            warnings, self.functions, self.hints
         )
 
         logger.info(f"  Confirmed: {len(confirmed_warnings)}, Filtered: {len(filtered_warnings)}")

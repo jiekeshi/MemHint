@@ -1043,6 +1043,7 @@ class WarningValidator:
         self,
         warnings: list[Warning],
         functions: dict[str, FunctionInfo],
+        hints: Optional[HintSet] = None,
     ) -> tuple[list[Warning], list[Warning]]:
         """Validate warnings, returning (confirmed, filtered)."""
         if not Z3_AVAILABLE:
@@ -1052,6 +1053,13 @@ class WarningValidator:
 
         alloc_funcs = self._get_all_alloc_funcs(functions)
         free_funcs = self._get_all_free_funcs(functions)
+        
+        # Add allocators and deallocators from hints
+        if hints:
+            for func_name, arg_idx in hints.get_allocators():
+                alloc_funcs.add(func_name)
+            for func_name, arg_idx in hints.get_deallocators():
+                free_funcs.add(func_name)
 
         confirmed = []
         filtered = []
