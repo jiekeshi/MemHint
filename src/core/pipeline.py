@@ -88,6 +88,7 @@ class Pipeline:
         self.functions: dict[str, FunctionInfo] = {}
         self.hints = HintSet()
         self.conflicts: list[str] = []
+        self.validated_hints_count: int = 0  # Track number of hints that passed Z3 validation
 
     def analyze(
         self,
@@ -176,12 +177,19 @@ class Pipeline:
         if self.skip_hint_injection:
             logger.info("Hint injection disabled: skipping hint generation/validation (phases 2-3).")
             self.hints = HintSet()
+            self.validated_hints_count = 0
+            # Export empty cost file
+            self._export_costs(output_dir)
         else:
             # Check for cached hints
             hints_file = output_dir / "hints.json"
             if hints_file.exists():
                 logger.info(f"  Loading cached hints from {hints_file}")
                 self.hints = self._load_hints(hints_file)
+                # Count validated hints from cached hints (approximate - all cached hints are considered validated)
+                self.validated_hints_count = sum(len(hints) for hints in self.hints.hints.values())
+                # Export cost file (will show zeros since no LLM calls were made)
+                self._export_costs(output_dir)
             else:
                 # =================================================================
                 # Phase 2-3: hint generation and validation
@@ -240,6 +248,9 @@ class Pipeline:
 
                 # Save validated hints
                 self._save_hints(hints_file)
+                
+                # Export cost information right after hint generation completes
+                self._export_costs(output_dir)
 
         # =====================================================================
         # Phase 4: CodeQL analysis with hints
@@ -355,6 +366,110 @@ class Pipeline:
         report_file.write_text(report)
 
         logger.info(f"Results saved to {output_dir}")
+
+    def _export_costs(self, output_dir: Path) -> None:
+        """Export LLM cost information to JSON file."""
+        # Calculate total number of functions analyzed
+        total_functions = len(self.functions)
+        
+        # Count total validated hints (hints that passed Z3 validation)
+        total_validated_hints = self.validated_hints_count
+        
+        if self.skip_hint_injection:
+            # No costs if hints were skipped
+            cost_data = {
+                "total_llm_cost": 0.0,
+                "total_tokens": 0,
+                "total_functions": total_functions,
+                "total_validated_hints": total_validated_hints,
+                "cost_per_validated_hint": 0.0,
+                "function_costs": {},
+                "hint_costs": {},
+            }
+            cost_file = output_dir / "llm_costs.json"
+            cost_file.write_text(json.dumps(cost_data, indent=2))
+            return
+        
+        # Get cost summary from hint generator
+        cost_summary = self.hint_generator.get_cost_summary()
+        total_llm_cost = cost_summary["total_cost"]
+        
+        # Count total output hints (final hints in self.hints)
+        total_output_hints = sum(len(hints) for hints in self.hints.hints.values())
+        
+        # Calculate cost per validated hint (validated hints are from Z3, but we calculate cost per validated hint)
+        cost_per_validated_hint = 0.0
+        if total_validated_hints > 0:
+            cost_per_validated_hint = total_llm_cost / total_validated_hints
+        
+        # Calculate cost per output hint (final hints in output)
+        cost_per_output_hint = 0.0
+        if total_output_hints > 0:
+            cost_per_output_hint = total_llm_cost / total_output_hints
+        
+        # Calculate per-hint costs
+        # Distribute each function's cost evenly across its hints
+        hint_costs = {}
+        for func_name, func_hints in self.hints.hints.items():
+            func_cost_info = self.hint_generator.function_costs.get(func_name, {})
+            func_cost = func_cost_info.get("cost", 0.0)
+            num_hints = len(func_hints)
+            
+            if num_hints > 0:
+                cost_per_hint = func_cost / num_hints
+                for i, hint in enumerate(func_hints):
+                    hint_key = f"{func_name}.{hint.hint_type.name}.{hint.target}"
+                    hint_costs[hint_key] = {
+                        "function_name": func_name,
+                        "hint_type": hint.hint_type.name,
+                        "target": hint.target,
+                        "cost": cost_per_hint,
+                        "tokens": func_cost_info.get("tokens", 0) // num_hints if num_hints > 0 else 0,
+                    }
+            else:
+                # Function had cost but no hints generated
+                hint_key = f"{func_name}.no_hints"
+                hint_costs[hint_key] = {
+                    "function_name": func_name,
+                    "hint_type": "NONE",
+                    "target": "N/A",
+                    "cost": func_cost,
+                    "tokens": func_cost_info.get("tokens", 0),
+                }
+        
+        # Build final cost data structure
+        cost_data = {
+            "total_llm_cost": total_llm_cost,
+            "total_tokens": cost_summary["total_tokens"],
+            "total_functions": total_functions,
+            "total_validated_hints": total_validated_hints,
+            "total_output_hints": total_output_hints,
+            "cost_per_validated_hint": cost_per_validated_hint,
+            "cost_per_output_hint": cost_per_output_hint,
+            "function_costs": {
+                func_name: {
+                    "cost": info["cost"],
+                    "tokens": info["tokens"],
+                    "prompt_tokens": info.get("prompt_tokens", 0),
+                    "completion_tokens": info.get("completion_tokens", 0),
+                    "input_cost": info.get("input_cost", 0.0),
+                    "output_cost": info.get("output_cost", 0.0),
+                }
+                for func_name, info in cost_summary["function_costs"].items()
+            },
+            "hint_costs": hint_costs,
+        }
+        
+        cost_file = output_dir / "llm_costs.json"
+        cost_file.write_text(json.dumps(cost_data, indent=2))
+        logger.info(f"  LLM cost information saved to {cost_file}")
+        logger.info(f"  Total LLM cost: ${cost_data['total_llm_cost']:.6f}")
+        logger.info(f"  Total tokens: {cost_data['total_tokens']}")
+        logger.info(f"  Total functions analyzed: {cost_data['total_functions']}")
+        logger.info(f"  Total validated hints: {cost_data['total_validated_hints']}")
+        logger.info(f"  Total output hints: {cost_data['total_output_hints']}")
+        logger.info(f"  Cost per validated hint: ${cost_data['cost_per_validated_hint']:.6f}")
+        logger.info(f"  Cost per output hint: ${cost_data['cost_per_output_hint']:.6f}")
 
     def _generate_report(self, bugs: list[Evidence]) -> str:
         """Generate markdown report."""
