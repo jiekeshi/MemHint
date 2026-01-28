@@ -71,7 +71,7 @@ def main():
 
     parser.add_argument(
         "--project", "-p", required=True,
-        help="Project path to analyze"
+        help="Project path to analyze (used for building analyzer database)"
     )
     parser.add_argument(
         "--output", "-o", default="./output",
@@ -94,6 +94,15 @@ def main():
         nargs="+",
         help="Optional: path(s) to one or more C/C++ source files to feed to the LLM/hint phases "
              "instead of parsing the entire project (for small tests). Can specify multiple files.",
+    )
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        help=(
+            "Optional: root directory to scan for functions/macros for LLM hints. "
+            "Defaults to the same as --project. Useful when the build root is larger "
+            "than the code region you want to feed to the LLM."
+        ),
     )
     parser.add_argument(
         "--codeql-dir",
@@ -138,11 +147,18 @@ def main():
     setup_logging(log_level, str(log_file))
     logger = logging.getLogger(__name__)
 
-    # Validate project path
+    # Validate project / source paths
     project_path = Path(args.project)
     if not project_path.exists():
         logger.error(f"Project not found: {project_path}")
         sys.exit(1)
+
+    source_root: Path | None = None
+    if args.source_root:
+        source_root = Path(args.source_root)
+        if not source_root.exists():
+            logger.error(f"Source root not found: {source_root}")
+            sys.exit(1)
 
     single_sources = None
     if args.single_source:
@@ -171,7 +187,12 @@ def main():
         use_enhanced_queries=not args.no_enhanced_queries,
     )
 
-    result = pipeline.analyze(project_path, output_dir, single_sources=single_sources)
+    result = pipeline.analyze(
+        project_path,
+        output_dir,
+        single_sources=single_sources,
+        source_root=source_root,
+    )
 
     # Print summary
     print("\n" + "=" * 60)

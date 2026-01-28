@@ -96,6 +96,7 @@ class Pipeline:
         project_path: Path,
         output_dir: Path = None,
         single_sources: list[Path] | None = None,
+        source_root: Path | None = None,
     ) -> AnalysisResult:
         """Run the full analysis pipeline.
 
@@ -114,6 +115,7 @@ class Pipeline:
             AnalysisResult with confirmed bugs and hints
         """
         project_path = Path(project_path).resolve()
+        source_root = Path(source_root).resolve() if source_root else project_path
         output_dir = output_dir or Path("./output")
         output_dir.mkdir(parents=True, exist_ok=True)
         single_sources = [Path(p).resolve() for p in single_sources] if single_sources else None
@@ -125,6 +127,10 @@ class Pipeline:
         # Phase 1: Parse source code
         # =====================================================================
         logger.info("Phase 1: Parsing source code...")
+
+        # We use the same parsing logic for both full and single-source modes.
+        # The only difference is the set of files we feed into the parser.
+        target_files: list[Path] = []
         if single_sources is not None:
             logger.info(f"  Single-source mode: parsing {len(single_sources)} file(s)")
             for single_source in single_sources:
@@ -136,58 +142,101 @@ class Pipeline:
                         iterations=0,
                         spurious_filtered=0,
                     )
-
-            # Parse all specified files and merge results
-            self.functions = {}
-            self.macro_names = set()
-            for single_source in single_sources:
-                logger.info(f"    Parsing {single_source}")
-                file_functions, file_macros = self.parser.parse_file_with_macros(single_source, preprocess=False)
-                for func_name, info in file_functions.items():
-                    # Ensure file_path is set for downstream components
-                    if not getattr(info, "file_path", None):
-                        info.file_path = str(single_source)
-                    # Handle function name conflicts by prefixing with file name if needed
-                    if func_name in self.functions:
-                        logger.warning(f"    Function {func_name} found in multiple files, keeping first occurrence")
-                    else:
-                        self.functions[func_name] = info
-                # Convert function-like macros to FunctionInfo and add to functions
-                for macro_name, macro_info in file_macros.items():
-                    if macro_info.is_function_like:
-                        # Include expansion in code so LLM can see what the macro expands to
-                        macro_code = macro_info.code
-                        if macro_info.expansion:
-                            macro_code += f"\n// Expands to: {macro_info.expansion}"
-                        
-                        func_info = FunctionInfo(
-                            name=macro_name,
-                            code=macro_code,
-                            file_path=macro_info.file_path or str(single_source),
-                            start_line=macro_info.start_line,
-                            end_line=macro_info.end_line,
-                            arg_names=macro_info.arg_names,
-                            arg_types=[""] * len(macro_info.arg_names),
-                            return_type="",
-                            callees=set(),
-                            callers=set(),
-                            return_expressions={macro_info.expansion} if macro_info.expansion else set(),
-                        )
-                        if macro_name not in self.functions:
-                            self.functions[macro_name] = func_info
-                            self.macro_names.add(macro_name)
-                        else:
-                            logger.warning(f"    Macro/Function {macro_name} found in multiple files, keeping first occurrence")
-
-            # Best-effort call graph resolution within this subset
-            try:
-                # parse_project normally does this; call it explicitly here.
-                self.parser._resolve_calls(self.functions)  # type: ignore[attr-defined]
-            except Exception as e:
-                logger.warning(f"  Warning: could not resolve calls in single-source mode: {e}")
+            target_files = single_sources
         else:
-            self.functions = self.parser.parse_project(project_path)
-            self.macro_names = set()  # Full project mode doesn't extract macros yet
+            logger.info(f"  Full-project mode: parsing all source files under source root {source_root}")
+            # Reuse the same extension set as CodeParser.parse_project_with_macros
+            exts = {
+                ".c", ".cpp", ".cc", ".cxx",
+                ".h", ".hpp", ".hxx", ".hh",
+                ".inc", ".inl", ".def",
+            }
+            for fp in source_root.rglob("*"):
+                if fp.suffix.lower() in exts:
+                    target_files.append(fp)
+
+        # Unified parsing for both modes: per-file parse_file_with_macros
+        self.functions = {}
+        self.macro_names = set()
+        for src in target_files:
+            logger.info(f"    Parsing {src}")
+            file_functions, file_macros = self.parser.parse_file_with_macros(src, preprocess=False)
+
+            # Merge functions: if duplicates exist, keep the one with longer code (more context)
+            for func_name, info in file_functions.items():
+                if not getattr(info, "file_path", None):
+                    info.file_path = str(src)
+                if func_name in self.functions:
+                    existing = self.functions[func_name]
+                    if len(info.code) > len(existing.code):
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                "    Function %s found in multiple files, replacing with longer definition from %s",
+                                func_name,
+                                src,
+                            )
+                        self.functions[func_name] = info
+                    else:
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                "    Function %s found in multiple files, keeping existing definition from %s",
+                                func_name,
+                                existing.file_path,
+                            )
+                    continue
+                self.functions[func_name] = info
+
+            # Convert function-like macros to FunctionInfo and merge
+            for macro_name, macro_info in file_macros.items():
+                if not macro_info.is_function_like:
+                    continue
+
+                macro_code = macro_info.code
+                if macro_info.expansion:
+                    macro_code += f"\n// Expands to: {macro_info.expansion}"
+
+                func_info = FunctionInfo(
+                    name=macro_name,
+                    code=macro_code,
+                    file_path=macro_info.file_path or str(src),
+                    start_line=macro_info.start_line,
+                    end_line=macro_info.end_line,
+                    arg_names=macro_info.arg_names,
+                    arg_types=[""] * len(macro_info.arg_names),
+                    return_type="",
+                    callees=set(),
+                    callers=set(),
+                    return_expressions={macro_info.expansion} if macro_info.expansion else set(),
+                )
+                if macro_name in self.functions:
+                    existing = self.functions[macro_name]
+                    if len(func_info.code) > len(existing.code):
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                "    Macro/Function %s found in multiple files, replacing with longer definition from %s",
+                                macro_name,
+                                src,
+                            )
+                        self.functions[macro_name] = func_info
+                    else:
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                "    Macro/Function %s found in multiple files, keeping existing definition from %s",
+                                macro_name,
+                                existing.file_path,
+                            )
+                    # Regardless, it is still a macro name
+                    self.macro_names.add(macro_name)
+                    continue
+
+                self.functions[macro_name] = func_info
+                self.macro_names.add(macro_name)
+
+        # Best-effort call graph resolution (both modes)
+        try:
+            self.parser._resolve_calls(self.functions)  # type: ignore[attr-defined]
+        except Exception as e:
+            logger.warning(f"  Warning: could not resolve calls: {e}")
         
         # Count functions vs macros
         num_functions = len(self.functions) - len(self.macro_names)
@@ -202,7 +251,8 @@ class Pipeline:
             if func_name in self.macro_names:
                 logger.debug(f"    Scan target macro: {func_name} (file: {file_hint})")
             else:
-                logger.debug(f"    Scan target function: {func_name} (file: {file_hint})")
+                # logger.debug(f"    Scan target function: {func_name} (file: {file_hint})")
+                pass
 
         if not self.functions:
             logger.warning("No functions found")
@@ -236,9 +286,56 @@ class Pipeline:
 
                 all_conflicts = []
 
-                # Initial hint generation
+                # -----------------------------------------------------------------
+                # Phase 2a: Filter LLM candidate functions (pointer / alloc/free related)
+                # -----------------------------------------------------------------
+                total_funcs = len(self.functions)
+                num_macros = len(self.macro_names)
+                pointer_typedef_aliases = getattr(self.parser, "pointer_typedef_aliases", set())  # type: ignore[attr-defined]
+                self.hint_generator.set_pointer_typedef_aliases(pointer_typedef_aliases)
+                if logger.isEnabledFor(logging.DEBUG) and pointer_typedef_aliases:
+                    logger.debug(
+                        "Phase 2a: Found %d pointer typedef aliases: %s",
+                        len(pointer_typedef_aliases),
+                        sorted(pointer_typedef_aliases),
+                    )
+
+                # Classify all parsed functions into "kept" and "filtered out" for LLM
+                kept_functions: list[str] = []
+                filtered_functions: list[str] = []
+                for fn, f in self.functions.items():
+                    if fn in self.macro_names or self.hint_generator._has_pointer_io(f):
+                        kept_functions.append(fn)
+                    else:
+                        filtered_functions.append(fn)
+
+                candidate_funcs = len(kept_functions)
+                logger.info(
+                    "Phase 2a: Filtering LLM candidates - %d/%d functions are pointer/alloc/free related (including %d macros)",
+                    candidate_funcs,
+                    total_funcs,
+                    num_macros,
+                )
+
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Phase 2a: Kept %d function(s) for LLM (including macros): %s",
+                        len(kept_functions),
+                        sorted(kept_functions),
+                    )
+                    logger.debug(
+                        "Phase 2a: Filtered out %d function(s) (no pointer/alloc/free IO): %s",
+                        len(filtered_functions),
+                        sorted(filtered_functions),
+                    )
+
+                # Initial hint generation (actual per-function filtering is done inside HintGenerator)
                 logger.info("Phase 2: Generating hints with LLM...")
-                self.hints = self.hint_generator.generate_hints(self.functions)
+                self.hints = self.hint_generator.generate_hints(
+                    self.functions, 
+                    macro_names=self.macro_names,
+                    pointer_typedef_aliases=pointer_typedef_aliases,
+                )
                 logger.info(f"  {self.hints.summary()}")
 
                 # =================================================================
@@ -271,7 +368,9 @@ class Pipeline:
                     new_hints = self.hint_generator.regenerate_hints_for_functions(
                         self.functions,
                         conflict_functions,
-                        previous_conflicts=conflicts  # Pass current iteration's conflicts for LLM feedback
+                        previous_conflicts=conflicts,  # Pass current iteration's conflicts for LLM feedback
+                        macro_names=self.macro_names,
+                        pointer_typedef_aliases=pointer_typedef_aliases,
                     )
                     # Merge new hints with existing validated hints
                     for func_name, func_hints in new_hints.hints.items():
