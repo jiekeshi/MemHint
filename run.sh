@@ -7,7 +7,7 @@ CPP_QUERIES_DIR="/home/huihuihuang/Hint/codeql/qlpacks/codeql/cpp-queries"
 # - Or set RUN_ALL=false and list desired case names in RUN_CASES.
 #   Example: RUN_CASES=("redis" "zstd_issue4112")
 RUN_ALL=false
-RUN_CASES=("vim_issue14255" "vim_issue14254")
+RUN_CASES=("redis")
 
 # MODE options:
 #   single_with_hints  - use --single-source hints✅ enhanced query✅
@@ -15,7 +15,7 @@ RUN_CASES=("vim_issue14255" "vim_issue14254")
 #   full_no_hints      - analyze full project without hints❌ enhanced query✅
 #   full_with_hints_no_enhanced_queries - analyze full project with hints✅ enhanced query❌
 #   full_no_hints_no_enhanced_queries - analyze full project without hints❌ enhanced query❌
-MODE="full_with_hints_no_enhanced_queries"
+MODE="full_with_hints"
 
 case "$MODE" in
   single_with_hints)
@@ -127,10 +127,11 @@ run_case() {
     local output_path="$2"
     shift 2
 
-    python main.py --no-reuse-db --project "$project_path" --output "$output_path" \
+    python main.py --debug --no-reuse-db --project "$project_path" --output "$output_path" \
         --cpp-queries-dir "$CPP_QUERIES_DIR" \
         $SKIP_HINTS_FLAG \
         $ENHANCED_QUERIES_FLAG \
+        --source-root "$project_path" \
         "$@"
 }
 ##########
@@ -143,9 +144,11 @@ OUTPUT_PATH=$(adjust_output_path "$BASE_OUTPUT")
 prepare_hints_from_single "$BASE_OUTPUT" "$OUTPUT_PATH"
 if [ "$USE_SINGLE_SOURCE" = true ]; then
   run_case "$PROJECT_PATH" "$OUTPUT_PATH" \
-    --single-source "/home/huihuihuang/Hint/cloned_proj/redis/src/replication.c" "/home/huihuihuang/Hint/cloned_proj/redis/src/redis-benchmark.c"
+    --single-source "/home/huihuihuang/Hint/cloned_proj/redis/src/replication.c" "/home/huihuihuang/Hint/cloned_proj/redis/src/redis-benchmark.c" "/home/huihuihuang/Hint/cloned_proj/redis/src/server.h"
 else
-  run_case "$PROJECT_PATH" "$OUTPUT_PATH"
+  run_case "$PROJECT_PATH" "$OUTPUT_PATH" \
+    --source-root "/home/huihuihuang/Hint/cloned_proj/redis/src"
+
 fi
 fi
 
@@ -343,34 +346,6 @@ fi
 fi
 
 ##########
-# vim issue14239 using vim_pr14241_before#
-#########
-# if should_run "vim_issue14239"; then
-# PROJECT_PATH=/home/huihuihuang/Hint/cloned_proj/vim_pr14241_before
-# OUTPUT_PATH=$(adjust_output_path "/home/huihuihuang/Hint/output/cloned_proj/vim_issue14239_pr14241_before/output")
-# if [ "$USE_SINGLE_SOURCE" = true ]; then
-#   run_case "$PROJECT_PATH" "$OUTPUT_PATH" \
-#     --single-source "/home/huihuihuang/Hint/cloned_proj/vim_pr14241_before/src/drawline.c" "/home/huihuihuang/Hint/cloned_proj/vim_pr14241_before/src/vim.h"
-# else
-#   run_case "$PROJECT_PATH" "$OUTPUT_PATH"
-# fi
-# fi
-
-##########
-# vim issue14239 using vim_pr14241_before#
-#########
-# if should_run "vim_issue14250"; then
-# PROJECT_PATH=/home/huihuihuang/Hint/cloned_proj/vim_pr14260_before
-# OUTPUT_PATH=$(adjust_output_path "/home/huihuihuang/Hint/output/cloned_proj/vim_issue14250_pr14260_before/output")
-# if [ "$USE_SINGLE_SOURCE" = true ]; then
-#   run_case "$PROJECT_PATH" "$OUTPUT_PATH" \
-#     --single-source "/home/huihuihuang/Hint/cloned_proj/vim_pr14260_before/src/misc1.c" "/home/huihuihuang/Hint/cloned_proj/vim_pr14260_before/src/strings.c"
-# else
-#   run_case "$PROJECT_PATH" "$OUTPUT_PATH"
-# fi
-# fi
-
-##########
 # vim issue14254 using vim_915f3_before#
 #########
 if should_run "vim_issue14254"; then
@@ -401,3 +376,37 @@ else
   run_case "$PROJECT_PATH" "$OUTPUT_PATH"
 fi
 fi
+
+##########
+# example2-1: Standard version (malloc/free)#
+#########
+if should_run "example2-1"; then
+PROJECT_PATH=/home/huihuihuang/Hint/data/example2-1
+BASE_OUTPUT="/home/huihuihuang/Hint/output/data/example2-1/output"
+OUTPUT_PATH=$(adjust_output_path "$BASE_OUTPUT")
+prepare_hints_from_single "$BASE_OUTPUT" "$OUTPUT_PATH"
+if [ "$USE_SINGLE_SOURCE" = true ]; then
+  run_case "$PROJECT_PATH" "$OUTPUT_PATH" \
+    --single-source "/home/huihuihuang/Hint/data/example2-1/main_standard.cpp"
+else
+  run_case "$PROJECT_PATH" "$OUTPUT_PATH"
+fi
+fi
+
+##########
+# example2-2: Custom micro version (MICRO_malloc/MICRO_free)#
+#########
+if should_run "example2-2"; then
+PROJECT_PATH=/home/huihuihuang/Hint/data/example2-2
+BASE_OUTPUT="/home/huihuihuang/Hint/output/data/example2-2/output"
+OUTPUT_PATH=$(adjust_output_path "$BASE_OUTPUT")
+prepare_hints_from_single "$BASE_OUTPUT" "$OUTPUT_PATH"
+if [ "$USE_SINGLE_SOURCE" = true ]; then
+  run_case "$PROJECT_PATH" "$OUTPUT_PATH" \
+    --single-source "/home/huihuihuang/Hint/data/example2-2/main_micro.cpp"
+else
+  run_case "$PROJECT_PATH" "$OUTPUT_PATH"
+fi
+fi
+
+
