@@ -262,5 +262,19 @@
             "command": "make",
             "can_error": false
         }
+    },
+    "example2-1": {
+        "prepare_for_build": [],
+        "build_command": {
+            "command": "gcc -o main_standard main_standard.cpp -Wall -Wextra",
+            "can_error": false
+        }
+    },
+    "example2-2": {
+        "prepare_for_build": [],
+        "build_command": {
+            "command": "gcc -o main_micro main_micro.cpp -Wall -Wextra",
+            "can_error": false
+        }
     }
 }
