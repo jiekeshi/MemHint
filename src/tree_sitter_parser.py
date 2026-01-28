@@ -7,6 +7,7 @@ Key design: Extract raw text from AST nodes instead of reconstructing types.
 """
 
 import logging
+import re
 import subprocess
 import shutil
 from dataclasses import dataclass, field
@@ -71,8 +72,87 @@ class CodeParser:
     """Extract functions from C/C++ source using tree-sitter."""
 
     def __init__(self):
-        pass
+        # Aggregated across the last parse_project / parse_source calls.
+        # Contains typedef alias names that are pointer types.
+        # Example: `typedef struct _client { ... } *client;` -> adds "client"
+        self.pointer_typedef_aliases: set[str] = set()
+    
+    def _collect_pointer_typedef_aliases(self, root, source: bytes) -> set[str]:
+        """Collect pointer typedef aliases using tree-sitter AST nodes.
 
+        Supports:
+        - typedef struct _client { ... } *client;
+        - typedef some_type *client;
+        - typedef char* sds;              (IMPORTANT: '*' on type side, not declarator side)
+        - typedef const char *cstring;
+        - avoids false capture from function pointer typedef parameter names
+        """
+
+        def _unwrap_typedef_declarator(decl_node):
+            if decl_node is None:
+                return None
+            if decl_node.type == "parenthesized_declarator":
+                inner = decl_node.child_by_field_name("declarator")
+                return _unwrap_typedef_declarator(inner) if inner is not None else decl_node
+            if decl_node.type == "function_declarator":
+                inner = decl_node.child_by_field_name("declarator")
+                return _unwrap_typedef_declarator(inner) if inner is not None else decl_node
+            if decl_node.type == "init_declarator":
+                inner = decl_node.child_by_field_name("declarator")
+                return _unwrap_typedef_declarator(inner) if inner is not None else decl_node
+            return decl_node
+
+        aliases: set[str] = set()
+
+        for node in self._iter_nodes(root):
+            if node.type != "type_definition":
+                continue
+
+            # The typedef's main declarator (authoritative; not inside parameter_list)
+            decl_field_raw = node.child_by_field_name("declarator")
+            decl_field = _unwrap_typedef_declarator(decl_field_raw)
+
+            # Try to get alias name even if it's not a pointer_declarator
+            alias_name = ""
+            if decl_field is not None:
+                alias_name = self._extract_declarator_name_only(decl_field, source)
+
+            pointer_decl = None
+            if decl_field is not None and decl_field.type == "pointer_declarator":
+                pointer_decl = decl_field
+
+            # Case B: typedef ... init_declarator;
+            if pointer_decl is None:
+                for child in node.children:
+                    if child.type == "init_declarator":
+                        alias_decl = child.child_by_field_name("declarator")
+                        alias_decl = _unwrap_typedef_declarator(alias_decl)
+                        if alias_decl is not None:
+                            if not alias_name:
+                                alias_name = self._extract_declarator_name_only(alias_decl, source)
+                            if alias_decl.type == "pointer_declarator":
+                                pointer_decl = alias_decl
+                        break
+
+            # (1) declarator-side pointer: definitely a pointer typedef
+            if pointer_decl is not None and alias_name:
+                aliases.add(alias_name)
+                continue
+
+            # (2) type-side pointer: typedef char* sds; typedef const char *cstring;
+            #     if the "type" part contains '*', treat alias as pointer-like typedef
+            if alias_name and decl_field_raw is not None:
+                type_text = source[node.start_byte:decl_field_raw.start_byte].decode(errors="ignore")
+                if "*" in type_text:
+                    aliases.add(alias_name)
+                    continue
+
+        if logger.isEnabledFor(logging.DEBUG) and aliases:
+            logger.debug(f"Collected {len(aliases)} pointer typedef aliases: {sorted(aliases)}")
+
+        return aliases
+
+    
     def _preprocess_file(self, file_path: Path) -> bytes:
         """Preprocess a file to expand macros.
         
@@ -133,12 +213,19 @@ class CodeParser:
         except Exception as e:
             raise RuntimeError(f"Preprocessing error: {e}")
 
-    def parse_file(self, file_path: Path, preprocess: bool = False) -> dict[str, FunctionInfo]:
+    def parse_file(
+        self,
+        file_path: Path,
+        preprocess: bool = False,
+        collect_typedefs: bool = True,
+    ) -> dict[str, FunctionInfo]:
         """Parse a single file and extract all functions.
-        
+
         Args:
             file_path: Path to the source file
             preprocess: If True, preprocess the file first to expand macros
+            collect_typedefs: If True, collect pointer typedef aliases from this file
+                            (set False in parse_project Pass2 to avoid rescanning)
         """
         try:
             if preprocess:
@@ -159,15 +246,22 @@ class CodeParser:
         elif file_path.suffix in c_only_extensions:
             parser = _get_c_parser()
         elif file_path.suffix in ambiguous_extensions:
-            # For .h files, try C++ parser first (handles more cases)
-            # If it has C++ constructs like class/template, C++ parser works better
-            # C++ parser is also backward compatible with most C code
+            # For .h files, try C++ parser first
             parser = _get_cpp_parser()
         else:
             parser = _get_c_parser()
 
         tree = parser.parse(source)
-        functions = {}
+
+        # Collect pointer typedef aliases for this file (optional)
+        if collect_typedefs:
+            try:
+                aliases = self._collect_pointer_typedef_aliases(tree.root_node, source)
+                self.pointer_typedef_aliases.update(aliases)
+            except Exception:
+                pass
+
+        functions: dict[str, FunctionInfo] = {}
 
         # Find all function_definition nodes
         for node in self._iter_nodes(tree.root_node):
@@ -178,19 +272,29 @@ class CodeParser:
 
         return functions
 
-    def parse_file_with_macros(self, file_path: Path, preprocess: bool = False) -> tuple[dict[str, FunctionInfo], dict[str, MacroInfo]]:
+    def parse_file_with_macros(
+        self,
+        file_path: Path,
+        preprocess: bool = False,
+        collect_typedefs: bool = True,
+    ) -> tuple[dict[str, FunctionInfo], dict[str, MacroInfo]]:
         """Parse a single file and extract both functions and macros.
-        
+
         Args:
             file_path: Path to the source file
             preprocess: If True, preprocess the file first to expand macros
-                       Note: If preprocess=True, macros will already be expanded
-                       and won't be extractable. Use preprocess=False to extract macros.
-        
+                    Note: If preprocess=True, macros will already be expanded
+                    and won't be extractable. Use preprocess=False to extract macros.
+            collect_typedefs: If True, collect pointer typedef aliases from this file
+                            and update self.pointer_typedef_aliases. For project-level
+                            parsing with a global Pass1 typedef collection, set to False.
+
         Returns:
             Tuple of (functions dict, macros dict)
         """
         try:
+            # IMPORTANT: if you want macros, you MUST read raw source (no preprocessing)
+            # preprocessing expands macros and removes macro definitions.
             source = file_path.read_bytes()
         except Exception as e:
             logger.warning(f"Cannot read {file_path}: {e}")
@@ -211,8 +315,17 @@ class CodeParser:
             parser = _get_c_parser()
 
         tree = parser.parse(source)
-        functions = {}
-        macros = {}
+
+        # Collect pointer typedef aliases (optional)
+        if collect_typedefs:
+            try:
+                aliases = self._collect_pointer_typedef_aliases(tree.root_node, source)
+                self.pointer_typedef_aliases.update(aliases)
+            except Exception:
+                pass
+
+        functions: dict[str, FunctionInfo] = {}
+        macros: dict[str, MacroInfo] = {}
 
         # Extract both functions and macros
         for node in self._iter_nodes(tree.root_node):
@@ -227,14 +340,31 @@ class CodeParser:
 
         return functions, macros
 
-    def parse_source(self, source: str | bytes, filename: str = "<string>", is_cpp: bool = True) -> dict[str, FunctionInfo]:
+
+
+    def parse_source(
+        self,
+        source: str | bytes,
+        filename: str = "<string>",
+        is_cpp: bool = True,
+        collect_typedefs: bool = True,
+    ) -> dict[str, FunctionInfo]:
         """Parse source code string and extract all functions."""
         if isinstance(source, str):
-            source = source.encode('utf-8')
+            source = source.encode("utf-8")
 
         parser = _get_cpp_parser() if is_cpp else _get_c_parser()
         tree = parser.parse(source)
-        functions = {}
+
+        # Collect pointer typedef aliases for this source (optional)
+        if collect_typedefs:
+            try:
+                aliases = self._collect_pointer_typedef_aliases(tree.root_node, source)
+                self.pointer_typedef_aliases.update(aliases)
+            except Exception:
+                pass
+
+        functions: dict[str, FunctionInfo] = {}
 
         for node in self._iter_nodes(tree.root_node):
             if node.type == "function_definition":
@@ -244,18 +374,31 @@ class CodeParser:
 
         return functions
 
+
     def parse_project(self, project_path: Path, preprocess: bool = False) -> dict[str, FunctionInfo]:
-        """Parse all C/C++ files in a project directory.
-        
-        Args:
-            project_path: Path to the project directory
-            preprocess: If True, preprocess files first to expand macros
-        """
-        functions = {}
+        functions: dict[str, FunctionInfo] = {}
+        self.pointer_typedef_aliases = set()
         extensions = {".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx"}
 
         project_path = project_path.resolve()
 
+        # Pass 1: collect pointer typedef aliases globally
+        for file_path in project_path.rglob("*"):
+            if file_path.suffix.lower() in extensions:
+                try:
+                    source = file_path.read_bytes()
+                except Exception:
+                    continue
+                parser = _get_cpp_parser() if file_path.suffix.lower() in {".cpp",".cc",".cxx",".hpp",".hxx"} else _get_c_parser()
+                tree = parser.parse(source)
+                try:
+                    self.pointer_typedef_aliases.update(
+                        self._collect_pointer_typedef_aliases(tree.root_node, source)
+                    )
+                except Exception:
+                    pass
+
+        # Pass 2: extract functions (no pointer filtering here; filtering is done uniformly in Phase 2a)
         for file_path in project_path.rglob("*"):
             if file_path.suffix.lower() in extensions:
                 try:
@@ -263,7 +406,11 @@ class CodeParser:
                 except ValueError:
                     rel_path = str(file_path)
 
-                file_funcs = self.parse_file(file_path, preprocess=preprocess)
+                file_funcs = self.parse_file(
+                    file_path,
+                    preprocess=preprocess,
+                    collect_typedefs=False,
+                )
                 for name, info in file_funcs.items():
                     info.file_path = rel_path
                     # Keep longer definition if duplicate
@@ -300,57 +447,52 @@ class CodeParser:
                     stack.append(child)
 
     def _extract_function(self, node, source: bytes, file_path: str) -> Optional[FunctionInfo]:
-        """Extract FunctionInfo from a function_definition node.
-
-        AST structure for function_definition:
-        - Zero or more: type specifiers, qualifiers (storage_class_specifier, type_qualifier, etc.)
-        - Return type: primitive_type, type_identifier, qualified_identifier, template_type, etc.
-        - Declarator: function_declarator, pointer_declarator (wrapping function_declarator), etc.
-        - Body: compound_statement
-        """
-        # Strategy: Find the declarator and body first, everything before declarator is return type
+        """Extract FunctionInfo from a function_definition node, with C++ trailing return type support."""
         declarator_node = None
         body_node = None
 
-        # Identify key children
         children = list(node.children)
         declarator_idx = -1
 
         for i, child in enumerate(children):
             if child.type == "compound_statement":
                 body_node = child
-            elif child.type in ("function_declarator", "pointer_declarator",
-                               "reference_declarator", "parenthesized_declarator"):
+            elif child.type in ("function_declarator", "pointer_declarator", "reference_declarator", "parenthesized_declarator"):
                 declarator_node = child
                 declarator_idx = i
             elif child.type == "ERROR":
-                # Skip error nodes
                 continue
 
         if not declarator_node:
             return None
 
-        # Extract return type: everything before the declarator (excluding body)
-        # Plus any pointer/reference symbols from the declarator
+        # Base return type: everything before declarator
         return_type = ""
         if declarator_idx > 0:
-            # Get text from start to declarator
             type_start = children[0].start_byte
             type_end = declarator_node.start_byte
-            return_type = source[type_start:type_end].decode().strip()
+            return_type = source[type_start:type_end].decode(errors="ignore").strip()
 
-        # Add pointer/reference from declarator (e.g., void* -> pointer is in declarator)
+        # Add pointer/reference from declarator wrapper (e.g., void* foo())
         ptr_ref_suffix = self._get_ptr_ref_from_declarator(declarator_node)
         if ptr_ref_suffix:
             return_type = return_type + ptr_ref_suffix
 
-        # Extract function name and parameters from declarator
-        name, arg_names, arg_types = self._parse_declarator(declarator_node, source)
+        # C++ trailing return type: auto f(...) -> T*
+        # tree-sitter-cpp typically uses node type "trailing_return_type"
+        for ch in children:
+            if ch.type == "trailing_return_type":
+                tr = source[ch.start_byte:ch.end_byte].decode(errors="ignore").strip()
+                if tr.startswith("->"):
+                    tr = tr[2:].strip()
+                if tr:
+                    return_type = tr
+                break
 
+        name, arg_names, arg_types = self._parse_declarator(declarator_node, source)
         if not name:
             return None
 
-        # Extract callees and return expressions from body
         callees = set()
         return_exprs = set()
 
@@ -365,8 +507,7 @@ class CodeParser:
                     if expr:
                         return_exprs.add(expr)
 
-        # Full function code
-        code = source[node.start_byte:node.end_byte].decode()
+        code = source[node.start_byte:node.end_byte].decode(errors="ignore")
 
         return FunctionInfo(
             name=name,
@@ -380,6 +521,7 @@ class CodeParser:
             callees=callees,
             return_expressions=return_exprs,
         )
+
 
     def _parse_declarator(self, node, source: bytes) -> tuple[str, list[str], list[str]]:
         """Parse declarator to extract function name and parameters.
@@ -493,14 +635,15 @@ class CodeParser:
 
         for child in node.children:
             if child.type == "identifier":
-                # Could be type or name, last one is usually name
+                # last identifier is usually the name (OK for most cases)
                 pname = source[child.start_byte:child.end_byte].decode()
                 name_node = child
-            elif child.type in ("pointer_declarator", "reference_declarator", "array_declarator"):
-                # Name is inside the declarator
-                pname = self._extract_name_from_declarator(child, source)
-                name_node = child
-                break
+            elif child.type in ("pointer_declarator", "reference_declarator", "array_declarator", "parenthesized_declarator", "function_declarator"):
+                cand = self._extract_declarator_name_only(child, source)
+                if cand:
+                    pname = cand
+                    name_node = child
+                    break
 
         # Type is everything except the name
         if pname and name_node:
@@ -523,12 +666,42 @@ class CodeParser:
 
         return ptype, pname
 
-    def _extract_name_from_declarator(self, node, source: bytes) -> str:
-        """Extract the identifier name from a declarator."""
-        for child in self._iter_nodes(node):
-            if child.type == "identifier":
-                return source[child.start_byte:child.end_byte].decode()
-        return ""
+
+    def _extract_declarator_name_only(self, decl_node, source: bytes) -> str:
+        """
+        Extract the name of the *declarator itself* by following the 'declarator' chain.
+        This avoids accidentally picking identifiers from parameter lists (function pointer typedef).
+        """
+        if decl_node is None:
+            return ""
+
+        cur = decl_node
+
+        # Walk down the declarator chain: pointer_declarator / reference_declarator / parenthesized_declarator
+        # / function_declarator / array_declarator / init_declarator ... until we hit an identifier-like node.
+        while True:
+            # Direct identifier nodes
+            if cur.type in ("identifier", "type_identifier", "field_identifier"):
+                return source[cur.start_byte:cur.end_byte].decode()
+
+            # Common declarator containers expose a 'declarator' field
+            next_decl = cur.child_by_field_name("declarator")
+            if next_decl is not None:
+                cur = next_decl
+                continue
+
+            # Some forms: function_declarator keeps name in its 'declarator' field,
+            # but if not available, scan ONLY its non-parameter children for first identifier-like.
+            if cur.type == "function_declarator":
+                for ch in cur.children:
+                    if ch.type == "parameter_list":
+                        continue
+                    if ch.type in ("identifier", "type_identifier", "field_identifier", "scoped_identifier"):
+                        return source[ch.start_byte:ch.end_byte].decode()
+                return ""
+
+            # Fallback: do NOT DFS the whole subtree (that reintroduces the bug).
+            return ""
 
     def _extract_type_from_param(self, param_node, name_node, source: bytes) -> str:
         """Extract the type portion from a parameter, excluding the name."""

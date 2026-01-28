@@ -11,6 +11,7 @@ Hint Types:
 import json
 import logging
 import os
+import re
 import time
 
 from tqdm import tqdm
@@ -278,11 +279,49 @@ class HintGenerator:
         self.function_costs: dict[str, dict] = {}  # function_name -> cost info
         self.total_cost: float = 0.0
         self.total_tokens: int = 0
+        # Provided by Pipeline (tree-sitter based): typedef alias names that are pointer types.
+        self.pointer_typedef_aliases: set[str] = set()
+
+    def set_pointer_typedef_aliases(self, aliases: set[str] | None) -> None:
+        self.pointer_typedef_aliases = set(aliases or set())
+
+    def _has_pointer_io(self, func: FunctionInfo) -> bool:
+        """Strict pointer-based IO filtering."""
+
+        # 1) direct pointer in signature
+        rt = func.return_type or ""
+        if "*" in rt:
+            return True
+
+        for t in func.arg_types or []:
+            if t and "*" in t:
+                return True
+
+        # 2) typedef-based pointer alias
+        alias = self.pointer_typedef_aliases
+
+        # return type is alias AND alias defined as pointer typedef
+        rt_token = (rt.split()[-1] if rt else None)
+        if rt_token in alias:
+            return True
+
+        # arg type is alias AND alias defined as pointer typedef
+        for t in func.arg_types or []:
+            if not t:
+                continue
+            token = t.split()[-1]
+            if token in alias:
+                return True
+
+        return False
+
 
     def generate_hints(
         self,
         functions: dict[str, FunctionInfo],
-        previous_conflicts: list[str] = None
+        previous_conflicts: list[str] = None,
+        macro_names: set[str] = None,
+        pointer_typedef_aliases: set[str] | None = None,
     ) -> HintSet:
         """Generate hints for all functions in codebase.
 
@@ -290,11 +329,15 @@ class HintGenerator:
             functions: Dict of function name -> FunctionInfo (includes converted macros)
             previous_conflicts: List of conflict messages from previous validation
                               (format: "REMOVED func_name.HintType.name: reason")
+            macro_names: Set of function names that are from macros (always included, not filtered)
 
         Returns:
             HintSet with all generated hints
         """
         hint_set = HintSet()
+        macro_names = macro_names or set()
+        if pointer_typedef_aliases is not None:
+            self.set_pointer_typedef_aliases(pointer_typedef_aliases)
 
         # Parse conflicts to map function names to their conflict reasons
         conflict_map = {}
@@ -313,11 +356,109 @@ class HintGenerator:
                                 conflict_map[func_name] = []
                             conflict_map[func_name].append(reason)
 
-        for func_name, func in tqdm(functions.items(), desc="Generating hints"):
-            # Skip main and test functions
-            if func_name in ("main", "_main", "wmain") or "test" in func_name.lower():
+        # Filter: only send pointer-related functions to the LLM to reduce tokens.
+        # Always include macros (they may expand to pointer operations).
+        # Additionally, skip entry/test-style functions (main/_main/wmain, *test*)
+        # up front so candidate count == actual LLM call count.
+        # Keep `functions` as the full codebase so context lookup still works.
+        candidate_functions: dict[str, FunctionInfo] = {}
+        filtered_entry_functions: list[str] = []   # main/_main/wmain or *test*
+        filtered_pointer_functions: list[str] = [] # no pointer IO and not macro
+        
+        for fn, f in functions.items():
+            # Skip main/test functions entirely for hint generation
+            if fn in ("main", "_main", "wmain") or "test" in fn.lower():
+                filtered_entry_functions.append(fn)
                 continue
 
+            if fn in macro_names or self._has_pointer_io(f):
+                candidate_functions[fn] = f
+            else:
+                filtered_pointer_functions.append(fn)
+
+        total_filtered = len(filtered_entry_functions) + len(filtered_pointer_functions)
+        if candidate_functions and total_filtered:
+            logger.info(
+                "LLM filter: %d/%d functions selected as LLM candidates; "
+                "skipping %d functions (entry/test: %d, non-pointer: %d)",
+                len(candidate_functions),
+                len(functions),
+                total_filtered,
+                len(filtered_entry_functions),
+                len(filtered_pointer_functions),
+            )
+            
+            # Debug: log all filtered and non-filtered functions
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Functions NOT filtered (will be sent to LLM):")
+                for fn in sorted(candidate_functions.keys()):
+                    reason = "macro" if fn in macro_names else "pointer/alloc/free related"
+                    logger.debug(f"  - {fn} ({reason})")
+                
+                if filtered_entry_functions:
+                    logger.debug("Functions FILTERED as entry/test (skipped):")
+                    for fn in sorted(filtered_entry_functions):
+                        logger.debug(f"  - {fn}")
+
+                if filtered_pointer_functions:
+                    logger.debug("Functions FILTERED as non-pointer IO (skipped):")
+                    for fn in sorted(filtered_pointer_functions):
+                        logger.debug(f"  - {fn}")
+
+        # ------------------------------------------------------------------
+        # Pre-estimate total LLM prompt tokens and input cost BEFORE calling LLM
+        # ------------------------------------------------------------------
+        if self.llm and candidate_functions:
+            est_prompt_tokens = 0
+            est_calls = 0
+
+            for func_name, func in candidate_functions.items():
+                # Build approximate prompt text (same structure as _llm_hints)
+                context_parts = []
+                for callee in list(func.callees)[:5]:
+                    if callee in functions:
+                        callee_code = functions[callee].code
+                        context_parts.append(f"// Called function:\n{callee_code}")
+                context = "\n\n".join(context_parts) if context_parts else ""
+                context_str = f"Context (called functions):\n{context}" if context else ""
+
+                func_conflicts = conflict_map.get(func_name, [])
+                conflict_feedback = ""
+                if func_conflicts:
+                    conflict_feedback = (
+                        "## Z3 Validation Feedback\n\n"
+                        "The following hints were rejected by Z3:\n"
+                        + "\n".join(f"- {c}" for c in func_conflicts)
+                    )
+
+                params = list(zip(func.arg_types, func.arg_names))
+                params_str = ", ".join(f"{t} {n}" for t, n in params) if params else "void"
+
+                prompt = HINT_GENERATION_PROMPT.format(
+                    func_name=func.name,
+                    return_type=func.return_type or "void",
+                    parameters=params_str,
+                    code=func.code,
+                    context=context_str + conflict_feedback,
+                )
+
+                # Rough token estimate: ~4 characters per token
+                est_tokens_this = max(1, len(prompt) // 4)
+                est_prompt_tokens += est_tokens_this
+                est_calls += 1
+
+            if est_calls > 0:
+                ppm = getattr(self.llm, "input_price_per_million", 0.0) or 0.0
+                est_input_cost = (est_prompt_tokens / 1_000_000) * ppm
+                logger.info(
+                    "LLM pre-estimate: about %d prompt tokens across %d call(s), "
+                    "estimated input cost ≈ $%.4f (excluding completion tokens)",
+                    est_prompt_tokens,
+                    est_calls,
+                    est_input_cost,
+                )
+
+        for func_name, func in tqdm(candidate_functions.items(), desc="Generating hints"):
             # Get conflicts for this function if any
             func_conflicts = conflict_map.get(func_name, [])
             hints = self._generate_for_function(func, functions, func_conflicts)
@@ -331,7 +472,9 @@ class HintGenerator:
         self,
         functions: dict[str, FunctionInfo],
         conflict_functions: set[str],
-        previous_conflicts: list[str] = None
+        previous_conflicts: list[str] = None,
+        macro_names: set[str] = None,
+        pointer_typedef_aliases: set[str] | None = None,
     ) -> HintSet:
         """Regenerate hints only for functions that had conflicts.
 
@@ -340,11 +483,15 @@ class HintGenerator:
             conflict_functions: Set of function names that had conflicts
             previous_conflicts: List of conflict messages from previous validation
                               (format: "REMOVED func_name.HintType.name: reason")
+            macro_names: Set of function names that are from macros (always included, not filtered)
 
         Returns:
             HintSet with regenerated hints for conflict functions only
         """
         hint_set = HintSet()
+        macro_names = macro_names or set()
+        if pointer_typedef_aliases is not None:
+            self.set_pointer_typedef_aliases(pointer_typedef_aliases)
 
         # Parse conflicts to map function names to their conflict reasons
         conflict_map = {}
@@ -363,21 +510,87 @@ class HintGenerator:
                                 conflict_map[func_name] = []
                             conflict_map[func_name].append(reason)
 
-        # Only process conflict functions
+        # Pre-estimate tokens/cost for regeneration subset
+        if self.llm and conflict_functions:
+            est_prompt_tokens = 0
+            est_calls = 0
+
+            for func_name in conflict_functions:
+                if func_name not in functions:
+                    continue
+
+                func = functions[func_name]
+                # Respect pointer IO filter for non-macros (same as actual loop)
+                if func_name not in macro_names and not self._has_pointer_io(func):
+                    continue
+
+                context_parts = []
+                for callee in list(func.callees)[:5]:
+                    if callee in functions:
+                        callee_code = functions[callee].code
+                        context_parts.append(f"// Called function:\n{callee_code}")
+                context = "\n\n".join(context_parts) if context_parts else ""
+                context_str = f"Context (called functions):\n{context}" if context else ""
+
+                func_conflicts = conflict_map.get(func_name, [])
+                conflict_feedback = ""
+                if func_conflicts:
+                    conflict_feedback = (
+                        "## Z3 Validation Feedback\n\n"
+                        "The following hints were rejected by Z3:\n"
+                        + "\n".join(f"- {c}" for c in func_conflicts)
+                    )
+
+                params = list(zip(func.arg_types, func.arg_names))
+                params_str = ", ".join(f"{t} {n}" for t, n in params) if params else "void"
+
+                prompt = HINT_GENERATION_PROMPT.format(
+                    func_name=func.name,
+                    return_type=func.return_type or "void",
+                    parameters=params_str,
+                    code=func.code,
+                    context=context_str + conflict_feedback,
+                )
+
+                est_tokens_this = max(1, len(prompt) // 4)
+                est_prompt_tokens += est_tokens_this
+                est_calls += 1
+
+            if est_calls > 0:
+                ppm = getattr(self.llm, "input_price_per_million", 0.0) or 0.0
+                est_input_cost = (est_prompt_tokens / 1_000_000) * ppm
+                logger.info(
+                    "LLM pre-estimate (regeneration): about %d prompt tokens across %d call(s), "
+                    "estimated input cost ≈ $%.4f (excluding completion tokens)",
+                    est_prompt_tokens,
+                    est_calls,
+                    est_input_cost,
+                )
+
+        # Only process conflict functions (all of these have already passed the initial LLM filter)
+        filtered_conflict_funcs = []
         for func_name in conflict_functions:
             if func_name not in functions:
                 continue
-            # Skip main and test functions
-            if func_name in ("main", "_main", "wmain") or "test" in func_name.lower():
-                continue
 
             func = functions[func_name]
+            # Always include macros. For regular functions, apply pointer-only filter.
+            if func_name not in macro_names and not self._has_pointer_io(func):
+                filtered_conflict_funcs.append(func_name)
+                continue
+            
             # Get conflicts for this function if any
             func_conflicts = conflict_map.get(func_name, [])
             hints = self._generate_for_function(func, functions, func_conflicts)
 
             for hint in hints:
                 hint_set.add(hint)
+        
+        # Debug: log filtered conflict functions
+        if filtered_conflict_funcs and logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Conflict functions FILTERED during regeneration (skipped):")
+            for fn in sorted(filtered_conflict_funcs):
+                logger.debug(f"  - {fn}")
 
         return hint_set
 
@@ -506,13 +719,6 @@ The rejected hints are inconsistent with the code structure. Please:
         Returns:
             dict with total costs, per-function costs, and per-hint costs
         """
-        # Calculate per-hint costs (distribute function cost evenly across hints)
-        hint_costs = {}
-        for func_name, cost_info in self.function_costs.items():
-            # We'll need to count hints per function from the HintSet
-            # For now, we'll return per-function costs and let Pipeline calculate per-hint
-            pass
-        
         return {
             "total_cost": self.total_cost,
             "total_tokens": self.total_tokens,
