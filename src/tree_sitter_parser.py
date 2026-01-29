@@ -894,23 +894,6 @@ def extract_functions(source: str | bytes | Path, is_cpp: bool = True, preproces
         return extractor.parse_source(source, is_cpp=is_cpp)
 
 
-def extract_functions_and_macros(source: Path, preprocess: bool = False) -> tuple[dict[str, FunctionInfo], dict[str, MacroInfo]]:
-    """Extract both functions and macros from a file.
-
-    Args:
-        source: Path to the source file
-        preprocess: If True, preprocess the file first (macros will be expanded and not extractable)
-
-    Returns:
-        Tuple of (functions dict, macros dict)
-    """
-    extractor = CodeParser()
-    if isinstance(source, Path):
-        return extractor.parse_file_with_macros(source, preprocess=preprocess)
-    else:
-        raise ValueError("extract_functions_and_macros only accepts Path objects")
-
-
 # =============================================================================
 # Main - for testing
 # =============================================================================
