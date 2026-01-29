@@ -281,6 +281,8 @@ class HintGenerator:
         self.total_tokens: int = 0
         # Provided by Pipeline (tree-sitter based): typedef alias names that are pointer types.
         self.pointer_typedef_aliases: set[str] = set()
+        # Snapshot of last filtering decision for external consumers (e.g., Pipeline)
+        self.last_filter_classes: dict[str, list[str]] | None = None
 
     def set_pointer_typedef_aliases(self, aliases: set[str] | None) -> None:
         self.pointer_typedef_aliases = set(aliases or set())
@@ -375,6 +377,13 @@ class HintGenerator:
                 candidate_functions[fn] = f
             else:
                 filtered_pointer_functions.append(fn)
+
+        # Persist filter snapshot for external reporting (Pipeline will use this)
+        self.last_filter_classes = {
+            "kept": sorted(candidate_functions.keys()),
+            "filtered_entry": sorted(filtered_entry_functions),
+            "filtered_non_pointer": sorted(filtered_pointer_functions),
+        }
 
         total_filtered = len(filtered_entry_functions) + len(filtered_pointer_functions)
         if candidate_functions and total_filtered:

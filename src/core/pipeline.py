@@ -90,6 +90,94 @@ class Pipeline:
         self.hints = HintSet()
         self.conflicts: list[str] = []
         self.validated_hints_count: int = 0  # Track number of hints that passed Z3 validation
+        # Track function/macro replacements due to duplicate names (for later analysis/LLM reuse)
+        self.function_replacements: list[dict] = []
+
+    def _serialize_function_for_llm(self, name: str, is_macro: bool) -> dict | None:
+        """Serialize a function into a JSON-friendly dict for LLM reuse."""
+        func = self.functions.get(name)
+        if not func:
+            return None
+        return {
+            "name": func.name,
+            "file_path": getattr(func, "file_path", ""),
+            "start_line": getattr(func, "start_line", 0),
+            "end_line": getattr(func, "end_line", 0),
+            "arg_names": getattr(func, "arg_names", []),
+            "arg_types": getattr(func, "arg_types", []),
+            "return_type": getattr(func, "return_type", ""),
+            "is_macro": is_macro,
+            "code": getattr(func, "code", ""),
+        }
+
+    def _compute_llm_filter_classes(self, pointer_typedef_aliases: set[str]) -> dict[str, list[str]]:
+        """Compute (kept/filtered) classes without calling the LLM."""
+        self.hint_generator.set_pointer_typedef_aliases(pointer_typedef_aliases)
+
+        kept: list[str] = []
+        filtered_entry: list[str] = []
+        filtered_non_pointer: list[str] = []
+
+        for fn, f in self.functions.items():
+            # Match HintGenerator.generate_hints() filtering behavior
+            if fn in ("main", "_main", "wmain") or "test" in fn.lower():
+                filtered_entry.append(fn)
+                continue
+
+            if fn in self.macro_names or self.hint_generator._has_pointer_io(f):
+                kept.append(fn)
+            else:
+                filtered_non_pointer.append(fn)
+
+        return {
+            "kept": sorted(kept),
+            "filtered_entry": sorted(filtered_entry),
+            "filtered_non_pointer": sorted(filtered_non_pointer),
+        }
+
+    def _export_llm_filter_metadata(self, output_dir: Path, classes: dict[str, list[str]] | None = None) -> None:
+        """Export LLM filter info (kept/filtered/replaced functions) to JSON for later reuse."""
+        if classes is None:
+            classes = getattr(self.hint_generator, "last_filter_classes", None)
+        if not classes:
+            return
+
+        kept_names = classes.get("kept", []) or []
+        filtered_entry = classes.get("filtered_entry", []) or []
+        filtered_nonptr = classes.get("filtered_non_pointer", []) or []
+
+        kept = []
+        for name in kept_names:
+            is_macro = name in self.macro_names
+            meta = self._serialize_function_for_llm(name, is_macro)
+            if meta:
+                kept.append(meta)
+
+        filtered_entry_detail = []
+        for name in filtered_entry:
+            is_macro = name in self.macro_names
+            meta = self._serialize_function_for_llm(name, is_macro)
+            if meta:
+                filtered_entry_detail.append(meta)
+
+        filtered_nonptr_detail = []
+        for name in filtered_nonptr:
+            is_macro = name in self.macro_names
+            meta = self._serialize_function_for_llm(name, is_macro)
+            if meta:
+                filtered_nonptr_detail.append(meta)
+
+        data = {
+            "total_functions": len(self.functions),
+            "macro_names": sorted(self.macro_names),
+            "kept_for_llm": kept,
+            "filtered_entry_or_test": filtered_entry_detail,
+            "filtered_non_pointer": filtered_nonptr_detail,
+            "replacements": self.function_replacements,
+        }
+
+        out_path = output_dir / "llm_filter_functions.json"
+        out_path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
     def analyze(
         self,
@@ -159,7 +247,7 @@ class Pipeline:
         self.functions = {}
         self.macro_names = set()
         for src in target_files:
-            logger.info(f"    Parsing {src}")
+            logger.debug(f"    Parsing {src}")
             file_functions, file_macros = self.parser.parse_file_with_macros(src, preprocess=False)
 
             # Merge functions: if duplicates exist, keep the one with longer code (more context)
@@ -175,6 +263,31 @@ class Pipeline:
                                 func_name,
                                 src,
                             )
+                        # Record replacement detail for later analysis / LLM reuse
+                        self.function_replacements.append({
+                            "name": func_name,
+                            "kept": {
+                                "name": info.name,
+                                "file_path": info.file_path,
+                                "start_line": info.start_line,
+                                "end_line": info.end_line,
+                                "arg_names": info.arg_names,
+                                "arg_types": info.arg_types,
+                                "return_type": info.return_type,
+                                "is_macro": False,
+                            },
+                            "discarded": {
+                                "name": existing.name,
+                                "file_path": existing.file_path,
+                                "start_line": existing.start_line,
+                                "end_line": existing.end_line,
+                                "arg_names": existing.arg_names,
+                                "arg_types": existing.arg_types,
+                                "return_type": existing.return_type,
+                                "is_macro": False,
+                            },
+                            "reason": "longer_code",
+                        })
                         self.functions[func_name] = info
                     else:
                         if logger.isEnabledFor(logging.DEBUG):
@@ -183,6 +296,31 @@ class Pipeline:
                                 func_name,
                                 existing.file_path,
                             )
+                        # Record that the new definition was discarded
+                        self.function_replacements.append({
+                            "name": func_name,
+                            "kept": {
+                                "name": existing.name,
+                                "file_path": existing.file_path,
+                                "start_line": existing.start_line,
+                                "end_line": existing.end_line,
+                                "arg_names": existing.arg_names,
+                                "arg_types": existing.arg_types,
+                                "return_type": existing.return_type,
+                                "is_macro": False,
+                            },
+                            "discarded": {
+                                "name": info.name,
+                                "file_path": info.file_path,
+                                "start_line": info.start_line,
+                                "end_line": info.end_line,
+                                "arg_names": info.arg_names,
+                                "arg_types": info.arg_types,
+                                "return_type": info.return_type,
+                                "is_macro": False,
+                            },
+                            "reason": "duplicate_function_kept_existing",
+                        })
                     continue
                 self.functions[func_name] = info
 
@@ -217,6 +355,30 @@ class Pipeline:
                                 macro_name,
                                 src,
                             )
+                        self.function_replacements.append({
+                            "name": macro_name,
+                            "kept": {
+                                "name": func_info.name,
+                                "file_path": func_info.file_path,
+                                "start_line": func_info.start_line,
+                                "end_line": func_info.end_line,
+                                "arg_names": func_info.arg_names,
+                                "arg_types": func_info.arg_types,
+                                "return_type": func_info.return_type,
+                                "is_macro": True,
+                            },
+                            "discarded": {
+                                "name": existing.name,
+                                "file_path": existing.file_path,
+                                "start_line": existing.start_line,
+                                "end_line": existing.end_line,
+                                "arg_names": existing.arg_names,
+                                "arg_types": existing.arg_types,
+                                "return_type": existing.return_type,
+                                "is_macro": True,
+                            },
+                            "reason": "longer_code",
+                        })
                         self.functions[macro_name] = func_info
                     else:
                         if logger.isEnabledFor(logging.DEBUG):
@@ -225,6 +387,30 @@ class Pipeline:
                                 macro_name,
                                 existing.file_path,
                             )
+                        self.function_replacements.append({
+                            "name": macro_name,
+                            "kept": {
+                                "name": existing.name,
+                                "file_path": existing.file_path,
+                                "start_line": existing.start_line,
+                                "end_line": existing.end_line,
+                                "arg_names": existing.arg_names,
+                                "arg_types": existing.arg_types,
+                                "return_type": existing.return_type,
+                                "is_macro": True,
+                            },
+                            "discarded": {
+                                "name": func_info.name,
+                                "file_path": func_info.file_path,
+                                "start_line": func_info.start_line,
+                                "end_line": func_info.end_line,
+                                "arg_names": func_info.arg_names,
+                                "arg_types": func_info.arg_types,
+                                "return_type": func_info.return_type,
+                                "is_macro": True,
+                            },
+                            "reason": "duplicate_macro_kept_existing",
+                        })
                     # Regardless, it is still a macro name
                     self.macro_names.add(macro_name)
                     continue
@@ -262,6 +448,20 @@ class Pipeline:
                 iterations=0,
                 spurious_filtered=0,
             )
+
+        # Export filter+replacement metadata right after parsing (so you can reuse it without running the full pipeline)
+        try:
+            pointer_typedef_aliases = getattr(self.parser, "pointer_typedef_aliases", set())  # type: ignore[attr-defined]
+            classes = self._compute_llm_filter_classes(pointer_typedef_aliases)
+            self._export_llm_filter_metadata(output_dir, classes=classes)
+            logger.info(
+                "Wrote LLM filter metadata JSON: kept=%d, filtered_entry/test=%d, filtered_non_pointer=%d",
+                len(classes.get("kept", [])),
+                len(classes.get("filtered_entry", [])),
+                len(classes.get("filtered_non_pointer", [])),
+            )
+        except Exception as e:
+            logger.warning(f"  Warning: failed to export LLM filter metadata after parsing: {e}")
 
         if self.skip_hint_injection:
             logger.info("Hint injection disabled: skipping hint generation/validation (phases 2-3).")
