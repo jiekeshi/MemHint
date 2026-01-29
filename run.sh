@@ -7,8 +7,7 @@ CPP_QUERIES_DIR="/home/huihuihuang/Hint/codeql/qlpacks/codeql/cpp-queries"
 # - Or set RUN_ALL=false and list desired case names in RUN_CASES.
 #   Example: RUN_CASES=("redis" "zstd_issue4112")
 RUN_ALL=false
-RUN_CASES=("redis")
-
+RUN_CASES=("redis-8_6-rc1")
 # MODE options:
 #   single_with_hints  - use --single-source hints✅ enhanced query✅
 #   full_with_hints    - analyze full project with hints✅ enhanced query✅
@@ -127,7 +126,7 @@ run_case() {
     local output_path="$2"
     shift 2
 
-    python main.py --debug --no-reuse-db --project "$project_path" --output "$output_path" \
+    python main.py --no-reuse-db --project "$project_path" --output "$output_path" \
         --cpp-queries-dir "$CPP_QUERIES_DIR" \
         $SKIP_HINTS_FLAG \
         $ENHANCED_QUERIES_FLAG \
@@ -148,7 +147,6 @@ if [ "$USE_SINGLE_SOURCE" = true ]; then
 else
   run_case "$PROJECT_PATH" "$OUTPUT_PATH" \
     --source-root "/home/huihuihuang/Hint/cloned_proj/redis/src"
-
 fi
 fi
 
@@ -410,3 +408,18 @@ fi
 fi
 
 
+##########
+# Redis-8.6-rc1 #
+##########
+if should_run "redis-8_6-rc1"; then
+PROJECT_PATH=/home/huihuihuang/Hint/cloned_proj_test/redis-8_6-rc1
+BASE_OUTPUT="/home/huihuihuang/Hint/output/cloned_proj_test/redis-8_6-rc1/output"
+OUTPUT_PATH=$(adjust_output_path "$BASE_OUTPUT")
+prepare_hints_from_single "$BASE_OUTPUT" "$OUTPUT_PATH"
+if [ "$USE_SINGLE_SOURCE" = true ]; then
+  echo "Not supported"
+else
+  run_case "$PROJECT_PATH" "$OUTPUT_PATH" \
+    --source-root "/home/huihuihuang/Hint/cloned_proj_test/redis-8_6-rc1/src"
+fi
+fi

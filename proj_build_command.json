@@ -276,5 +276,17 @@
             "command": "gcc -o main_micro main_micro.cpp -Wall -Wextra",
             "can_error": false
         }
+    },
+    "redis-8_6-rc1": {
+        "prepare_for_build": [
+            {
+                "command": "make clean",
+                "can_error": true
+            }
+        ],
+        "build_command": {
+            "command": "make",
+            "can_error": false
+        }
     }
 }
