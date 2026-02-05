@@ -43,6 +43,9 @@ logger = logging.getLogger(__name__)
 
 C_LANGUAGE = Language(tsc.language())
 
+_ASSIGN_RE = re.compile(r"^\s*(?P<lhs>.+?)\s*=\s*(?P<rhs>.+?);?\s*$")
+_RETURN_RE = re.compile(r"^\s*return\s+(?P<expr>.+?);?\s*$")
+
 
 # =============================================================================
 # CFG Data Structures
@@ -62,12 +65,12 @@ class NodeType(Enum):
 
 @dataclass
 class CFGNode:
-    """Control Flow Graph node."""
     id: int
     node_type: NodeType
     line: int
     code: str
-    variable: str = ""
+    variable: str = ""   # keep for legacy / leak checks 
+    obj: str = ""        # NEW: full expression identity for DF/UAF (e.g., acl_args[i], p->x)
     condition: str = ""
     successors: list[int] = field(default_factory=list)
     predecessors: list[int] = field(default_factory=list)
@@ -102,28 +105,52 @@ class CallGraphBuilder:
     def __init__(self):
         self.parser = Parser(C_LANGUAGE)
 
-    def build(self, functions: dict[str, FunctionInfo]) -> CallGraph:
-        """Build call graph from all functions."""
+    def build(self, functions) -> CallGraph:
+        """Build call graph from all functions.
+
+        Robust: functions[name] can be FunctionInfo-like OR dict-like.
+        """
         cg = CallGraph()
 
         for func_name, func_info in functions.items():
+            # Skip obviously wrong entries early
+            if func_info is None:
+                continue
             self._extract_calls(func_name, func_info, cg)
 
         return cg
 
-    def _extract_calls(self, func_name: str, func_info: FunctionInfo, cg: CallGraph):
-        """Extract all call sites from a function."""
-        tree = self.parser.parse(func_info.code.encode())
-        source = func_info.code.encode()
+
+
+
+    def _extract_calls(self, func_name: str, func_info, cg: CallGraph):
+        """Extract all call sites from a function.
+
+        Accepts:
+        - FunctionInfo-like objects with .code / .arg_names
+        - dict-like objects with ["code"] / ["arg_names"]
+        """
+        # --- robust read code ---
+        if isinstance(func_info, dict):
+            code = func_info.get("code", "") or ""
+        else:
+            code = getattr(func_info, "code", "") or ""
+
+        if not isinstance(code, str):
+            code = str(code)
+
+        src_bytes = code.encode("utf-8", errors="ignore")
+        tree = self.parser.parse(src_bytes)
 
         for node in self._walk(tree.root_node):
             if node.type == "call_expression":
-                callsite = self._process_call(func_name, func_info, node, source)
+                callsite = self._process_call(func_name, func_info, node, src_bytes)
                 if callsite:
                     cg.callsites[func_name].append(callsite)
                     if not callsite.is_indirect:
                         cg.callers[callsite.callee].add(func_name)
                         cg.callees[func_name].add(callsite.callee)
+
 
     def _walk(self, node):
         yield node
@@ -133,40 +160,42 @@ class CallGraphBuilder:
     def _process_call(
         self,
         caller: str,
-        caller_info: FunctionInfo,
+        caller_info,
         node,
         source: bytes
     ) -> Optional[CallSite]:
-        """Process a call expression into a CallSite."""
         func_node = node.child_by_field_name("function")
         if not func_node:
             return None
 
-        callee = source[func_node.start_byte:func_node.end_byte].decode()
+        callee = source[func_node.start_byte:func_node.end_byte].decode(errors="ignore").strip()
         line = node.start_point[0] + 1
 
-        # Check if indirect call (function pointer)
         is_indirect = func_node.type != "identifier"
 
-        arg_mapping = {}
-        arg_expressions = {}
+        # robust arg_names
+        if isinstance(caller_info, dict):
+            arg_names = caller_info.get("arg_names", []) or []
+        else:
+            arg_names = getattr(caller_info, "arg_names", []) or []
+
+        arg_mapping: dict[int, int] = {}
+        arg_expressions: dict[int, str] = {}
 
         args_node = node.child_by_field_name("arguments")
         if args_node:
             arg_idx = 0
             for child in args_node.children:
-                if child.type in ("identifier", "pointer_expression", "cast_expression",
-                                  "number_literal", "string_literal", "call_expression"):
-                    expr = source[child.start_byte:child.end_byte].decode()
+                if child.type in (
+                    "identifier", "pointer_expression", "cast_expression",
+                    "number_literal", "string_literal", "call_expression",
+                    "subscript_expression", "field_expression", "parenthesized_expression"
+                ):
+                    expr = source[child.start_byte:child.end_byte].decode(errors="ignore").strip()
                     arg_expressions[arg_idx] = expr
 
-                    if child.type == "identifier":
-                        param_name = expr
-                        if param_name in caller_info.arg_names:
-                            caller_arg_idx = caller_info.arg_names.index(param_name)
-                            arg_mapping[arg_idx] = caller_arg_idx
-                        else:
-                            arg_mapping[arg_idx] = -1
+                    if child.type == "identifier" and expr in arg_names:
+                        arg_mapping[arg_idx] = arg_names.index(expr)
                     else:
                         arg_mapping[arg_idx] = -1
 
@@ -324,6 +353,7 @@ class TransitiveAnalyzer:
         "g_free",
         "kfree", "vfree", "kfree_sensitive",
         "xfree",
+        "sdsfree", "zfree", "decrRefCount",
     }
 
     def __init__(self, call_graph: CallGraph, functions: dict[str, FunctionInfo]):
@@ -519,9 +549,9 @@ class TransitiveAnalyzer:
                     if our_arg_idx >= 0:
                         return (True, our_arg_idx, result_chain)
 
-                for callee_arg, our_arg in callsite.arg_mapping.items():
-                    if our_arg >= 0:
-                        return (True, our_arg, result_chain)
+                # Don't guess. Many functions free internal fields / owned containers.
+                # If we can't map the freed argument precisely, treat as unknown.
+                continue
 
         return (False, -1, [])
 
@@ -636,41 +666,177 @@ class CFGBuilder:
         self,
         alloc_funcs: set[str] = None,
         free_funcs: set[str] = None,
+        alloc_out_params: dict[str, int] = None,
     ):
         self.parser = Parser(C_LANGUAGE)
         self.alloc_funcs = alloc_funcs or {"malloc", "calloc", "realloc", "strdup"}
         self.free_funcs = free_funcs or {"free"}
+        # func_name -> out param index (e.g., posix_memalign style)
+        self.alloc_out_params = alloc_out_params or {}
+
 
     def build(self, code: str) -> dict[int, CFGNode]:
-        """Build CFG from function code."""
+        """Build CFG from function code.
+
+        Fixes:
+        - Real if/else control-flow edges (not a linear chain)
+        - Emits RETURN nodes as exits
+        - Keeps predecessors/successors consistent
+        """
         tree = self.parser.parse(code.encode())
         source = code.encode()
 
         nodes: dict[int, CFGNode] = {}
         node_id = 0
 
-        nodes[node_id] = CFGNode(
-            id=node_id, node_type=NodeType.ENTRY, line=0, code="entry"
-        )
-        prev_id = node_id
-        node_id += 1
+        def new_node(
+            nt: NodeType,
+            line: int,
+            code_txt: str,
+            variable: str = "",
+            obj: str = "",
+            condition: str = ""
+        ) -> int:
+            nonlocal node_id
+            nid = node_id
+            nodes[nid] = CFGNode(
+                id=nid,
+                node_type=nt,
+                line=line,
+                code=code_txt,
+                variable=variable,
+                obj=obj,
+                condition=condition,
+                successors=[],
+                predecessors=[],
+            )
+            node_id += 1
+            return nid
 
-        for node in self._walk(tree.root_node):
-            cfg_node = self._process_node(node, source, node_id)
-            if cfg_node:
-                nodes[node_id] = cfg_node
-                nodes[prev_id].successors.append(node_id)
-                cfg_node.predecessors.append(prev_id)
-                prev_id = node_id
-                node_id += 1
 
-        nodes[node_id] = CFGNode(
-            id=node_id, node_type=NodeType.EXIT, line=0, code="exit"
-        )
-        nodes[prev_id].successors.append(node_id)
-        nodes[node_id].predecessors.append(prev_id)
+        def add_edge(a: int, b: int):
+            if b not in nodes[a].successors:
+                nodes[a].successors.append(b)
+            if a not in nodes[b].predecessors:
+                nodes[b].predecessors.append(a)
+
+        entry_id = new_node(NodeType.ENTRY, 0, "entry")
+
+        # Build CFG only from the function body (compound_statement) to avoid noise.
+        body = None
+        for ch in tree.root_node.children:
+            if ch.type == "function_definition":
+                for c2 in ch.children:
+                    if c2.type == "compound_statement":
+                        body = c2
+                        break
+                break
+        if body is None:
+            # Fallback: walk whole tree if we couldn't find a body
+            body = tree.root_node
+
+        exit_id = new_node(NodeType.EXIT, 0, "exit")
+
+        def build_stmt_list(stmt_list_node, in_id: int) -> int:
+            """Build sequential CFG for a list of statements.
+            Returns the 'tail' node id after the list.
+            """
+            cur = in_id
+            for st in stmt_list_node.children:
+                if st.type in ("{", "}"):
+                    continue
+                cur = build_stmt(st, cur)
+            return cur
+
+        def build_stmt(st_node, in_id: int) -> int:
+            """Build CFG for a statement; returns the tail node id."""
+            # if-statement: create BRANCH and split edges
+            if st_node.type == "if_statement":
+                return build_if(st_node, in_id)
+
+            # return-statement: create RETURN node and edge to EXIT
+            if st_node.type == "return_statement":
+                rid = new_node(
+                    NodeType.RETURN,
+                    st_node.start_point[0] + 1,
+                    source[st_node.start_byte:st_node.end_byte].decode(errors="ignore"),
+                )
+                add_edge(in_id, rid)
+                add_edge(rid, exit_id)
+                return rid
+
+            # expression_statement: may contain call_expression / deref / etc.
+            # We'll scan inside it and emit nodes for interesting operations
+            tail = in_id
+            created_any = False
+            for n in self._walk(st_node):
+                cfg_n = self._process_node(n, source, node_id)
+                if cfg_n:
+                    # materialize the node into `nodes` with a fresh id
+                    nid = new_node(cfg_n.node_type, cfg_n.line, cfg_n.code, cfg_n.variable, cfg_n.obj, cfg_n.condition)
+                    add_edge(tail, nid)
+                    tail = nid
+                    created_any = True
+
+            if created_any:
+                return tail
+
+            # default: ignore, keep flow
+            return in_id
+
+        def build_if(if_node, in_id: int) -> int:
+            """Build CFG for if/else with proper join."""
+            cond = if_node.child_by_field_name("condition")
+            then_part = if_node.child_by_field_name("consequence")
+            else_part = if_node.child_by_field_name("alternative")
+
+            cond_txt = ""
+            if cond is not None:
+                cond_txt = source[cond.start_byte:cond.end_byte].decode(errors="ignore")
+
+            bid = new_node(
+                NodeType.BRANCH,
+                if_node.start_point[0] + 1,
+                source[if_node.start_byte:if_node.end_byte].decode(errors="ignore")[:80],
+                condition=cond_txt,
+            )
+            add_edge(in_id, bid)
+
+            join_id = new_node(NodeType.ASSIGN, if_node.end_point[0] + 1, "join")  # generic join node
+
+            # THEN branch
+            then_tail = bid
+            if then_part is not None:
+                if then_part.type == "compound_statement":
+                    then_tail = build_stmt_list(then_part, bid)
+                else:
+                    then_tail = build_stmt(then_part, bid)
+            add_edge(then_tail, join_id)
+
+            # ELSE branch
+            else_tail = bid
+            if else_part is not None:
+                if else_part.type == "compound_statement":
+                    else_tail = build_stmt_list(else_part, bid)
+                else:
+                    else_tail = build_stmt(else_part, bid)
+            add_edge(else_tail, join_id)
+
+            return join_id
+
+        # Build the body statements starting from entry
+        tail = entry_id
+        if body.type == "compound_statement":
+            tail = build_stmt_list(body, entry_id)
+        else:
+            tail = build_stmt(body, entry_id)
+
+        # If the last statement didn't return, connect to EXIT
+        if exit_id not in nodes[tail].successors:
+            add_edge(tail, exit_id)
 
         return nodes
+
 
     def _walk(self, node):
         yield node
@@ -684,46 +850,221 @@ class CFGBuilder:
             return self._process_if(node, source, node_id)
         elif node.type == "return_statement":
             return self._process_return(node, source, node_id)
+        elif node.type in ("pointer_expression", "subscript_expression", "field_expression"):
+            return self._process_deref(node, source, node_id)
         return None
+
+    def _process_deref(self, node, source: bytes, node_id: int) -> Optional[CFGNode]:
+        """Create a DEREF node when we see obvious pointer/array/member dereference.
+
+        We only handle easy cases:
+        *p
+        p[i]
+        p->field / p.field  (field_expression)
+        and extract the base identifier as node.variable.
+        """
+        line = node.start_point[0] + 1
+        code = source[node.start_byte:node.end_byte].decode(errors="ignore")
+
+        var = ""
+
+        # pointer_expression: '*' <argument>
+        if node.type == "pointer_expression":
+            arg = node.child_by_field_name("argument")
+            if arg and arg.type == "identifier":
+                var = source[arg.start_byte:arg.end_byte].decode(errors="ignore")
+
+        # subscript_expression: <argument> '[' <index> ']'
+        elif node.type == "subscript_expression":
+            arg = node.child_by_field_name("argument")
+            if arg and arg.type == "identifier":
+                var = source[arg.start_byte:arg.end_byte].decode(errors="ignore")
+
+        # field_expression: <argument> ('.'|'->') <field>
+        elif node.type == "field_expression":
+            arg = node.child_by_field_name("argument")
+            if arg:
+                # common easy case: identifier
+                if arg.type == "identifier":
+                    var = source[arg.start_byte:arg.end_byte].decode(errors="ignore")
+                # or parenthesized: (p)->x
+                elif arg.type == "parenthesized_expression":
+                    for ch in arg.children:
+                        if ch.type == "identifier":
+                            var = source[ch.start_byte:ch.end_byte].decode(errors="ignore")
+                            break
+
+        
+        
+        return CFGNode(
+            id=node_id,
+            node_type=NodeType.DEREF,
+            line=line,
+            code=code,
+            variable=var,
+            obj=code.strip(),  # full deref expr like p->x, p[i], *p
+        )
+
+
+    
+    def _extract_base_identifier(self, node, source: bytes) -> str:
+        """Best-effort: extract the base identifier used as a pointer.
+
+        Examples:
+        *p            -> p
+        p->x          -> p
+        p.x           -> p
+        p[i]          -> p
+        (*p)->x       -> p
+        (p)->x        -> p
+        """
+        cur = node
+
+        # Unwrap parentheses / casts
+        while cur is not None and cur.type in ("parenthesized_expression", "cast_expression"):
+            inner = cur.child_by_field_name("value") or cur.child_by_field_name("expression")
+            if inner is None and cur.children:
+                inner = cur.children[-1]
+            cur = inner
+
+        if cur is None:
+            return ""
+
+        # pointer_expression: *expr
+        if cur.type == "pointer_expression":
+            arg = cur.child_by_field_name("argument")
+            if arg is None and cur.children:
+                arg = cur.children[-1]
+            return self._extract_base_identifier(arg, source)
+
+        # field_expression: obj.field or obj->field
+        if cur.type == "field_expression":
+            obj = cur.child_by_field_name("argument")
+            if obj is None and cur.children:
+                obj = cur.children[0]
+            return self._extract_base_identifier(obj, source)
+
+        # subscript_expression: arr[idx]
+        if cur.type == "subscript_expression":
+            arr = cur.child_by_field_name("argument") or cur.child_by_field_name("array")
+            if arr is None and cur.children:
+                arr = cur.children[0]
+            return self._extract_base_identifier(arr, source)
+
+        # identifier: base case
+        if cur.type == "identifier":
+            return source[cur.start_byte:cur.end_byte].decode(errors="ignore")
+
+        # For member call like p->f() the "function" is a field_expression; base id is inside it.
+        if cur.type == "call_expression":
+            fn = cur.child_by_field_name("function")
+            if fn is not None:
+                return self._extract_base_identifier(fn, source)
+
+        return ""
+
+
 
     def _process_call(self, node, source: bytes, node_id: int) -> Optional[CFGNode]:
         func_node = node.child_by_field_name("function")
         if not func_node:
             return None
 
-        func_name = source[func_node.start_byte:func_node.end_byte].decode()
+        func_name = source[func_node.start_byte:func_node.end_byte].decode(errors="ignore")
         line = node.start_point[0] + 1
-        code = source[node.start_byte:node.end_byte].decode()
+        code = source[node.start_byte:node.end_byte].decode(errors="ignore")
 
+        # Out-parameter style allocator: func(..., &out, ...) allocates into argument
+        if func_name in self.alloc_out_params:
+            out_idx = self.alloc_out_params[func_name]
+            return CFGNode(
+                id=node_id,
+                node_type=NodeType.ALLOC,
+                line=line,
+                code=code,
+                variable=f"arg{out_idx}",
+            )
+
+        # Regular allocators (return-value style)
         if func_name in self.alloc_funcs:
             parent = node.parent
             var = ""
             if parent and parent.type in ("assignment_expression", "init_declarator"):
                 for child in parent.children:
                     if child.type == "identifier":
-                        var = source[child.start_byte:child.end_byte].decode()
+                        var = source[child.start_byte:child.end_byte].decode(errors="ignore")
                         break
-
             return CFGNode(
-                id=node_id, node_type=NodeType.ALLOC,
-                line=line, code=code, variable=var
+                id=node_id,
+                node_type=NodeType.ALLOC,
+                line=line,
+                code=code,
+                variable=var,
             )
 
+        # Frees
         if func_name in self.free_funcs:
             args = node.child_by_field_name("arguments")
-            var = ""
+            obj = ""
+            var = ""  # keep identifier-only if you still want it
             if args:
                 for child in args.children:
-                    if child.type == "identifier":
-                        var = source[child.start_byte:child.end_byte].decode()
+                    if child.type in (
+                        "identifier",
+                        "subscript_expression",
+                        "field_expression",
+                        "pointer_expression",
+                        "parenthesized_expression",
+                        "cast_expression",
+                        "call_expression",
+                    ):
+                        obj = source[child.start_byte:child.end_byte].decode(errors="ignore").strip()
                         break
+            if obj:
+                # if it's a plain identifier, also populate var
+                if re.fullmatch(r"[A-Za-z_]\w*", obj):
+                    var = obj
 
             return CFGNode(
-                id=node_id, node_type=NodeType.FREE,
-                line=line, code=code, variable=var
+                id=node_id,
+                node_type=NodeType.FREE,
+                line=line,
+                code=code,
+                variable=var,
+                obj=obj,
             )
 
+
+        # Generic "use": if this call passes an identifier argument, treat it as a use site.
+        # This enables UAF detection even if the deref happens in the callee.
+        args = node.child_by_field_name("arguments")
+        # Generic "use": treat passing a pointer-ish expression as a use site (helps UAF)
+        if args:
+            for child in args.children:
+                if child.type in (
+                    "identifier",
+                    "subscript_expression",
+                    "field_expression",
+                    "pointer_expression",
+                    "parenthesized_expression",
+                    "cast_expression",
+                ):
+                    obj = source[child.start_byte:child.end_byte].decode(errors="ignore").strip()
+                    if not obj:
+                        continue
+                    var = obj if re.fullmatch(r"[A-Za-z_]\w*", obj) else ""
+                    return CFGNode(
+                        id=node_id,
+                        node_type=NodeType.DEREF,
+                        line=line,
+                        code=code,
+                        variable=var,
+                        obj=obj,
+                    )
+
+
         return None
+
 
     def _process_if(self, node, source: bytes, node_id: int) -> Optional[CFGNode]:
         cond = node.child_by_field_name("condition")
@@ -904,10 +1245,18 @@ class HintValidator:
         if not self._transitive_analyzer:
             return self._validate_deallocator_simple(hint, func)
 
-        # Use enhanced transitive analyzer
         is_dealloc, freed_arg, chain = self._transitive_analyzer.is_transitive_deallocator(func_name)
-
         if is_dealloc:
+            # If a hint claims "argK is deallocated", require evidence that the function (or its chain)
+            # frees that argument *itself* (free(argK) / sdsfree(argK) / decrRefCount(argK) ...),
+            # NOT merely frees fields reachable from it (argK->field, listEmpty(argK->...)).
+            if hint.arg_index >= 0:
+                if not self._frees_argument_itself(func, hint.arg_index):
+                    return ValidationResult(
+                        is_valid=False,
+                        reason=f"Does not free arg{hint.arg_index} itself (only internal members / containers)"
+                    )
+
             # Verify argument index if specified
             if hint.arg_index >= 0 and freed_arg >= 0 and hint.arg_index != freed_arg:
                 return ValidationResult(
@@ -915,7 +1264,7 @@ class HintValidator:
                     reason=f"Hint says arg {hint.arg_index} freed, but analysis shows arg {freed_arg}"
                 )
 
-            chain_str = ' -> '.join(chain) if chain else func_name
+            chain_str = " -> ".join(chain) if chain else func_name
             return ValidationResult(
                 is_valid=True,
                 reason=f"chain: {chain_str}, frees arg {freed_arg}"
@@ -967,6 +1316,47 @@ class HintValidator:
                 return True
 
         return False
+
+    def _frees_argument_itself(self, func: FunctionInfo, arg_index: int) -> bool:
+        """Return True iff code contains a clear deallocation of the argument variable itself.
+
+        Accepts patterns like:
+        free(p)
+        sdsfree(p)
+        decrRefCount(p)
+        zfree(p)
+        Rejects patterns like:
+        free(p->field)
+        decrRefCount(p->field)
+        listEmpty(p->list)
+        """
+        if arg_index < 0 or arg_index >= len(func.arg_names):
+            return False
+
+        var = func.arg_names[arg_index]
+        if not var:
+            return False
+
+        code = func.code
+
+        # Common free-like calls (extend as needed; still generic)
+        free_like = [
+            "free", "cfree",
+            "sdsfree",
+            "decrRefCount",
+            "zfree",
+            "g_free",
+            "kfree", "vfree", "xfree",
+        ]
+
+        for f in free_like:
+            # Must be exactly f(var) with optional whitespace.
+            # Crucially disallow f(var->...) or f(var....) by requiring ')' after var.
+            if re.search(rf'\b{re.escape(f)}\s*\(\s*{re.escape(var)}\s*\)', code):
+                return True
+
+        return False
+
 
     def discover_memory_functions(
         self,
@@ -1028,16 +1418,50 @@ class WarningValidator:
         return alloc_funcs
 
     def _get_all_free_funcs(self, functions: dict[str, FunctionInfo]) -> set[str]:
+        # Only include "strong" frees: ones that free the argument pointer itself.
         free_funcs = set(self.base_free_funcs)
         free_funcs.update(TransitiveAnalyzer.BASE_DEALLOCATORS)
 
         if self._transitive_analyzer:
-            for func_name in functions:
-                is_dealloc, _, _ = self._transitive_analyzer.is_transitive_deallocator(func_name)
-                if is_dealloc:
+            for func_name, finfo in functions.items():
+                is_dealloc, freed_arg, _ = self._transitive_analyzer.is_transitive_deallocator(func_name)
+                if not is_dealloc or freed_arg < 0:
+                    continue
+
+                # Strong criterion: function must directly free its freed_arg (free(arg), decrRefCount(arg), ...)
+                if self._directly_frees_param_pointer(finfo, freed_arg):
                     free_funcs.add(func_name)
 
         return free_funcs
+    
+    def _directly_frees_param_pointer(self, func: FunctionInfo, arg_index: int) -> bool:
+        """True iff this function directly deallocates argN itself, not argN->field / container members."""
+        if arg_index < 0 or arg_index >= len(func.arg_names):
+            return False
+        var = func.arg_names[arg_index]
+        if not var:
+            return False
+
+        code = func.code
+
+        # Conservative, generic free-like primitives. Safe across projects.
+        free_like = [
+            "free", "cfree",
+            "sdsfree",
+            "decrRefCount",
+            "zfree",
+            "g_free",
+            "kfree", "vfree", "xfree",
+        ]
+
+        # Match: f(var) exactly; reject f(var->x), f(&var), f(*var), etc.
+        for f in free_like:
+            if re.search(rf"\b{re.escape(f)}\s*\(\s*{re.escape(var)}\s*\)", code):
+                return True
+
+        return False
+
+
 
     def validate_warnings(
         self,
@@ -1054,12 +1478,17 @@ class WarningValidator:
         alloc_funcs = self._get_all_alloc_funcs(functions)
         free_funcs = self._get_all_free_funcs(functions)
         
-        # Add allocators and deallocators from hints
         if hints:
             for func_name, arg_idx in hints.get_allocators():
                 alloc_funcs.add(func_name)
+
             for func_name, arg_idx in hints.get_deallocators():
-                free_funcs.add(func_name)
+                finfo = functions.get(func_name)
+                if not finfo:
+                    continue
+                # Only treat as FREE if it frees the argument pointer itself.
+                if self._directly_frees_param_pointer(finfo, arg_idx):
+                    free_funcs.add(func_name)
 
         confirmed = []
         filtered = []
@@ -1067,10 +1496,21 @@ class WarningValidator:
         for warning in warnings:
             func = functions.get(warning.function_name)
             if not func:
+                logger.warning("Validator: function not found for warning: %s (available=%d). Example keys: %s",
+                            warning.function_name, len(functions), list(functions.keys())[:20])
                 confirmed.append(warning)
                 continue
 
-            result = self._check_feasibility(warning, func, alloc_funcs, free_funcs)
+
+
+            alloc_out_params: dict[str, int] = {}
+            if hints:
+                for func_name, arg_idx in hints.get_allocators():
+                    if arg_idx is not None and arg_idx >= 0:
+                        alloc_out_params[func_name] = arg_idx
+
+            result = self._check_feasibility(warning, func, alloc_funcs, free_funcs, alloc_out_params)
+
             if result.is_feasible:
                 confirmed.append(warning)
             else:
@@ -1087,10 +1527,11 @@ class WarningValidator:
         func: FunctionInfo,
         alloc_funcs: set[str],
         free_funcs: set[str],
+        alloc_out_params: Optional[dict[str, int]] = None,
     ) -> PathFeasibilityResult:
         """Check if warning's bug path is feasible."""
         try:
-            cfg_builder = CFGBuilder(alloc_funcs, free_funcs)
+            cfg_builder = CFGBuilder(alloc_funcs, free_funcs, alloc_out_params=alloc_out_params or {})
             cfg = cfg_builder.build(func.code)
 
             if warning.issue_type == MemoryIssueType.MEMORY_LEAK:
@@ -1100,90 +1541,343 @@ class WarningValidator:
             elif warning.issue_type == MemoryIssueType.USE_AFTER_FREE:
                 return self._check_uaf_feasibility(cfg, warning)
             else:
-                return PathFeasibilityResult(is_feasible=True, reason="unhandled bug type")
+                return PathFeasibilityResult(is_feasible=False, reason="unsupported bug type in validator")
 
         except Exception as e:
             logger.debug(f"Feasibility check failed: {e}")
             return PathFeasibilityResult(is_feasible=True, reason=f"analysis failed: {e}")
+
+
+
+
+    def _mentions_var(self, expr: str, var: str) -> bool:
+        if not var:
+            return False
+        return re.search(rf"\b{re.escape(var)}\b", expr) is not None
+
+    def _lhs_is_escape_sink(self, lhs: str) -> bool:
+        lhs = lhs.strip()
+        # out-parameter store: *out = ...
+        if re.match(r"^\*+\s*\w+", lhs):
+            return True
+        # struct/global-ish store: obj->field = ... or obj.field = ...
+        if re.match(r"^\w+\s*(->|\.)\s*\w+", lhs):
+            return True
+        return False
+
+    def _is_escape_event(self, code: str, alloc_var: str) -> bool:
+        code = code.strip()
+
+        # return alloc_var;
+        m = _RETURN_RE.match(code)
+        if m and self._mentions_var(m.group("expr"), alloc_var):
+            return True
+
+        # sink = alloc_var;
+        m = _ASSIGN_RE.match(code)
+        if m:
+            lhs, rhs = m.group("lhs"), m.group("rhs")
+            if self._lhs_is_escape_sink(lhs) and self._mentions_var(rhs, alloc_var):
+                return True
+
+        return False
+
+    def _choose_alloc_var(self, cfg: dict[int, CFGNode], warning: Warning) -> str:
+        # Prefer the warning's variable if present
+        wv = getattr(warning, "variable", "") or ""
+        if wv:
+            return wv
+
+        # Otherwise pick the first allocation with a variable name
+        allocs = [n for n in cfg.values() if n.node_type == NodeType.ALLOC and n.variable]
+        return allocs[0].variable if allocs else ""
+    
+    def _sanitize(self, s: str) -> str:
+        """Sanitize an arbitrary expression to a Z3-safe symbol suffix."""
+        if not s:
+            return "empty"
+        s = s.strip()
+        s = re.sub(r"[^A-Za-z0-9_]", "_", s)
+        # avoid super long names
+        return s[:120]
+
 
     def _check_leak_feasibility(
         self,
         cfg: dict[int, CFGNode],
         warning: Warning,
     ) -> PathFeasibilityResult:
-        """Check if memory leak path is feasible."""
+        """Leak feasible iff there exists a reachable EXIT/RETURN where:
+        - the allocated object is allocated,
+        - not freed along that path, AND
+        - not escaped (ownership transferred out).
+        """
         solver = Solver()
 
         alloc_nodes = [n for n in cfg.values() if n.node_type == NodeType.ALLOC]
-        free_nodes = [n for n in cfg.values() if n.node_type == NodeType.FREE]
         exit_nodes = [n for n in cfg.values() if n.node_type in (NodeType.EXIT, NodeType.RETURN)]
-
         if not alloc_nodes:
             return PathFeasibilityResult(is_feasible=False, reason="no allocation found")
 
+        # Choose a stable identity for the allocated object
+        alloc_var = self._choose_alloc_var(cfg, warning)
+        if not alloc_var:
+            # If we can't identify the allocated object, be conservative: don't filter.
+            return PathFeasibilityResult(is_feasible=True, reason="unknown allocated variable (conservative)")
+
         reach = {n.id: Bool(f"reach_{n.id}") for n in cfg.values()}
         freed = {n.id: Bool(f"freed_{n.id}") for n in cfg.values()}
+        escaped = {n.id: Bool(f"escaped_{n.id}") for n in cfg.values()}
 
         entry = next(n for n in cfg.values() if n.node_type == NodeType.ENTRY)
         solver.add(reach[entry.id] == True)
         solver.add(freed[entry.id] == False)
+        solver.add(escaped[entry.id] == False)
 
+        def free_matches_alloc(node: CFGNode) -> bool:
+            """Does this FREE node free the same allocated object?"""
+            if node.node_type != NodeType.FREE:
+                return False
+
+            # Strong matches:
+            # - variable equals alloc_var (identifier frees)
+            if node.variable and node.variable == alloc_var:
+                return True
+
+            # - obj equals alloc_var or mentions alloc_var (covers acl_args[i], p->field, etc.)
+            o = (node.obj or "").strip()
+            if o:
+                if o == alloc_var:
+                    return True
+                if self._mentions_var(o, alloc_var):
+                    return True
+
+            return False
+
+        # Propagate reachability / freed(alloc_var) / escaped(alloc_var)
         for node in cfg.values():
             if node.node_type == NodeType.ENTRY:
                 continue
 
             preds = node.predecessors
             if preds:
-                reach_conds = [reach[p] for p in preds]
-                solver.add(reach[node.id] == Or(*reach_conds))
+                solver.add(reach[node.id] == Or(*[reach[p] for p in preds]))
 
-                if node.node_type == NodeType.FREE:
-                    solver.add(freed[node.id] == Or(reach[node.id], *[freed[p] for p in preds]))
+                # freed propagates
+                freed_from_preds = Or(*[freed[p] for p in preds])
+                if free_matches_alloc(node):
+                    # freed becomes true if alloc_var freed at this node on a reachable path
+                    solver.add(freed[node.id] == Or(freed_from_preds, reach[node.id]))
                 else:
-                    freed_conds = [freed[p] for p in preds]
-                    solver.add(freed[node.id] == Or(*freed_conds))
+                    solver.add(freed[node.id] == freed_from_preds)
 
-        leak_conditions = []
-        for exit_node in exit_nodes:
-            leak_conditions.append(And(reach[exit_node.id], Not(freed[exit_node.id])))
+                # escaped propagates
+                solver.add(escaped[node.id] == Or(*[escaped[p] for p in preds]))
+            else:
+                solver.add(reach[node.id] == False)
+                solver.add(freed[node.id] == False)
+                solver.add(escaped[node.id] == False)
 
-        if leak_conditions:
-            solver.add(Or(*leak_conditions))
+            # Escape rule (out-parameter alloc)
+            if node.node_type == NodeType.ALLOC and node.variable.startswith("arg"):
+                solver.add(escaped[node.id] == True)
+
+            # Escape rule (return alloc_var;)
+            if node.node_type == NodeType.RETURN:
+                if self._mentions_var(node.code, alloc_var):
+                    solver.add(escaped[node.id] == True)
+
+            # Escape rule (store into *out or field/global sink)
+            if node.node_type == NodeType.ASSIGN:
+                if self._is_escape_event(node.code, alloc_var):
+                    solver.add(escaped[node.id] == True)
+
+        # Leak exists if reachable exit with NOT freed and NOT escaped
+        leak_conditions = [
+            And(reach[x.id], Not(freed[x.id]), Not(escaped[x.id]))
+            for x in exit_nodes
+        ]
+        solver.add(Or(*leak_conditions))
 
         result = solver.check()
-
         if result == sat:
-            return PathFeasibilityResult(is_feasible=True, reason="leak path exists")
-        else:
-            return PathFeasibilityResult(is_feasible=False, reason="all paths free memory")
+            return PathFeasibilityResult(is_feasible=True, reason=f"leak path exists for {alloc_var}")
+        return PathFeasibilityResult(is_feasible=False, reason=f"all paths free or escape {alloc_var}")
+
+
+
 
     def _check_double_free_feasibility(
         self,
-        cfg: dict[int, CFGNode],
-        warning: Warning,
-    ) -> PathFeasibilityResult:
-        """Check if double-free path is feasible."""
-        free_nodes = [n for n in cfg.values() if n.node_type == NodeType.FREE]
+            cfg: dict[int, CFGNode],
+            warning: Warning,
+        ) -> PathFeasibilityResult:
+        """Check if double-free is feasible (per-object expression).
 
+        Double-free is feasible iff there exists a reachable FREE(obj) such that
+        obj has already been freed earlier on that reachable path.
+
+        We use CFGNode.obj (full freed expression, e.g., acl_args[i], p->x, *p)
+        instead of CFGNode.variable (base identifier), to avoid collapsing distinct
+        objects into the same name.
+        """
+        solver = Solver()
+
+        # Use full expression identity
+        free_nodes = [n for n in cfg.values() if n.node_type == NodeType.FREE and (n.obj or "").strip()]
         if len(free_nodes) < 2:
             return PathFeasibilityResult(is_feasible=False, reason="less than 2 free calls")
 
-        vars_freed = [n.variable for n in free_nodes]
-        for var in vars_freed:
-            if var and vars_freed.count(var) >= 2:
-                return PathFeasibilityResult(is_feasible=True, reason=f"multiple frees of {var}")
+        objs_freed = sorted({(n.obj or "").strip() for n in free_nodes if (n.obj or "").strip()})
+        if not objs_freed:
+            return PathFeasibilityResult(is_feasible=False, reason="no free object extracted")
 
-        return PathFeasibilityResult(is_feasible=False, reason="no duplicate frees found")
+        # Reachability boolean per node
+        reach = {n.id: Bool(f"reach_{n.id}") for n in cfg.values()}
+        entry = next(n for n in cfg.values() if n.node_type == NodeType.ENTRY)
+        solver.add(reach[entry.id] == True)
 
+        # Reachability propagation
+        for node in cfg.values():
+            if node.node_type == NodeType.ENTRY:
+                continue
+            preds = node.predecessors
+            if preds:
+                solver.add(reach[node.id] == Or(*[reach[p] for p in preds]))
+            else:
+                solver.add(reach[node.id] == False)
+
+        # Per-object "freed already before this node" and "freed up to this node"
+        freed_in: dict[str, dict[int, BoolRef]] = {}
+        freed: dict[str, dict[int, BoolRef]] = {}
+
+        for o in objs_freed:
+            okey = self._sanitize(o)
+            freed_in[o] = {n.id: Bool(f"freedIn_{okey}_{n.id}") for n in cfg.values()}
+            freed[o] = {n.id: Bool(f"freed_{okey}_{n.id}") for n in cfg.values()}
+            solver.add(freed_in[o][entry.id] == False)
+            solver.add(freed[o][entry.id] == False)
+
+        # Propagate + event updates
+        for node in cfg.values():
+            if node.node_type == NodeType.ENTRY:
+                continue
+
+            preds = node.predecessors
+
+            for o in objs_freed:
+                # freed_in[o][node] = OR freed[o][pred]
+                if preds:
+                    solver.add(freed_in[o][node.id] == Or(*[freed[o][p] for p in preds]))
+                else:
+                    solver.add(freed_in[o][node.id] == False)
+
+                # If this node frees o on a reachable path, then freed[o] becomes true
+                if node.node_type == NodeType.FREE and (node.obj or "").strip() == o:
+                    # freed[o][node] = freed_in[o][node] OR reach[node]
+                    solver.add(freed[o][node.id] == Or(freed_in[o][node.id], reach[node.id]))
+                else:
+                    solver.add(freed[o][node.id] == freed_in[o][node.id])
+
+        # Double-free exists if there is a FREE(o) node where freed_in[o] is already true
+        df_conditions = []
+        for node in free_nodes:
+            o = (node.obj or "").strip()
+            df_conditions.append(And(reach[node.id], freed_in[o][node.id]))
+
+        if not df_conditions:
+            return PathFeasibilityResult(is_feasible=False, reason="no candidate double-free nodes")
+
+        solver.add(Or(*df_conditions))
+
+        result = solver.check()
+        if result == sat:
+            return PathFeasibilityResult(is_feasible=True, reason="double-free path exists")
+        return PathFeasibilityResult(is_feasible=False, reason="no reachable double-free")
+    
     def _check_uaf_feasibility(
         self,
         cfg: dict[int, CFGNode],
         warning: Warning,
     ) -> PathFeasibilityResult:
-        """Check if use-after-free path is feasible."""
-        free_nodes = [n for n in cfg.values() if n.node_type == NodeType.FREE]
+        """Check if use-after-free is feasible (per-object expression).
+
+        UAF is feasible iff there exists a reachable DEREF(obj) such that
+        obj has already been freed earlier on that reachable path.
+
+        We use CFGNode.obj (full used/freed expression) rather than CFGNode.variable.
+        """
+        solver = Solver()
+
+        free_nodes = [n for n in cfg.values() if n.node_type == NodeType.FREE and (n.obj or "").strip()]
+        deref_nodes = [n for n in cfg.values() if n.node_type == NodeType.DEREF and (n.obj or "").strip()]
 
         if not free_nodes:
             return PathFeasibilityResult(is_feasible=False, reason="no free found")
+        if not deref_nodes:
+            return PathFeasibilityResult(is_feasible=False, reason="no deref/use found (CFGBuilder missing DEREF)")
 
-        return PathFeasibilityResult(is_feasible=True, reason="free found, needs detailed analysis")
+        objs_of_interest = sorted(
+            {(n.obj or "").strip() for n in free_nodes if (n.obj or "").strip()} |
+            {(n.obj or "").strip() for n in deref_nodes if (n.obj or "").strip()}
+        )
+        if not objs_of_interest:
+            return PathFeasibilityResult(is_feasible=False, reason="no objects extracted")
+
+        reach = {n.id: Bool(f"reach_{n.id}") for n in cfg.values()}
+        entry = next(n for n in cfg.values() if n.node_type == NodeType.ENTRY)
+        solver.add(reach[entry.id] == True)
+
+        # Reachability propagation
+        for node in cfg.values():
+            if node.node_type == NodeType.ENTRY:
+                continue
+            preds = node.predecessors
+            if preds:
+                solver.add(reach[node.id] == Or(*[reach[p] for p in preds]))
+            else:
+                solver.add(reach[node.id] == False)
+
+        # Track freed status per object
+        freed_in: dict[str, dict[int, BoolRef]] = {}
+        freed: dict[str, dict[int, BoolRef]] = {}
+
+        for o in objs_of_interest:
+            okey = self._sanitize(o)
+            freed_in[o] = {n.id: Bool(f"freedIn_{okey}_{n.id}") for n in cfg.values()}
+            freed[o] = {n.id: Bool(f"freed_{okey}_{n.id}") for n in cfg.values()}
+            solver.add(freed_in[o][entry.id] == False)
+            solver.add(freed[o][entry.id] == False)
+
+        for node in cfg.values():
+            if node.node_type == NodeType.ENTRY:
+                continue
+
+            preds = node.predecessors
+
+            for o in objs_of_interest:
+                # freed_in[o][node] = OR freed[o][pred]
+                if preds:
+                    solver.add(freed_in[o][node.id] == Or(*[freed[o][p] for p in preds]))
+                else:
+                    solver.add(freed_in[o][node.id] == False)
+
+                # FREE(o) makes freed[o] true
+                if node.node_type == NodeType.FREE and (node.obj or "").strip() == o:
+                    solver.add(freed[o][node.id] == Or(freed_in[o][node.id], reach[node.id]))
+                else:
+                    solver.add(freed[o][node.id] == freed_in[o][node.id])
+
+        # UAF exists if DEREF(o) reachable AND o was freed before
+        uaf_conditions = []
+        for node in deref_nodes:
+            o = (node.obj or "").strip()
+            uaf_conditions.append(And(reach[node.id], freed_in[o][node.id]))
+
+        solver.add(Or(*uaf_conditions))
+
+        result = solver.check()
+        if result == sat:
+            return PathFeasibilityResult(is_feasible=True, reason="uaf path exists")
+        return PathFeasibilityResult(is_feasible=False, reason="no reachable use-after-free")
+
