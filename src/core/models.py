@@ -204,6 +204,9 @@ class HintSet:
 # Analysis Results (CodeQL generates these, Z3 filters them)
 # =============================================================================
 
+from dataclasses import dataclass, field
+from enum import Enum
+
 @dataclass
 class Warning:
     """A warning from static analyzer (CodeQL/Infer)."""
@@ -215,6 +218,32 @@ class Warning:
     issue_type: MemoryIssueType = MemoryIssueType.MEMORY_LEAK
     allocation_site: str = ""
     trace: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "file_path": self.file_path,
+            "line_number": self.line_number,
+            "function_name": self.function_name,
+            "warning_type": self.warning_type,
+            "message": self.message,
+            "issue_type": self.issue_type.name,  # enum → string
+            "allocation_site": self.allocation_site,
+            "trace": self.trace,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "Warning":
+        return Warning(
+            file_path=d["file_path"],
+            line_number=d["line_number"],
+            function_name=d["function_name"],
+            warning_type=d["warning_type"],
+            message=d["message"],
+            issue_type=MemoryIssueType[d["issue_type"]],  # string → enum
+            allocation_site=d.get("allocation_site", ""),
+            trace=d.get("trace", []),
+        )
+
 
 
 @dataclass
