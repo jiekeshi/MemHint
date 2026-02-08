@@ -53,7 +53,7 @@ ENHANCED_MEMORY_NEVER_FREED = '''/**
  * @name Memory is never freed (Enhanced)
  * @description Enhanced version with better error-path detection.
  *              Detects memory allocated but never freed, including in error paths.
- * @kind problem
+ * @kind path-problem
  * @id cpp/memory-never-freed-enhanced
  * @problem.severity warning
  * @security-severity 7.5
@@ -112,7 +112,7 @@ select alloc, "This memory is " + reason + "."
 ENHANCED_MEMORY_MAY_NOT_BE_FREED = '''/**
  * @name Memory may not be freed (Enhanced)
  * @description Enhanced version that better tracks memory through early returns.
- * @kind problem
+ * @kind path-problem
  * @id cpp/memory-may-not-be-freed-enhanced
  * @problem.severity warning
  * @security-severity 7.5
@@ -874,43 +874,49 @@ class CodeQLAnalyzer:
     # =========================================================================
 
     def _parse_sarif(self, sarif_path: Path, project_path: Path) -> list[Warning]:
-        if not sarif_path.exists():
-            return []
+      if not sarif_path.exists():
+          return []
 
-        warnings = []
-        try:
-            data = json.loads(sarif_path.read_text())
-            for run in data.get("runs", []):
-                for result in run.get("results", []):
-                    rule_id = result.get("ruleId", "").lower()
+      warnings = []
+      try:
+          data = json.loads(sarif_path.read_text())
+          for run in data.get("runs", []):
+              for result in run.get("results", []):
+                  rule_id = result.get("ruleId", "").lower()
 
-                    issue_type = MemoryIssueType.MEMORY_LEAK
-                    for key, val in CODEQL_ISSUE_MAP.items():
-                        if key in rule_id:
-                            issue_type = val
-                            break
+                  issue_type = MemoryIssueType.MEMORY_LEAK
+                  for key, val in CODEQL_ISSUE_MAP.items():
+                      if key in rule_id:
+                          issue_type = val
+                          break
 
-                    locs = result.get("locations", [])
-                    if not locs:
-                        continue
+                  locs = result.get("locations", [])
+                  if not locs:
+                      continue
 
-                    loc = locs[0].get("physicalLocation", {})
-                    file_path = loc.get("artifactLocation", {}).get("uri", "")
-                    line = loc.get("region", {}).get("startLine", 0)
+                  loc0 = locs[0].get("physicalLocation", {})
+                  file_path = loc0.get("artifactLocation", {}).get("uri", "")
+                  line = loc0.get("region", {}).get("startLine", 0)
 
-                    warnings.append(Warning(
-                        file_path=file_path,
-                        line_number=line,
-                        function_name=self._find_function(file_path, line, project_path),
-                        warning_type=rule_id,
-                        message=result.get("message", {}).get("text", ""),
-                        issue_type=issue_type,
-                        trace=[]
-                    ))
-        except Exception as e:
-            logger.error(f"SARIF parse error: {e}")
+                  alloc_site = self._extract_allocation_site(result, run)
+                  trace = self._extract_trace(result, run)
 
-        return warnings
+                  warnings.append(Warning(
+                      file_path=file_path,
+                      line_number=line,
+                      function_name=self._find_function(file_path, line, project_path),
+                      warning_type=rule_id,
+                      message=result.get("message", {}).get("text", ""),
+                      issue_type=issue_type,
+                      allocation_site=alloc_site,
+                      trace=trace
+                  ))
+
+      except Exception as e:
+          logger.error(f"SARIF parse error: {e}")
+
+      return warnings
+
 
     def _find_function(self, file_path: str, line: int, project_path: Path) -> str:
         if not file_path or not line:
@@ -926,3 +932,171 @@ class CodeQLAnalyzer:
         except Exception:
             pass
         return ""
+      
+
+
+    def _extract_path_trace(self, result: dict) -> list[str]:
+        """
+        Extract a light trace from SARIF for path-problem results.
+        Returns list of 'file:line' strings in order.
+        """
+        trace = []
+        for cf in result.get("codeFlows", []) or []:
+            for tf in cf.get("threadFlows", []) or []:
+                for tloc in tf.get("locations", []) or []:
+                    loc = tloc.get("location", {})
+                    s = self._sarif_loc_to_str(loc)
+                    if s:
+                        trace.append(s)
+        # de-dup while preserving order
+        seen = set()
+        out = []
+        for x in trace:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+
+
+    
+ 
+    
+    from pathlib import Path
+    from typing import Optional
+
+    def _sarif_loc_to_str(self, loc: dict) -> str:
+        """
+        Convert a SARIF location-like object to "file:line" string.
+        Accepts either:
+          - result["locations"][i]
+          - result["relatedLocations"][i]
+          - threadFlowLocation["location"]
+        """
+        if not loc:
+            return ""
+
+        # SARIF: { "physicalLocation": { "artifactLocation": {"uri": ...}, "region": {"startLine": ...}}}
+        phys = loc.get("physicalLocation") or {}
+        art = phys.get("artifactLocation") or {}
+        uri = art.get("uri") or ""
+
+        region = phys.get("region") or {}
+        line = region.get("startLine") or 0
+
+        if not uri:
+            return ""
+        if line:
+            return f"{uri}:{line}"
+        return uri
+
+
+    def _resolve_related_locations(self, result: dict, run: dict) -> list[dict]:
+        """
+        Return related location objects for a SARIF result, resolving
+        relatedLocations indices via run["relatedLocations"] if needed.
+        """
+        related = result.get("relatedLocations") or []
+        if not related:
+            return []
+
+        # SARIF can store related locations either as full objects or as indices
+        resolved = []
+        pool = (run.get("relatedLocations") or [])
+
+        for rl in related:
+            # Case A: already a full location object
+            if isinstance(rl, dict) and ("physicalLocation" in rl or "location" in rl):
+                # Some SARIF producers wrap it: {"location": {...}}
+                resolved.append(rl.get("location") if "location" in rl else rl)
+                continue
+
+            # Case B: index into run.relatedLocations
+            if isinstance(rl, int) and 0 <= rl < len(pool):
+                resolved.append(pool[rl])
+                continue
+
+            # Case C: dict with "id" referencing run pool
+            if isinstance(rl, dict):
+                idx = rl.get("id")
+                if isinstance(idx, int) and 0 <= idx < len(pool):
+                    resolved.append(pool[idx])
+
+        return resolved
+
+
+    def _extract_allocation_site(self, result: dict, run: dict) -> str:
+        """
+        Best-effort allocation site extraction.
+        For path-problem queries, allocation is often the primary location,
+        and sinks (exit points) are in related locations or message references.
+        """
+        # 1) Prefer the primary location (most CodeQL memory queries report the alloc here)
+        locs = result.get("locations") or []
+        if locs:
+            s = self._sarif_loc_to_str(locs[0].get("physicalLocation") and locs[0] or locs[0].get("location") or locs[0])
+            if s:
+                return s
+
+        # 2) Otherwise try related locations
+        rls = self._resolve_related_locations(result, run)
+        for rl in rls:
+            s = self._sarif_loc_to_str(rl)
+            if s:
+                return s
+
+        return ""
+
+
+    def _extract_trace(self, result: dict, run: dict) -> list[str]:
+        """
+        Extract a simple trace list (file:line strings).
+        - If codeFlows exist, use threadFlowLocations.
+        - Otherwise fall back to relatedLocations.
+        """
+        trace: list[str] = []
+
+        # 1) codeFlows -> threadFlows -> threadFlowLocations
+        codeflows = result.get("codeFlows") or []
+        for cf in codeflows:
+            for tf in (cf.get("threadFlows") or []):
+                for tfl in (tf.get("locations") or []):
+                    loc = tfl.get("location") or {}
+                    s = self._sarif_loc_to_str(loc)
+                    if s:
+                        trace.append(s)
+
+        if trace:
+            # de-dup while preserving order
+            seen = set()
+            out = []
+            for x in trace:
+                if x not in seen:
+                    seen.add(x)
+                    out.append(x)
+            return out
+
+        # 2) fallback: related locations
+        rls = self._resolve_related_locations(result, run)
+        for rl in rls:
+            s = self._sarif_loc_to_str(rl)
+            if s:
+                trace.append(s)
+
+        # 3) also include primary location at front if exists
+        locs = result.get("locations") or []
+        if locs:
+            primary = self._sarif_loc_to_str(locs[0].get("physicalLocation") and locs[0] or locs[0].get("location") or locs[0])
+            if primary:
+                trace = [primary] + [x for x in trace if x != primary]
+
+        # de-dup
+        seen = set()
+        out = []
+        for x in trace:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+
