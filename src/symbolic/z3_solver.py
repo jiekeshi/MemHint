@@ -850,9 +850,30 @@ class CFGBuilder:
             return self._process_if(node, source, node_id)
         elif node.type == "return_statement":
             return self._process_return(node, source, node_id)
+        elif node.type == "assignment_expression":
+            return self._process_assign(node, source, node_id)
         elif node.type in ("pointer_expression", "subscript_expression", "field_expression"):
             return self._process_deref(node, source, node_id)
         return None
+    
+    def _process_assign(self, node, source: bytes, node_id: int) -> Optional[CFGNode]:
+        """
+        Emit ASSIGN node so leak checker can detect escape events like:
+        *out = p
+        global = p
+        obj->field = p
+        """
+        line = node.start_point[0] + 1
+        code = source[node.start_byte:node.end_byte].decode(errors="ignore").strip()
+        if not code:
+            return None
+        return CFGNode(
+            id=node_id,
+            node_type=NodeType.ASSIGN,
+            line=line,
+            code=code,
+        )
+
 
     def _process_deref(self, node, source: bytes, node_id: int) -> Optional[CFGNode]:
         """Create a DEREF node when we see obvious pointer/array/member dereference.
@@ -895,7 +916,9 @@ class CFGBuilder:
                             break
 
         
-        
+        if not var:
+            return None
+
         return CFGNode(
             id=node_id,
             node_type=NodeType.DEREF,
@@ -983,7 +1006,9 @@ class CFGBuilder:
                 line=line,
                 code=code,
                 variable=f"arg{out_idx}",
+                obj=f"arg{out_idx}",
             )
+
 
         # Regular allocators (return-value style)
         if func_name in self.alloc_funcs:
@@ -994,13 +1019,16 @@ class CFGBuilder:
                     if child.type == "identifier":
                         var = source[child.start_byte:child.end_byte].decode(errors="ignore")
                         break
+            alloc_obj = var  # best we can do for return-value style alloc
             return CFGNode(
                 id=node_id,
                 node_type=NodeType.ALLOC,
                 line=line,
                 code=code,
                 variable=var,
+                obj=alloc_obj,
             )
+
 
         # Frees
         if func_name in self.free_funcs:
@@ -1487,8 +1515,7 @@ class WarningValidator:
                 if not finfo:
                     continue
                 # Only treat as FREE if it frees the argument pointer itself.
-                if self._directly_frees_param_pointer(finfo, arg_idx):
-                    free_funcs.add(func_name)
+                free_funcs.add(func_name)
 
         confirmed = []
         filtered = []
@@ -1583,14 +1610,46 @@ class WarningValidator:
         return False
 
     def _choose_alloc_var(self, cfg: dict[int, CFGNode], warning: Warning) -> str:
-        # Prefer the warning's variable if present
+        """
+        Choose the allocation variable most likely associated with this warning.
+
+        Strategy (generic, conservative):
+        1) If warning explicitly names a variable, use it.
+        2) Otherwise, pick the ALLOC whose line is closest *before* the warning line.
+        3) If no such ALLOC exists, fall back to any ALLOC (last resort).
+        """
+
+        # 1) Prefer variable directly reported by the analyzer
         wv = getattr(warning, "variable", "") or ""
         if wv:
             return wv
 
-        # Otherwise pick the first allocation with a variable name
-        allocs = [n for n in cfg.values() if n.node_type == NodeType.ALLOC and n.variable]
-        return allocs[0].variable if allocs else ""
+        warn_line = getattr(warning, "line_number", None)
+
+        allocs = [
+            n for n in cfg.values()
+            if n.node_type == NodeType.ALLOC and n.variable
+        ]
+        if not allocs:
+            return ""
+
+        # 2) Pick closest alloc *before* the warning
+        if warn_line is not None:
+            before = [
+                n for n in allocs
+                if n.line is not None and n.line <= warn_line
+            ]
+            if before:
+                best = max(before, key=lambda n: n.line)
+                return best.variable
+
+        # 3) Fallback: last alloc in source order (still safer than first)
+        best = max(
+            allocs,
+            key=lambda n: (n.line if n.line is not None else -1)
+        )
+        return best.variable
+
     
     def _sanitize(self, s: str) -> str:
         """Sanitize an arbitrary expression to a Z3-safe symbol suffix."""
@@ -1607,11 +1666,6 @@ class WarningValidator:
         cfg: dict[int, CFGNode],
         warning: Warning,
     ) -> PathFeasibilityResult:
-        """Leak feasible iff there exists a reachable EXIT/RETURN where:
-        - the allocated object is allocated,
-        - not freed along that path, AND
-        - not escaped (ownership transferred out).
-        """
         solver = Solver()
 
         alloc_nodes = [n for n in cfg.values() if n.node_type == NodeType.ALLOC]
@@ -1619,42 +1673,41 @@ class WarningValidator:
         if not alloc_nodes:
             return PathFeasibilityResult(is_feasible=False, reason="no allocation found")
 
-        # Choose a stable identity for the allocated object
         alloc_var = self._choose_alloc_var(cfg, warning)
         if not alloc_var:
-            # If we can't identify the allocated object, be conservative: don't filter.
             return PathFeasibilityResult(is_feasible=True, reason="unknown allocated variable (conservative)")
 
-        reach = {n.id: Bool(f"reach_{n.id}") for n in cfg.values()}
-        freed = {n.id: Bool(f"freed_{n.id}") for n in cfg.values()}
+        reach   = {n.id: Bool(f"reach_{n.id}")   for n in cfg.values()}
+        allocd  = {n.id: Bool(f"allocd_{n.id}")  for n in cfg.values()}   # NEW
+        freed   = {n.id: Bool(f"freed_{n.id}")   for n in cfg.values()}
         escaped = {n.id: Bool(f"escaped_{n.id}") for n in cfg.values()}
 
         entry = next(n for n in cfg.values() if n.node_type == NodeType.ENTRY)
         solver.add(reach[entry.id] == True)
+        solver.add(allocd[entry.id] == False)    # NEW
         solver.add(freed[entry.id] == False)
         solver.add(escaped[entry.id] == False)
 
+        def alloc_matches_var(node: CFGNode) -> bool:
+            # Return-value alloc: variable is LHS identifier extracted by CFGBuilder
+            return node.node_type == NodeType.ALLOC and (node.variable or "") == alloc_var
+
         def free_matches_alloc(node: CFGNode) -> bool:
-            """Does this FREE node free the same allocated object?"""
             if node.node_type != NodeType.FREE:
                 return False
 
-            # Strong matches:
-            # - variable equals alloc_var (identifier frees)
+            # Strong match only: free(alloc_var)
             if node.variable and node.variable == alloc_var:
                 return True
 
-            # - obj equals alloc_var or mentions alloc_var (covers acl_args[i], p->field, etc.)
             o = (node.obj or "").strip()
-            if o:
-                if o == alloc_var:
-                    return True
-                if self._mentions_var(o, alloc_var):
-                    return True
+            if o and o == alloc_var:
+                return True
 
+            # IMPORTANT: do NOT treat "mentions alloc_var" as freeing it.
+            # free(p->x) does NOT free p.
             return False
 
-        # Propagate reachability / freed(alloc_var) / escaped(alloc_var)
         for node in cfg.values():
             if node.node_type == NodeType.ENTRY:
                 continue
@@ -1663,11 +1716,17 @@ class WarningValidator:
             if preds:
                 solver.add(reach[node.id] == Or(*[reach[p] for p in preds]))
 
-                # freed propagates
+                # allocated propagates existentially ("there exists a path where allocated happened")
+                alloc_from_preds = Or(*[allocd[p] for p in preds])
+                if alloc_matches_var(node):
+                    solver.add(allocd[node.id] == Or(alloc_from_preds, reach[node.id]))
+                else:
+                    solver.add(allocd[node.id] == alloc_from_preds)
+
+                # freed propagates, but only becomes true if we are already allocated on that path
                 freed_from_preds = Or(*[freed[p] for p in preds])
                 if free_matches_alloc(node):
-                    # freed becomes true if alloc_var freed at this node on a reachable path
-                    solver.add(freed[node.id] == Or(freed_from_preds, reach[node.id]))
+                    solver.add(freed[node.id] == Or(freed_from_preds, And(reach[node.id], allocd[node.id])))
                 else:
                     solver.add(freed[node.id] == freed_from_preds)
 
@@ -1675,26 +1734,32 @@ class WarningValidator:
                 solver.add(escaped[node.id] == Or(*[escaped[p] for p in preds]))
             else:
                 solver.add(reach[node.id] == False)
+                solver.add(allocd[node.id] == False)
                 solver.add(freed[node.id] == False)
                 solver.add(escaped[node.id] == False)
 
-            # Escape rule (out-parameter alloc)
-            if node.node_type == NodeType.ALLOC and node.variable.startswith("arg"):
+            # Escape: out-parameter allocation (only if this is the tracked object)
+            if node.node_type == NodeType.ALLOC and (node.variable or "").startswith("arg"):
+                # This is not alloc_var usually; keep if you intentionally treat argX as escaped
                 solver.add(escaped[node.id] == True)
 
-            # Escape rule (return alloc_var;)
+            # Escape: return alloc_var (only makes sense after allocation)
             if node.node_type == NodeType.RETURN:
                 if self._mentions_var(node.code, alloc_var):
-                    solver.add(escaped[node.id] == True)
+                    solver.add(escaped[node.id] == And(reach[node.id], allocd[node.id]))
 
-            # Escape rule (store into *out or field/global sink)
+            # Escape: store alloc_var into sink (only makes sense if you actually emitted ASSIGN nodes)
             if node.node_type == NodeType.ASSIGN:
                 if self._is_escape_event(node.code, alloc_var):
-                    solver.add(escaped[node.id] == True)
+                    escaped[node.id] == True
 
-        # Leak exists if reachable exit with NOT freed and NOT escaped
+
+        # Leak exists if reachable exit where:
+        # - alloc happened on that path
+        # - not freed
+        # - not escaped
         leak_conditions = [
-            And(reach[x.id], Not(freed[x.id]), Not(escaped[x.id]))
+            And(reach[x.id], allocd[x.id], Not(freed[x.id]), Not(escaped[x.id]))
             for x in exit_nodes
         ]
         solver.add(Or(*leak_conditions))
@@ -1702,7 +1767,7 @@ class WarningValidator:
         result = solver.check()
         if result == sat:
             return PathFeasibilityResult(is_feasible=True, reason=f"leak path exists for {alloc_var}")
-        return PathFeasibilityResult(is_feasible=False, reason=f"all paths free or escape {alloc_var}")
+        return PathFeasibilityResult(is_feasible=False, reason=f"all paths free/escape or never allocate {alloc_var}")
 
 
 
