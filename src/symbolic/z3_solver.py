@@ -769,7 +769,8 @@ class CFGBuilder:
             # We'll scan inside it and emit nodes for interesting operations
             tail = in_id
             created_any = False
-            for n in self._walk(st_node):
+            for n in st_node.children:
+                # or only walk one level down, or filter
                 cfg_n = self._process_node(n, source, node_id)
                 if cfg_n:
                     # materialize the node into `nodes` with a fresh id
@@ -850,11 +851,17 @@ class CFGBuilder:
             return self._process_if(node, source, node_id)
         elif node.type == "return_statement":
             return self._process_return(node, source, node_id)
-        elif node.type == "assignment_expression":
-            return self._process_assign(node, source, node_id)
         elif node.type in ("pointer_expression", "subscript_expression", "field_expression"):
             return self._process_deref(node, source, node_id)
+
+        # NEW: capture escapes like Users = raxNew(), UsersToLoad = listCreate(), etc.
+        elif node.type == "assignment_expression":
+            return self._process_assign(node, source, node_id)
+        elif node.type == "init_declarator":
+            return self._process_init_declarator(node, source, node_id)
+
         return None
+
     
     def _process_assign(self, node, source: bytes, node_id: int) -> Optional[CFGNode]:
         """
@@ -873,6 +880,87 @@ class CFGBuilder:
             line=line,
             code=code,
         )
+        
+    def _node_text(self, node, source: bytes) -> str:
+        return source[node.start_byte:node.end_byte].decode(errors="ignore")
+
+    def _process_assign(self, node, source: bytes, node_id: int) -> Optional[CFGNode]:
+        """
+        assignment_expression: <left> = <right>
+        We emit ASSIGN so leak checker can detect escape sinks:
+        - global_var = ...
+        - obj->field = ...
+        - *out = ...
+        """
+        left = node.child_by_field_name("left")
+        right = node.child_by_field_name("right")
+        if left is None or right is None:
+            return None
+
+        lhs_txt = self._node_text(left, source).strip()
+        rhs_txt = self._node_text(right, source).strip()
+
+        # Keep full assignment text (without requiring semicolon)
+        code = f"{lhs_txt} = {rhs_txt}"
+
+        return CFGNode(
+            id=node_id,
+            node_type=NodeType.ASSIGN,
+            line=node.start_point[0] + 1,
+            code=code,
+            variable=lhs_txt,  # store LHS (may be global, field, *out, local)
+            obj=rhs_txt,       # store RHS (useful later if you want)
+        )
+
+    def _process_init_declarator(self, node, source: bytes, node_id: int) -> Optional[CFGNode]:
+        """
+        init_declarator: declarator '=' value
+        Examples:
+        user *u = ACLCreateUser(...)
+        sds *acl_args = ACLMergeSelectorArguments(...)
+        Emit ASSIGN so leak checker can see escape when initializer is assigned to global/field.
+        (Even for locals, this helps build a consistent model.)
+        """
+        value = node.child_by_field_name("value")
+        if value is None:
+            return None
+
+        # Find the declared identifier on the LHS
+        declarator = node.child_by_field_name("declarator")
+        lhs_name = ""
+
+        if declarator is not None:
+            # walk to find identifier inside pointer_declarator etc.
+            stack = [declarator]
+            while stack:
+                cur = stack.pop()
+                if cur.type == "identifier":
+                    lhs_name = self._node_text(cur, source).strip()
+                    break
+                stack.extend(list(cur.children))
+
+        if not lhs_name:
+            # fallback: best effort by scanning children
+            for ch in node.children:
+                if ch.type == "identifier":
+                    lhs_name = self._node_text(ch, source).strip()
+                    break
+
+        rhs_txt = self._node_text(value, source).strip()
+        if not rhs_txt:
+            return None
+
+        code = f"{lhs_name} = {rhs_txt}" if lhs_name else rhs_txt
+
+        return CFGNode(
+            id=node_id,
+            node_type=NodeType.ASSIGN,
+            line=node.start_point[0] + 1,
+            code=code,
+            variable=lhs_name,
+            obj=rhs_txt,
+        )
+
 
 
     def _process_deref(self, node, source: bytes, node_id: int) -> Optional[CFGNode]:
@@ -1610,45 +1698,44 @@ class WarningValidator:
         return False
 
     def _choose_alloc_var(self, cfg: dict[int, CFGNode], warning: Warning) -> str:
-        """
-        Choose the allocation variable most likely associated with this warning.
+        # 0) If CodeQL stored an allocation_site string like "...:123" or "line 123"
+        alloc_site_line = -1
+        alloc_site = getattr(warning, "allocation_site", "") or ""
+        if alloc_site:
+            m = re.search(r"\b(\d+)\b", alloc_site)
+            if m:
+                alloc_site_line = int(m.group(1))
 
-        Strategy (generic, conservative):
-        1) If warning explicitly names a variable, use it.
-        2) Otherwise, pick the ALLOC whose line is closest *before* the warning line.
-        3) If no such ALLOC exists, fall back to any ALLOC (last resort).
-        """
+        # 1) Prefer CodeQL alloc-site line if present, otherwise fall back to warning line
+        target_line = alloc_site_line if alloc_site_line > 0 else (getattr(warning, "line_number", -1) or -1)
 
-        # 1) Prefer variable directly reported by the analyzer
-        wv = getattr(warning, "variable", "") or ""
-        if wv:
-            return wv
+        # 2) Collect allocation nodes with an identity
+        allocs = [n for n in cfg.values() if n.node_type == NodeType.ALLOC]
+        candidates = []
+        for n in allocs:
+            ident = (n.variable or (n.obj or "")).strip()
+            if ident:
+                candidates.append((n.line, ident))
 
-        warn_line = getattr(warning, "line_number", None)
-
-        allocs = [
-            n for n in cfg.values()
-            if n.node_type == NodeType.ALLOC and n.variable
-        ]
-        if not allocs:
+        if not candidates:
             return ""
 
-        # 2) Pick closest alloc *before* the warning
-        if warn_line is not None:
-            before = [
-                n for n in allocs
-                if n.line is not None and n.line <= warn_line
-            ]
+        # 3) If we have a target line, pick the allocation whose line is closest (prefer <= target_line)
+        if target_line > 0:
+            # Prefer allocations at/above the target line (closest backward), else closest overall
+            before = [(ln, ident) for (ln, ident) in candidates if ln <= target_line]
             if before:
-                best = max(before, key=lambda n: n.line)
-                return best.variable
+                # choose nearest previous alloc
+                ln, ident = max(before, key=lambda x: x[0])
+                return ident
 
-        # 3) Fallback: last alloc in source order (still safer than first)
-        best = max(
-            allocs,
-            key=lambda n: (n.line if n.line is not None else -1)
-        )
-        return best.variable
+            # otherwise choose nearest alloc by absolute distance
+            ln, ident = min(candidates, key=lambda x: abs(x[0] - target_line))
+            return ident
+
+        # 4) Fallback: first alloc identity
+        return candidates[0][1]
+
 
     
     def _sanitize(self, s: str) -> str:
