@@ -24,7 +24,7 @@ from collections import defaultdict
 try:
     from z3 import (
         Solver, Bool, Int, And, Or, Not, Implies,
-        sat, unsat, BoolRef
+        sat, unsat, BoolRef,AtMost
     )
     Z3_AVAILABLE = True
 except ImportError:
@@ -61,6 +61,8 @@ class NodeType(Enum):
     BRANCH = auto()
     ASSIGN = auto()
     DEREF = auto()
+    GOTO = auto()
+    LABEL = auto()
 
 
 @dataclass
@@ -169,7 +171,14 @@ class CallGraphBuilder:
             return None
 
         callee = source[func_node.start_byte:func_node.end_byte].decode(errors="ignore").strip()
-        line = node.start_point[0] + 1
+        
+        base = 0
+        if isinstance(caller_info, dict):
+            base = int(caller_info.get("start_line", 0) or 0)
+        else:
+            base = int(getattr(caller_info, "start_line", 0) or 0)
+
+        line = (node.start_point[0] + 1) + (base - 1 if base > 0 else 0)
 
         is_indirect = func_node.type != "identifier"
 
@@ -674,7 +683,7 @@ class CFGBuilder:
         self.alloc_out_params = alloc_out_params or {}
 
 
-    def build(self, code: str) -> dict[int, CFGNode]:
+    def build(self, code: str, line_offset: int = 0) -> dict[int, CFGNode]:
         """Build CFG from function code.
 
         Fixes:
@@ -701,7 +710,7 @@ class CFGBuilder:
             nodes[nid] = CFGNode(
                 id=nid,
                 node_type=nt,
-                line=line,
+                line=(line + line_offset) if line > 0 else line,
                 code=code_txt,
                 variable=variable,
                 obj=obj,
@@ -733,21 +742,39 @@ class CFGBuilder:
         if body is None:
             # Fallback: walk whole tree if we couldn't find a body
             body = tree.root_node
+            
+        label_nodes: dict[str, int] = {}
+        pending_gotos: list[tuple[int, str]] = []  # (goto_node_id, label_name)
+
+
 
         exit_id = new_node(NodeType.EXIT, 0, "exit")
 
         def build_stmt_list(stmt_list_node, in_id: int) -> int:
-            """Build sequential CFG for a list of statements.
-            Returns the 'tail' node id after the list.
-            """
-            cur = in_id
+            cur: Optional[int] = in_id
+            last_reachable: int = in_id
+
             for st in stmt_list_node.children:
                 if st.type in ("{", "}"):
                     continue
-                cur = build_stmt(st, cur)
-            return cur
 
-        def build_stmt(st_node, in_id: int) -> int:
+                # Keep building nodes even if cur is None (so labels exist),
+                # but do not connect fallthrough edges in that case.
+                tail = build_stmt(st, cur)
+
+                if cur is not None:
+                    last_reachable = tail
+                    if nodes[tail].node_type in (NodeType.RETURN, NodeType.GOTO):
+                        cur = None
+                    else:
+                        cur = tail
+
+            return last_reachable
+
+
+
+
+        def build_stmt(st_node,in_id: Optional[int]) -> int:
             """Build CFG for a statement; returns the tail node id."""
             # if-statement: create BRANCH and split edges
             if st_node.type == "if_statement":
@@ -760,20 +787,70 @@ class CFGBuilder:
                     st_node.start_point[0] + 1,
                     source[st_node.start_byte:st_node.end_byte].decode(errors="ignore"),
                 )
-                add_edge(in_id, rid)
+                if in_id is not None:
+                    add_edge(in_id, rid)
                 add_edge(rid, exit_id)
                 return rid
+
+            # labeled_statement:  label: statement
+            if st_node.type == "labeled_statement":
+                label_id_node = st_node.child(0)
+                label_name = source[label_id_node.start_byte:label_id_node.end_byte].decode(errors="ignore").strip()
+
+                lid = new_node(NodeType.LABEL, st_node.start_point[0] + 1, f"{label_name}:")
+                label_nodes[label_name] = lid
+                if in_id is not None:
+                    add_edge(in_id, lid)
+
+
+                # ✅ robust: tree-sitter has a "statement" field for labeled_statement in many grammars
+                body_stmt = st_node.child_by_field_name("statement")
+                if body_stmt is None:
+                    # ✅ fallback: last meaningful child (not ":" or identifier)
+                    body_stmt = None
+                    for ch in reversed(st_node.children):
+                        if ch.type not in (":", "identifier"):
+                            body_stmt = ch
+                            break
+
+                if body_stmt is not None:
+                    return build_stmt(body_stmt, lid)
+                return lid
+
+
+
+            if st_node.type == "goto_statement":
+                # goto <identifier> ;
+                # identifier is usually child(1)
+                target_node = None
+                for ch in st_node.children:
+                    if ch.type == "identifier":
+                        target_node = ch
+                        break
+                label = source[target_node.start_byte:target_node.end_byte].decode(errors="ignore").strip() if target_node else ""
+
+                gid = new_node(NodeType.GOTO, st_node.start_point[0] + 1,
+                            source[st_node.start_byte:st_node.end_byte].decode(errors="ignore").strip())
+                if in_id is not None:
+                    add_edge(in_id, gid)
+                pending_gotos.append((gid, label))
+
+                # IMPORTANT: goto is terminal in that path (don’t fallthrough)
+                return gid
 
             # expression_statement: may contain call_expression / deref / etc.
             # We'll scan inside it and emit nodes for interesting operations
             tail = in_id
             created_any = False
+
             for n in st_node.children:
-                # or only walk one level down, or filter
                 cfg_n = self._process_node(n, source, node_id)
                 if cfg_n:
-                    # materialize the node into `nodes` with a fresh id
-                    nid = new_node(cfg_n.node_type, cfg_n.line, cfg_n.code, cfg_n.variable, cfg_n.obj, cfg_n.condition)
+                    nid = new_node(
+                        cfg_n.node_type, cfg_n.line, cfg_n.code,
+                        cfg_n.variable, cfg_n.obj, cfg_n.condition
+                    )
+                    # ✅ chain forward: tail -> nid
                     add_edge(tail, nid)
                     tail = nid
                     created_any = True
@@ -781,8 +858,9 @@ class CFGBuilder:
             if created_any:
                 return tail
 
-            # default: ignore, keep flow
             return in_id
+        def is_terminal(nid: int) -> bool:
+            return nodes[nid].node_type in (NodeType.RETURN, NodeType.EXIT)
 
         def build_if(if_node, in_id: int) -> int:
             """Build CFG for if/else with proper join."""
@@ -811,7 +889,8 @@ class CFGBuilder:
                     then_tail = build_stmt_list(then_part, bid)
                 else:
                     then_tail = build_stmt(then_part, bid)
-            add_edge(then_tail, join_id)
+            if not is_terminal(then_tail):
+                add_edge(then_tail, join_id)
 
             # ELSE branch
             else_tail = bid
@@ -820,7 +899,8 @@ class CFGBuilder:
                     else_tail = build_stmt_list(else_part, bid)
                 else:
                     else_tail = build_stmt(else_part, bid)
-            add_edge(else_tail, join_id)
+            if not is_terminal(else_tail):
+                add_edge(else_tail, join_id)
 
             return join_id
 
@@ -832,11 +912,40 @@ class CFGBuilder:
             tail = build_stmt(body, entry_id)
 
         # If the last statement didn't return, connect to EXIT
-        if exit_id not in nodes[tail].successors:
+        if nodes[tail].node_type not in (NodeType.RETURN, NodeType.GOTO, NodeType.EXIT):
             add_edge(tail, exit_id)
+
+            
+        # Patch goto edges to labels
+        for gid, label in pending_gotos:
+            tgt = label_nodes.get(label)
+            logger.info(f"goto {label} to {tgt}")
+
+            # ✅ remove any bogus successors accumulated earlier
+            for s in list(nodes[gid].successors):
+                nodes[gid].successors.remove(s)
+                if gid in nodes[s].predecessors:
+                    nodes[s].predecessors.remove(gid)
+
+            if tgt is not None:
+                add_edge(gid, tgt)
+            else:
+                add_edge(gid, exit_id)
+
+
+
 
         return nodes
 
+    def _rhs_allocator_call(self, rhs_node, source: bytes) -> str:
+        # return allocator function name if rhs is call_expression to known alloc func
+        if rhs_node is None or rhs_node.type != "call_expression":
+            return ""
+        fn = rhs_node.child_by_field_name("function")
+        if not fn:
+            return ""
+        fname = source[fn.start_byte:fn.end_byte].decode(errors="ignore").strip()
+        return fname if fname in self.alloc_funcs else ""
 
     def _walk(self, node):
         yield node
@@ -852,6 +961,8 @@ class CFGBuilder:
             return self._process_return(node, source, node_id)
         elif node.type in ("pointer_expression", "subscript_expression", "field_expression"):
             return self._process_deref(node, source, node_id)
+        elif node.type == "goto_statement":
+            return self._process_goto(node, source, node_id)
 
         # NEW: capture escapes like Users = raxNew(), UsersToLoad = listCreate(), etc.
         elif node.type == "assignment_expression":
@@ -861,24 +972,30 @@ class CFGBuilder:
 
         return None
 
-    
-    def _process_assign(self, node, source: bytes, node_id: int) -> Optional[CFGNode]:
-        """
-        Emit ASSIGN node so leak checker can detect escape events like:
-        *out = p
-        global = p
-        obj->field = p
-        """
+    def _process_goto(self, node, source: bytes, node_id: int) -> Optional[CFGNode]:
+        # "goto label;"
         line = node.start_point[0] + 1
         code = source[node.start_byte:node.end_byte].decode(errors="ignore").strip()
-        if not code:
+
+        # tree-sitter-c: goto_statement has a child "identifier"
+        label = ""
+        for ch in node.children:
+            if ch.type == "identifier":
+                label = source[ch.start_byte:ch.end_byte].decode(errors="ignore").strip()
+                break
+
+        if not label:
             return None
+
         return CFGNode(
             id=node_id,
-            node_type=NodeType.ASSIGN,
+            node_type=NodeType.GOTO,
             line=line,
             code=code,
+            variable=label,   # store label name here
+            obj=label,
         )
+
         
     def _node_text(self, node, source: bytes) -> str:
         return source[node.start_byte:node.end_byte].decode(errors="ignore")
@@ -898,6 +1015,21 @@ class CFGBuilder:
 
         lhs_txt = self._node_text(left, source).strip()
         rhs_txt = self._node_text(right, source).strip()
+        
+        # If RHS is an allocator call, emit ALLOC instead of plain ASSIGN
+        alloc_name = self._rhs_allocator_call(right, source)
+        if alloc_name:
+            # choose a “variable identity”: for normal locals use identifier; for "*cause" use empty
+            var = lhs_txt if re.fullmatch(r"[A-Za-z_]\w*", lhs_txt) else ""
+            return CFGNode(
+                id=node_id,
+                node_type=NodeType.ALLOC,
+                line=node.start_point[0] + 1,
+                code=f"{lhs_txt} = {rhs_txt}",
+                variable=var,
+                obj=lhs_txt,  # keep full lhs expr too
+            )
+
 
         # Keep full assignment text (without requiring semicolon)
         code = f"{lhs_txt} = {rhs_txt}"
@@ -1576,6 +1708,24 @@ class WarningValidator:
                 return True
 
         return False
+    
+    def _dump_cfg(self, cfg: dict[int, CFGNode], func_name: str, alloc_line: int = -1, exit_line: int = -1):
+        logger.info("=== CFG dump for %s (nodes=%d) ===", func_name, len(cfg))
+
+        # show node list
+        for n in sorted(cfg.values(), key=lambda x: (x.line, x.id)):
+            mark = ""
+            if alloc_line > 0 and n.line == alloc_line:
+                mark += " [ALLOC_LINE]"
+            if exit_line > 0 and n.line == exit_line and n.node_type in (NodeType.RETURN, NodeType.EXIT):
+                mark += " [EXIT_LINE]"
+            logger.info(
+                "id=%d line=%d type=%s preds=%s succs=%s%s | %s",
+                n.id, n.line, n.node_type.name,
+                n.predecessors, n.successors, mark,
+                (n.code or "").strip().replace("\n", " ")[:120],
+            )
+
 
 
 
@@ -1609,13 +1759,14 @@ class WarningValidator:
 
         confirmed = []
         filtered = []
+        unconfirmed=[]
 
         for warning in warnings:
             func = functions.get(warning.function_name)
             if not func:
                 logger.warning("Validator: function not found for warning: %s (available=%d). Example keys: %s",
                             warning.function_name, len(functions), list(functions.keys())[:20])
-                confirmed.append(warning)
+                unconfirmed.append(warning)
                 continue
 
 
@@ -1636,7 +1787,7 @@ class WarningValidator:
                     f"Filtered {warning.function_name}:{warning.line_number}: {result.reason}"
                 )
 
-        return confirmed, filtered
+        return confirmed, filtered, unconfirmed
 
     def _check_feasibility(
         self,
@@ -1647,9 +1798,22 @@ class WarningValidator:
         alloc_out_params: Optional[dict[str, int]] = None,
     ) -> PathFeasibilityResult:
         """Check if warning's bug path is feasible."""
+        
+        logger.info(f"check_feasibility: {func.name}")
         try:
             cfg_builder = CFGBuilder(alloc_funcs, free_funcs, alloc_out_params=alloc_out_params or {})
-            cfg = cfg_builder.build(func.code)
+            line_offset = (getattr(func, "start_line", 1) or 1) - 1
+            if line_offset < 0:
+                line_offset = 0
+
+            cfg = cfg_builder.build(func.code, line_offset=line_offset)
+
+
+            
+            alloc_line = self._trace_alloc_line(warning)
+            exit_line  = self._trace_end_line(warning)
+            logger.info(f"dump")    
+            self._dump_cfg(cfg, warning.function_name, alloc_line, exit_line)
 
             if warning.issue_type == MemoryIssueType.MEMORY_LEAK:
                 return self._check_leak_feasibility(cfg, warning)
@@ -1661,8 +1825,8 @@ class WarningValidator:
                 return PathFeasibilityResult(is_feasible=False, reason="unsupported bug type in validator")
 
         except Exception as e:
-            logger.debug(f"Feasibility check failed: {e}")
-            return PathFeasibilityResult(is_feasible=True, reason=f"analysis failed: {e}")
+            logger.error(f"Feasibility check failed: {e}")
+            return PathFeasibilityResult(is_feasible=False, reason=f"analysis failed: {e}")
 
 
 
@@ -1768,6 +1932,7 @@ class WarningValidator:
         warning: Warning,
     ) -> PathFeasibilityResult:
         solver = Solver()
+        solver.set(unsat_core=True)
 
         alloc_nodes = [n for n in cfg.values() if n.node_type == NodeType.ALLOC]
         exit_nodes = [n for n in cfg.values() if n.node_type in (NodeType.EXIT, NodeType.RETURN)]
@@ -1776,41 +1941,37 @@ class WarningValidator:
 
         alloc_var = self._choose_alloc_var(cfg, warning)
         if not alloc_var:
-            return PathFeasibilityResult(is_feasible=True, reason="unknown allocated variable (conservative)")
+            return PathFeasibilityResult(is_feasible=False, reason="unknown allocated variable (conservative)")
 
         reach   = {n.id: Bool(f"reach_{n.id}")   for n in cfg.values()}
-        allocd  = {n.id: Bool(f"allocd_{n.id}")  for n in cfg.values()}   # NEW
+        allocd  = {n.id: Bool(f"allocd_{n.id}")  for n in cfg.values()}
         freed   = {n.id: Bool(f"freed_{n.id}")   for n in cfg.values()}
         escaped = {n.id: Bool(f"escaped_{n.id}") for n in cfg.values()}
 
         entry = next(n for n in cfg.values() if n.node_type == NodeType.ENTRY)
         solver.add(reach[entry.id] == True)
-        solver.add(allocd[entry.id] == False)    # NEW
+        solver.add(allocd[entry.id] == False)
         solver.add(freed[entry.id] == False)
         solver.add(escaped[entry.id] == False)
-        
+
         # --- Use CodeQL trace: require reaching the allocation site and the exit point ---
         alloc_line = self._trace_alloc_line(warning)
         exit_line = self._trace_end_line(warning)
-            
-        # Optional: only add if we found matching nodes
+
         if alloc_line > 0:
             matching_nodes = [n for n in cfg.values() if n.line == alloc_line]
             if matching_nodes:
-                solver.add(Or(*[And(reach[n.id], n.line == alloc_line) for n in matching_nodes]))
+                solver.add(Or(*[reach[n.id] for n in matching_nodes]))
             else:
                 logger.warning(f"No CFG nodes at allocation line {alloc_line} for {warning.function_name}")
 
         if exit_line > 0:
             matching_exit_nodes = [
-                n for n in cfg.values() 
+                n for n in cfg.values()
                 if n.line == exit_line and n.node_type in (NodeType.RETURN, NodeType.EXIT)
             ]
             if matching_exit_nodes:
-                solver.add(Or(*[
-                    And(reach[n.id], n.line == exit_line)
-                    for n in matching_exit_nodes
-                ]))
+                solver.add(Or(*[reach[n.id] for n in matching_exit_nodes]))
             else:
                 logger.warning(f"No CFG nodes at exit line {exit_line} for {warning.function_name}")
 
@@ -1819,11 +1980,7 @@ class WarningValidator:
         for tl in trace_lines[1:-1]:
             matching_trace = [n for n in cfg.values() if n.line == tl]
             if matching_trace:
-                solver.add(Or(*[
-                    And(reach[n.id], n.line == tl)
-                    for n in matching_trace
-                ]))
-
+                solver.add(Or(*[reach[n.id] for n in matching_trace]))
 
         def alloc_matches_var(node: CFGNode) -> bool:
             # Return-value alloc: variable is LHS identifier extracted by CFGBuilder
@@ -1841,62 +1998,86 @@ class WarningValidator:
             if o and o == alloc_var:
                 return True
 
-            # IMPORTANT: do NOT treat "mentions alloc_var" as freeing it.
-            # free(p->x) does NOT free p.
             return False
 
+        # -------------------------------------------------------------------------
+        # PATH-SENSITIVE encoding: choose at most one predecessor edge into each node
+        # -------------------------------------------------------------------------
+        # edge[(p,n)] means: the modeled path takes predecessor p into node n
+        edge: dict[tuple[int, int], BoolRef] = {}
+        for n in cfg.values():
+            for p in n.predecessors:
+                edge[(p, n.id)] = Bool(f"edge_{p}_{n.id}")
+
         for node in cfg.values():
-            if node.node_type == NodeType.ENTRY:
+            if node.id == entry.id:
                 continue
 
             preds = node.predecessors
-            if preds:
-                solver.add(reach[node.id] == Or(*[reach[p] for p in preds]))
-
-                # allocated propagates existentially ("there exists a path where allocated happened")
-                alloc_from_preds = Or(*[allocd[p] for p in preds])
-                if alloc_matches_var(node):
-                    solver.add(allocd[node.id] == Or(alloc_from_preds, reach[node.id]))
-                else:
-                    solver.add(allocd[node.id] == alloc_from_preds)
-
-                # freed propagates, but only becomes true if we are already allocated on that path
-                freed_from_preds = Or(*[freed[p] for p in preds])
-                if free_matches_alloc(node):
-                    solver.add(freed[node.id] == Or(freed_from_preds, And(reach[node.id], allocd[node.id])))
-                else:
-                    solver.add(freed[node.id] == freed_from_preds)
-
-                # escaped propagates
-                solver.add(escaped[node.id] == Or(*[escaped[p] for p in preds]))
-            else:
+            if not preds:
                 solver.add(reach[node.id] == False)
                 solver.add(allocd[node.id] == False)
                 solver.add(freed[node.id] == False)
                 solver.add(escaped[node.id] == False)
+                continue
+
+            incoming = [edge[(p, node.id)] for p in preds]
+
+            # At most one incoming edge is chosen for this node on the modeled path
+            solver.add(AtMost(*incoming, 1))
+
+            # If an edge is chosen, its predecessor must be reachable
+            for p in preds:
+                solver.add(Implies(edge[(p, node.id)], reach[p]))
+
+            # Node is reachable iff some incoming edge is chosen
+            solver.add(reach[node.id] == Or(*incoming))
+
+            # Propagate state ONLY from the chosen predecessor
+            alloc_from = Or(*[And(edge[(p, node.id)], allocd[p]) for p in preds])
+            freed_from = Or(*[And(edge[(p, node.id)], freed[p]) for p in preds])
+            esc_from   = Or(*[And(edge[(p, node.id)], escaped[p]) for p in preds])
+
+            # Allocation event: allocd becomes true at the alloc node when reachable
+            if alloc_matches_var(node):
+                solver.add(allocd[node.id] == Or(alloc_from, reach[node.id]))
+            else:
+                solver.add(allocd[node.id] == alloc_from)
+
+            # Free event: only counts if we were allocated on this modeled path
+            if free_matches_alloc(node):
+                solver.add(freed[node.id] == Or(freed_from, And(reach[node.id], allocd[node.id])))
+            else:
+                solver.add(freed[node.id] == freed_from)
+
+            # Escape event occurs only on this node/path (not by OR-merging other branches)
+            escape_now = False
 
             # Escape: out-parameter allocation (only if this is the tracked object)
             if node.node_type == NodeType.ALLOC and (node.variable or "").startswith("arg"):
-                # only mark escaped if this alloc is the one we track
                 if alloc_matches_var(node):
-                    solver.add(Implies(reach[node.id], escaped[node.id]))
+                    escape_now = True
 
             # Escape: return alloc_var (only if allocated)
-            if node.node_type == NodeType.RETURN:
-                if self._mentions_var(node.code, alloc_var):
-                    solver.add(Implies(And(reach[node.id], allocd[node.id]), escaped[node.id]))
+            if node.node_type == NodeType.RETURN and self._mentions_var(node.code, alloc_var):
+                escape_now = True
 
             # Escape: store alloc_var into sink (only if allocated)
-            if node.node_type == NodeType.ASSIGN:
-                if self._is_escape_event(node.code, alloc_var):
-                    solver.add(Implies(And(reach[node.id], allocd[node.id]), escaped[node.id]))
+            if node.node_type == NodeType.ASSIGN and self._is_escape_event(node.code, alloc_var):
+                escape_now = True
 
-
+            if escape_now:
+                solver.add(escaped[node.id] == Or(esc_from, And(reach[node.id], allocd[node.id])))
+            else:
+                solver.add(escaped[node.id] == esc_from)
 
         # Leak exists if reachable exit where:
         # - alloc happened on that path
         # - not freed
         # - not escaped
+        if not exit_nodes:
+            return PathFeasibilityResult(is_feasible=False, reason="no exit/return nodes in CFG")
+
         leak_conditions = [
             And(reach[x.id], allocd[x.id], Not(freed[x.id]), Not(escaped[x.id]))
             for x in exit_nodes
@@ -1907,7 +2088,6 @@ class WarningValidator:
         if result == sat:
             return PathFeasibilityResult(is_feasible=True, reason=f"leak path exists for {alloc_var}")
         return PathFeasibilityResult(is_feasible=False, reason=f"all paths free/escape or never allocate {alloc_var}")
-
 
 
 
