@@ -654,7 +654,6 @@ class TransitiveAnalyzer:
 
         return (False, -1, [])
 
-
 # =============================================================================
 # CFG Builder
 # =============================================================================
@@ -1203,6 +1202,7 @@ class CFGBuilder:
         )
 
 
+
 # =============================================================================
 # Hint Validator
 # =============================================================================
@@ -1602,8 +1602,10 @@ class WarningValidator:
                 finfo = functions.get(func_name)
                 if not finfo:
                     continue
-                # Only treat as FREE if it frees the argument pointer itself.
-                free_funcs.add(func_name)
+                if arg_idx is None or arg_idx < 0:
+                    continue
+                if self._directly_frees_param_pointer(finfo, arg_idx):
+                    free_funcs.add(func_name)
 
         confirmed = []
         filtered = []
@@ -1698,46 +1700,33 @@ class WarningValidator:
         return False
 
     def _choose_alloc_var(self, cfg: dict[int, CFGNode], warning: Warning) -> str:
-        # 0) If CodeQL stored an allocation_site string like "...:123" or "line 123"
-        alloc_site_line = -1
-        alloc_site = getattr(warning, "allocation_site", "") or ""
-        if alloc_site:
-            m = re.search(r"\b(\d+)\b", alloc_site)
-            if m:
-                alloc_site_line = int(m.group(1))
+        target_line = self._trace_alloc_line(warning)
 
-        # 1) Prefer CodeQL alloc-site line if present, otherwise fall back to warning line
-        target_line = alloc_site_line if alloc_site_line > 0 else (getattr(warning, "line_number", -1) or -1)
+        alloc_nodes = [n for n in cfg.values() if n.node_type == NodeType.ALLOC]
 
-        # 2) Collect allocation nodes with an identity
-        allocs = [n for n in cfg.values() if n.node_type == NodeType.ALLOC]
-        candidates = []
-        for n in allocs:
-            ident = (n.variable or (n.obj or "")).strip()
-            if ident:
-                candidates.append((n.line, ident))
-
-        if not candidates:
-            return ""
-
-        # 3) If we have a target line, pick the allocation whose line is closest (prefer <= target_line)
+        # 1) Best: exact ALLOC node at allocation_site line
         if target_line > 0:
-            # Prefer allocations at/above the target line (closest backward), else closest overall
-            before = [(ln, ident) for (ln, ident) in candidates if ln <= target_line]
+            exact = [n for n in alloc_nodes if n.line == target_line]
+            for n in exact:
+                ident = (n.variable or n.obj or "").strip()
+                if ident:
+                    return ident
+
+        # 2) Next: nearest ALLOC before that line
+        if target_line > 0:
+            before = [n for n in alloc_nodes if n.line <= target_line and (n.variable or n.obj)]
             if before:
-                # choose nearest previous alloc
-                ln, ident = max(before, key=lambda x: x[0])
+                n = max(before, key=lambda x: x.line)
+                return (n.variable or n.obj).strip()
+
+        # 3) Fallback: first alloc with identity
+        for n in alloc_nodes:
+            ident = (n.variable or n.obj or "").strip()
+            if ident:
                 return ident
 
-            # otherwise choose nearest alloc by absolute distance
-            ln, ident = min(candidates, key=lambda x: abs(x[0] - target_line))
-            return ident
+        return ""
 
-        # 4) Fallback: first alloc identity
-        return candidates[0][1]
-
-
-    
     def _sanitize(self, s: str) -> str:
         """Sanitize an arbitrary expression to a Z3-safe symbol suffix."""
         if not s:
@@ -1746,6 +1735,31 @@ class WarningValidator:
         s = re.sub(r"[^A-Za-z0-9_]", "_", s)
         # avoid super long names
         return s[:120]
+
+    def _parse_trace_lines(self, warning: Warning) -> list[int]:
+        """
+        warning.trace entries look like "layout-custom.c:176".
+        Return list of line numbers only (best-effort).
+        """
+        lines = []
+        for t in (warning.trace or []):
+            m = re.search(r":(\d+)\b", str(t))
+            if m:
+                lines.append(int(m.group(1)))
+        return lines
+
+    def _trace_end_line(self, warning: Warning) -> int:
+        lines = self._parse_trace_lines(warning)
+        return lines[-1] if lines else -1
+
+    def _trace_alloc_line(self, warning: Warning) -> int:
+        # Prefer allocation_site, else first trace line
+        alloc_site = (warning.allocation_site or "").strip()
+        m = re.search(r":(\d+)\b", alloc_site)
+        if m:
+            return int(m.group(1))
+        lines = self._parse_trace_lines(warning)
+        return lines[0] if lines else -1
 
 
     def _check_leak_feasibility(
@@ -1774,6 +1788,42 @@ class WarningValidator:
         solver.add(allocd[entry.id] == False)    # NEW
         solver.add(freed[entry.id] == False)
         solver.add(escaped[entry.id] == False)
+        
+        # --- Use CodeQL trace: require reaching the allocation site and the exit point ---
+        alloc_line = self._trace_alloc_line(warning)
+        exit_line = self._trace_end_line(warning)
+            
+        # Optional: only add if we found matching nodes
+        if alloc_line > 0:
+            matching_nodes = [n for n in cfg.values() if n.line == alloc_line]
+            if matching_nodes:
+                solver.add(Or(*[And(reach[n.id], n.line == alloc_line) for n in matching_nodes]))
+            else:
+                logger.warning(f"No CFG nodes at allocation line {alloc_line} for {warning.function_name}")
+
+        if exit_line > 0:
+            matching_exit_nodes = [
+                n for n in cfg.values() 
+                if n.line == exit_line and n.node_type in (NodeType.RETURN, NodeType.EXIT)
+            ]
+            if matching_exit_nodes:
+                solver.add(Or(*[
+                    And(reach[n.id], n.line == exit_line)
+                    for n in matching_exit_nodes
+                ]))
+            else:
+                logger.warning(f"No CFG nodes at exit line {exit_line} for {warning.function_name}")
+
+        # Optional intermediate trace lines - only add if nodes exist
+        trace_lines = self._parse_trace_lines(warning)
+        for tl in trace_lines[1:-1]:
+            matching_trace = [n for n in cfg.values() if n.line == tl]
+            if matching_trace:
+                solver.add(Or(*[
+                    And(reach[n.id], n.line == tl)
+                    for n in matching_trace
+                ]))
+
 
         def alloc_matches_var(node: CFGNode) -> bool:
             # Return-value alloc: variable is LHS identifier extracted by CFGBuilder
@@ -1827,18 +1877,20 @@ class WarningValidator:
 
             # Escape: out-parameter allocation (only if this is the tracked object)
             if node.node_type == NodeType.ALLOC and (node.variable or "").startswith("arg"):
-                # This is not alloc_var usually; keep if you intentionally treat argX as escaped
-                solver.add(escaped[node.id] == True)
+                # only mark escaped if this alloc is the one we track
+                if alloc_matches_var(node):
+                    solver.add(Implies(reach[node.id], escaped[node.id]))
 
-            # Escape: return alloc_var (only makes sense after allocation)
+            # Escape: return alloc_var (only if allocated)
             if node.node_type == NodeType.RETURN:
                 if self._mentions_var(node.code, alloc_var):
-                    solver.add(escaped[node.id] == And(reach[node.id], allocd[node.id]))
+                    solver.add(Implies(And(reach[node.id], allocd[node.id]), escaped[node.id]))
 
-            # Escape: store alloc_var into sink (only makes sense if you actually emitted ASSIGN nodes)
+            # Escape: store alloc_var into sink (only if allocated)
             if node.node_type == NodeType.ASSIGN:
                 if self._is_escape_event(node.code, alloc_var):
-                    escaped[node.id] == True
+                    solver.add(Implies(And(reach[node.id], allocd[node.id]), escaped[node.id]))
+
 
 
         # Leak exists if reachable exit where:
