@@ -53,7 +53,7 @@ ENHANCED_MEMORY_NEVER_FREED = '''/**
  * @name Memory is never freed (Enhanced)
  * @description Enhanced version with better error-path detection.
  *              Detects memory allocated but never freed, including in error paths.
- * @kind path-problem
+ * @kind problem
  * @id cpp/memory-never-freed-enhanced
  * @problem.severity warning
  * @security-severity 7.5
@@ -112,7 +112,7 @@ select alloc, "This memory is " + reason + "."
 ENHANCED_MEMORY_MAY_NOT_BE_FREED = '''/**
  * @name Memory may not be freed (Enhanced)
  * @description Enhanced version that better tracks memory through early returns.
- * @kind path-problem
+ * @kind problem
  * @id cpp/memory-may-not-be-freed-enhanced
  * @problem.severity warning
  * @security-severity 7.5
