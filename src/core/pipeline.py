@@ -604,24 +604,43 @@ class Pipeline:
         )
         logger.info(f"  CodeQL found {len(warnings)} warnings")
 
+        warning_dump_path = output_dir / "codeql_warnings.json"
+
+        with open(warning_dump_path, "w") as f:
+            json.dump([w.to_dict() for w in warnings], f, indent=2)
+
+        logger.info(f"  Saved CodeQL warnings to {warning_dump_path}")
+
+        
+        # =====================================================================
+        # Phase 4: Load CodeQL warnings directly (skip CodeQL analysis)
+        # =====================================================================
+        # warning_dump_path = output_dir / "codeql_warnings.json"
+        # logger.info("Phase 4: Loading stored CodeQL warnings...")
+
+        # with open(warning_dump_path) as f:
+        #     warnings = [Warning.from_dict(w) for w in json.load(f)]
+
+        # logger.info(f"  Loaded {len(warnings)} warnings")
+
+
         # =====================================================================
         # Phase 5: Z3 filters false positives
         # =====================================================================
         logger.info("Phase 5: Filtering warnings with Z3 path analysis...")
 
-        # Initialize warning validator with known allocators
-        alloc_funcs = set(self.hints.get_allocators())
+        # Initialize warning validator with known allocators       
+        alloc_funcs = set(fn for fn, _ in self.hints.get_allocators())
         alloc_funcs.update({"malloc", "calloc", "realloc", "strdup"})
         free_funcs = set(fn for fn, _ in self.hints.get_deallocators())
         free_funcs.update({"free"})
 
         self.warning_validator = WarningValidator(alloc_funcs, free_funcs)
-        confirmed_warnings, filtered_warnings = self.warning_validator.validate_warnings(
+        confirmed_warnings, filtered_warnings ,unconfirmed_warnings= self.warning_validator.validate_warnings(
             warnings, self.functions, self.hints
         )
 
-        logger.info(f"  Confirmed: {len(confirmed_warnings)}, Filtered: {len(filtered_warnings)}")
-
+        logger.info(f"  Total warnings: {len(warnings)}, Confirmed: {len(confirmed_warnings)}, Filtered: {len(filtered_warnings)}, Unconfirmed: {len(unconfirmed_warnings)}")
         # Convert to Evidence
         confirmed_bugs = [
             Evidence(
@@ -637,7 +656,7 @@ class Pipeline:
         # =====================================================================
         # Export results
         # =====================================================================
-        self._export_results(output_dir, confirmed_bugs, filtered_warnings)
+        self._export_results(output_dir, confirmed_bugs, filtered_warnings, unconfirmed_warnings)
 
         return AnalysisResult(
             confirmed_bugs=confirmed_bugs,
@@ -660,6 +679,7 @@ class Pipeline:
         output_dir: Path,
         confirmed: list[Evidence],
         filtered: list[Warning],
+        unconfirmed: list[Warning],
     ) -> None:
         """Export analysis results."""
         # Confirmed bugs
@@ -672,7 +692,10 @@ class Pipeline:
                 "file": bug.warning.file_path,
                 "line": bug.warning.line_number,
                 "function": bug.warning.function_name,
+                "type": bug.warning.issue_type.name,
                 "message": bug.warning.message,
+                "allocation_site": bug.warning.allocation_site,
+                "trace": bug.warning.trace,
                 "suggested_fix": bug.suggested_fix,
             })
 
@@ -680,17 +703,38 @@ class Pipeline:
         bugs_file.write_text(json.dumps(bugs_data, indent=2))
 
         # Filtered warnings (for debugging)
-        filtered_data = [
-            {
+        filtered_data = {}
+        for w in filtered:
+            t = w.issue_type.name
+            if t not in filtered_data:
+                filtered_data[t] = []
+            filtered_data[w.issue_type.name].append({
                 "file": w.file_path,
                 "line": w.line_number,
-                "type": w.issue_type.name,
+                "function": w.function_name,
                 "message": w.message,
-            }
-            for w in filtered
-        ]
+                "allocation_site": w.allocation_site,
+                "trace": w.trace,
+            })
         filtered_file = output_dir / "filtered_warnings.json"
         filtered_file.write_text(json.dumps(filtered_data, indent=2))
+
+        # Unconfirmed warnings (for debugging)
+        unconfirmed_data = {}
+        for w in unconfirmed:
+            t = w.issue_type.name
+            if t not in unconfirmed_data:
+                unconfirmed_data[t] = []
+            unconfirmed_data[w.issue_type.name].append({
+                "file": w.file_path,
+                "line": w.line_number,
+                "function": w.function_name,
+                "message": w.message,
+                "allocation_site": w.allocation_site,
+                "trace": w.trace,
+            })
+        unconfirmed_file = output_dir / "unconfirmed_warnings.json"
+        unconfirmed_file.write_text(json.dumps(unconfirmed_data, indent=2))
 
         # Conflicts log
         if self.conflicts:
