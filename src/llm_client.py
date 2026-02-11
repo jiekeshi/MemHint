@@ -1185,28 +1185,63 @@ Every result MUST emit a message containing BOTH:
 - The exact phrase: `second call at line <line_number>`
 
 **Example messages:**
-- "SAFE_PAIR: Index-selected cleanup with different indices (second call at line 123)"
+- "SAFE_PAIR: Index-selected cleanup with different indices (0 vs 1) (second call at line 123)"
 - "SAFE_PAIR: Partial cleanup of different internal structures (second call at line 456)"
-- "SAFE_PAIR: Reference-counted release, multiple calls expected (second call at line 789)"
 
 This structured format allows the pipeline to:
 1. Identify which results are safe pairs (via `SAFE_PAIR`)
 2. Match them to CodeQL warnings by line number (via `second call at line X`)
 
-**3. What to Check:**
+**3. CRITICAL CODEQL SYNTAX RULES:**
+
+⚠️ **String Concatenation:** ALWAYS use `.toString()` when building messages
+```codeql
+// ✅ CORRECT:
+"... (second call at line " + call2.getLocation().getStartLine().toString() + ")"
+
+// ❌ WRONG (compilation error):
+"... (second call at line " + call2.getLocation().getStartLine() + ")"
+```
+
+⚠️ **Function Matching:** Use `getName() = "..."` for clarity
+```codeql
+// ✅ CORRECT:
+call1.getTarget().getName() = "{name}"
+
+// ⚠️ ALSO WORKS but less clear:
+call1.getTarget().hasName("{name}")
+```
+
+⚠️ **Same Function Context:** Include this check to avoid cross-function matches
+```codeql
+// ✅ CORRECT:
+call1.getEnclosingFunction() = call2.getEnclosingFunction() and
+```
+
+⚠️ **Argument Comparison:** Use `.toString()` for robust matching
+```codeql
+// ✅ CORRECT (handles literals AND variables):
+call1.getArgument(1).toString() != call2.getArgument(1).toString()
+
+// ❌ LIMITED (only works for literals):
+idx1.(Literal).getValue() != idx2.(Literal).getValue()
+```
+
+**4. What to Check:**
 Identify pairs of calls to `{name}` where:
 - Both calls operate on the same object/pointer (same base address)
 - The calls are safe due to the function's special semantics
-- For index-based: Different index arguments (check Literal values)
+- For index-based: Different index arguments (use toString() comparison)
 - For refcounted: Any pair is safe (refcount handles it)
 - For conditional: State checking makes it idempotent
 
-**4. Allowed CodeQL Constructs:**
+**5. Allowed CodeQL Constructs:**
 ✅ ALLOWED:
 - `import cpp`
 - Basic AST: `FunctionCall`, `Expr`, `Literal`, `Variable`, `IfStmt`
-- Literal comparison: `Literal.getValue()`, `.toString()`
+- Comparisons: `toString()`, `getName()`
 - Location info: `.getLocation().getStartLine()`
+- Function context: `.getEnclosingFunction()`
 
 ❌ FORBIDDEN:
 - `DataFlow` or `TaintTracking` imports
@@ -1230,35 +1265,55 @@ For a function like `_dictClear(dict *d, int htidx)` that clears `d->ht[htidx]`:
 
 import cpp
 
-from FunctionCall call1, FunctionCall call2, Literal idx1, Literal idx2
+from FunctionCall call1, FunctionCall call2
 where
   // Both calls target our function
   call1.getTarget().getName() = "{name}" and
   call2.getTarget().getName() = "{name}" and
   
-  // Second call comes after first call
+  // In the same function, second call comes after first
+  call1.getEnclosingFunction() = call2.getEnclosingFunction() and
   call1.getLocation().getStartLine() < call2.getLocation().getStartLine() and
   
   // Both calls operate on the same base pointer (argument 0)
+  // Use toString() for comparison - handles variables, expressions, etc.
   call1.getArgument(0).toString() = call2.getArgument(0).toString() and
   
-  // Extract index arguments (assuming index is argument 1)
-  idx1 = call1.getArgument(1) and
-  idx2 = call2.getArgument(1) and
-  
-  // SAFE CONDITION: Different literal index values
-  idx1.getValue() != idx2.getValue()
+  // SAFE CONDITION: Different index arguments (argument 1)
+  // Use toString() to handle both literals (0, 1) and variables (ht0, ht1)
+  call1.getArgument(1).toString() != call2.getArgument(1).toString()
   
 select call2, 
   "SAFE_PAIR: Index-selected cleanup with different indices (" + 
-  idx1.getValue() + " vs " + idx2.getValue() + 
-  ") (second call at line " + call2.getLocation().getStartLine() + ")"
+  call1.getArgument(1).toString() + " vs " + call2.getArgument(1).toString() + 
+  ") (second call at line " + call2.getLocation().getStartLine().toString() + ")"
 ```
+
+**CRITICAL CODEQL SYNTAX REQUIREMENTS:**
+
+1. **String Conversion:** Always use `.toString()` when concatenating with strings
+   - ✅ Correct: `call2.getLocation().getStartLine().toString()`
+   - ❌ Wrong: `call2.getLocation().getStartLine()` (int, not string)
+
+2. **Function Name Matching:** Use `getName() = "..."` not `hasName(...)`
+   - ✅ Correct: `call1.getTarget().getName() = "{name}"`
+   - ❌ Wrong: `call1.getTarget().hasName("{name}")` (predicate, harder to use)
+
+3. **Argument Comparison:** Use `toString()` for robust matching
+   - Handles literals: `0` vs `1`
+   - Handles variables: `ht0` vs `ht1`
+   - Handles expressions: `i*2` vs `i*2+1`
+
+4. **Message Format (MANDATORY):**
+   - Must contain: `SAFE_PAIR`
+   - Must contain: `second call at line ` followed by the line number
+   - Line number MUST be converted to string with `.toString()`
 
 **Key points:**
 - Checks that both calls target the same object (argument 0)
-- Verifies index arguments (argument 1) have different literal values
-- Emits structured message with `SAFE_PAIR` and line number
+- Verifies index arguments (argument 1) have different values using toString()
+- Works for both literal values (0, 1) and variables (ht0, ht1)
+- Emits structured message with `SAFE_PAIR` and line number for pipeline parsing
 - Only reports when we can prove it's safe (different indices)
 
 ========================================
