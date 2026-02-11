@@ -12,10 +12,13 @@ import json
 import logging
 import os
 import re
+import subprocess
+import tempfile
 import time
-
+from pathlib import Path
 from tqdm import tqdm
-
+from typing import Any, Dict, List, Tuple, Optional
+from shutil import which
 try:
     import vertexai
     from vertexai.generative_models import GenerativeModel
@@ -28,7 +31,7 @@ except ImportError:  # pragma: no cover - environment may not have Vertex SDK
 
 
 
-from src.core.models import FunctionInfo, Hint, HintType, HintSet
+from src.core.models import FunctionInfo, Hint, HintType, HintSet, CustomQuery
 
 logger = logging.getLogger(__name__)
 
@@ -273,8 +276,9 @@ class HintGenerator:
     3. Combines both for comprehensive coverage
     """
 
-    def __init__(self, llm_client: LLMClient = None):
+    def __init__(self, llm_client: LLMClient = None, codeql_validator=None):
         self.llm = llm_client
+        self.codeql_validator = codeql_validator
         # Cost tracking: per function and per hint
         self.function_costs: dict[str, dict] = {}  # function_name -> cost info
         self.total_cost: float = 0.0
@@ -283,6 +287,9 @@ class HintGenerator:
         self.pointer_typedef_aliases: set[str] = set()
         # Snapshot of last filtering decision for external consumers (e.g., Pipeline)
         self.last_filter_classes: dict[str, list[str]] | None = None
+
+        # Custom CodeQL query generator for "special" functions
+        self.custom_query_generator: CustomQueryGenerator | None = None
 
     def set_pointer_typedef_aliases(self, aliases: set[str] | None) -> None:
         self.pointer_typedef_aliases = set(aliases or set())
@@ -712,12 +719,24 @@ The rejected hints are inconsistent with the code structure. Please:
             except KeyError:
                 continue
 
+            # Extract arg_semantics (convert string keys to int keys)
+            arg_semantics_raw = h.get("arg_semantics", {})
+            arg_semantics = {}
+            if isinstance(arg_semantics_raw, dict):
+                for k, v in arg_semantics_raw.items():
+                    try:
+                        arg_idx = int(k)
+                        arg_semantics[arg_idx] = str(v)
+                    except (ValueError, TypeError):
+                        pass
+
             hints.append(Hint(
                 function_name=func.name,
                 hint_type=hint_type,
                 target=h.get("target", "return"),
                 arg_index=h.get("arg_index", -1),
                 reason=h.get("reason", "LLM analysis"),
+                arg_semantics=arg_semantics,
             ))
 
         return hints
@@ -733,3 +752,892 @@ The rejected hints are inconsistent with the code structure. Please:
             "total_tokens": self.total_tokens,
             "function_costs": self.function_costs,
         }
+    
+"""
+CustomQueryGenerator: Generates custom CodeQL queries for functions with special semantics.
+
+This module uses an LLM to analyze C/C++ functions and generate targeted CodeQL queries
+for bug finding or false positive suppression based on memory safety hints and parameter semantics.
+"""
+
+
+class CodeQLValidator:
+    """Validator that uses CodeQL CLI to compile and validate queries."""
+    
+    def __init__(self, codeql_binary: str = "codeql", codeql_dir: Path | None = None, 
+                 database_path: Path | None = None, timeout: int = 30):
+        """
+        Initialize CodeQL validator.
+        
+        Args:
+            codeql_binary: Path to CodeQL binary (default: "codeql")
+            codeql_dir: Optional path to CodeQL installation directory
+            database_path: Optional path to CodeQL database (if available, can improve validation)
+            timeout: Timeout in seconds for validation (default: 30)
+        """
+        self.codeql_binary = codeql_binary
+        self.codeql_dir = codeql_dir
+        self.database_path = database_path
+        self.timeout = timeout
+        
+        # Check if CodeQL is available
+        if not which(codeql_binary):
+            raise ValueError(
+                f"CodeQL binary '{codeql_binary}' not found in PATH. "
+                "Please install CodeQL or provide the correct path."
+            )
+    
+    def validate_query(self, query_code: str) -> Tuple[bool, str]:
+        """
+        Validate a CodeQL query by writing it to a temp file and running codeql query compile.
+        
+        Args:
+            query_code: The CodeQL query code to validate
+        
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        if not query_code or not query_code.strip():
+            return False, "Query code is empty"
+        
+        # Create a temporary directory for the query file (needed for qlpack context)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            query_dir = Path(temp_dir)
+            query_file = query_dir / "query.ql"
+            
+            try:
+                # Write query to file
+                query_file.write_text(query_code)
+                
+                # Create qlpack.yml with required library dependencies
+                qlpack_file = query_dir / "qlpack.yml"
+                qlpack_content = """name: temp-query-pack
+version: 1.0.0
+libraryPathDependencies: codeql/cpp-all
+"""
+                qlpack_file.write_text(qlpack_content)
+                
+                # Run codeql query compile to validate the query
+                # Note: query compile validates syntax without needing a database
+                # The libraryPathDependencies in qlpack.yml provides the dbscheme
+                cmd = [self.codeql_binary, "query", "compile", "--check-only", str(query_file)]
+                
+                # Set environment if codeql_dir is provided
+                env = os.environ.copy()
+                if self.codeql_dir:
+                    env["CODEQL_HOME"] = str(self.codeql_dir)
+                
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout,
+                    env=env,
+                    cwd=str(query_dir),
+                )
+                
+                if result.returncode == 0:
+                    logger.info("CodeQL query validation passed successfully")
+                    return True, ""
+                else:
+                    # Return the error message - LLM will use this to fix the query
+                    error_msg = result.stderr.strip() or result.stdout.strip()
+                    if not error_msg:
+                        error_msg = f"CodeQL query compile failed with return code {result.returncode}"
+                    
+                    # Clean up error message - remove temp file paths
+                    error_msg = error_msg.replace(str(query_file), "query.ql")
+                    error_msg = error_msg.replace(str(query_dir), "")
+                    
+                    return False, error_msg
+                    
+            except Exception as e:
+                return False, f"Validation error: {str(e)}"
+
+
+class CustomQueryGenerator:
+    """Generates custom CodeQL queries for functions with special semantics."""
+    
+    def __init__(self, llm: Any = None, codeql_validator: Any = None):
+        """
+        Initialize the query generator.
+        
+        Args:
+            llm: Object with method query(prompt: str) -> dict
+                 Expected dict keys:
+                 - "content": dict with is_special/query_code/reason
+                 - "usage": dict with cost/token breakdown (optional)
+            codeql_validator: Optional validator object (if None, will try to create one automatically)
+        """
+        self.llm = llm
+        self.codeql_validator = codeql_validator
+        self.total_cost: float = 0.0
+        self.total_tokens: int = 0
+        self.function_costs: Dict[str, Dict[str, float]] = {}
+        
+        # Auto-create CodeQL validator if not provided and CodeQL is available
+        if not self.codeql_validator:
+            try:
+                self.codeql_validator = CodeQLValidator()
+                logger.info("CodeQL validator created automatically for query validation")
+            except Exception as e:
+                logger.debug(
+                    f"CodeQL validator not available (CodeQL not in PATH): {e}. "
+                    "Validation will use enhanced quick checks only."
+                )
+                self.codeql_validator = None
+    
+    # -------------------------------------------------------------------------
+    # Public API
+    # -------------------------------------------------------------------------
+    
+    def generate_custom_query_for_function(
+        self,
+        func: Any,
+        hints: List[Any],
+    ) -> Optional[CustomQuery]:
+        """
+        Generate a custom query for a function if it has special semantics.
+        
+        Args:
+            func: FunctionInfo object containing function metadata
+            hints: List of Hint objects with memory safety information
+        
+        Returns:
+            CustomQuery if the LLM marks it as special, else a CustomQuery with empty code
+        """
+        if not self.llm:
+            return None
+        
+        hints_text, arg_semantics_text = self._format_hints_and_mad(func, hints)
+        prompt = self._build_query_generation_prompt(func, hints_text, arg_semantics_text)
+        
+        logger.debug(
+            "Generating custom query for function: %s",
+            getattr(func, "name", "unknown")
+        )
+        
+        result = self.llm.query(prompt) or {}
+        usage = result.get("usage", {}) or {}
+        content = result.get("content", {}) or {}
+        
+        self._track_cost(getattr(func, "name", ""), usage)
+        
+        is_special = bool(content.get("is_special", False))
+        query_code = (content.get("query_code", "") or "").strip()
+        reason = (content.get("reason", "") or "LLM determined function needs custom query").strip()
+        
+        validated = False
+        validation_error = ""
+        
+        if is_special and query_code:
+            query_code, is_special, reason, validated, validation_error = self._validate_and_fix_query(
+                func_name=getattr(func, "name", ""),
+                query_code=query_code,
+                reason=reason,
+                original_prompt=prompt,
+            )
+        elif is_special and not query_code:
+            # Special but no query code means validation failed and couldn't be fixed
+            validated = False
+            validation_error = "No query code generated"
+        
+        return CustomQuery(
+            function_name=getattr(func, "name", ""),
+            query_code=query_code if is_special else "",
+            reason=reason,
+            is_special=is_special,
+            validated=validated,
+            validation_error=validation_error,
+        )
+    
+    def get_cost_summary(self) -> Dict[str, Any]:
+        """Get summary of LLM API costs and token usage."""
+        return {
+            "total_cost": self.total_cost,
+            "total_tokens": self.total_tokens,
+            "function_costs": self.function_costs,
+        }
+    
+    # -------------------------------------------------------------------------
+    # Formatting helpers
+    # -------------------------------------------------------------------------
+    
+    def _format_hints_and_mad(
+        self,
+        func: Any,
+        hints: List[Any]
+    ) -> Tuple[str, str]:
+        """
+        Convert hints and MAD (Memory Access Description) into readable text blocks.
+        
+        Args:
+            func: Function object
+            hints: List of hint objects
+            
+        Returns:
+            Tuple of (hints_text, arg_semantics_text)
+        """
+        hints_details: List[str] = []
+        all_arg_semantics: Dict[int, List[str]] = {}
+        
+        for hint in hints or []:
+            hint_type_name = getattr(
+                getattr(hint, "hint_type", None),
+                "name",
+                str(getattr(hint, "hint_type", ""))
+            )
+            target = getattr(hint, "target", "")
+            reason = getattr(hint, "reason", "")
+            
+            detail = f"- **{hint_type_name}** on `{target}`"
+            if reason:
+                detail += f": {reason}"
+            hints_details.append(detail)
+            
+            arg_sem = getattr(hint, "arg_semantics", {}) or {}
+            for arg_idx, semantic_desc in arg_sem.items():
+                try:
+                    arg_i = int(arg_idx)
+                except (ValueError, TypeError):
+                    continue
+                all_arg_semantics.setdefault(arg_i, []).append(str(semantic_desc))
+        
+        hints_text = "\n".join(hints_details) if hints_details else "No hints available"
+        
+        arg_semantics_text = ""
+        if all_arg_semantics:
+            arg_lines: List[str] = []
+            arg_names = getattr(func, "arg_names", []) or []
+            arg_types = getattr(func, "arg_types", []) or []
+            
+            for arg_idx in sorted(all_arg_semantics.keys()):
+                descs = "; ".join(sorted(set(all_arg_semantics[arg_idx])))
+                arg_name = arg_names[arg_idx] if arg_idx < len(arg_names) else f"arg{arg_idx}"
+                arg_type = arg_types[arg_idx] if arg_idx < len(arg_types) else "unknown"
+                arg_lines.append(f"- **Argument {arg_idx}** (`{arg_name}: {arg_type}`): {descs}")
+            
+            arg_semantics_text = "\n".join(arg_lines)
+        
+        return hints_text, arg_semantics_text
+    
+    # -------------------------------------------------------------------------
+    # Prompt engineering
+    # -------------------------------------------------------------------------
+    
+    def _build_query_generation_prompt(
+        self,
+        func: Any,
+        hints_text: str,
+        arg_semantics_text: str
+    ) -> str:
+        """
+        Build the LLM prompt for deciding specialness and generating a query.
+        
+        This prompt uses a MAD-driven approach to guide the LLM in creating
+        targeted CodeQL queries based on function semantics.
+        """
+        name = getattr(func, "name", "")
+        code = getattr(func, "code", "")
+        ret = getattr(func, "return_type", "") or "void"
+        arg_names = getattr(func, "arg_names", []) or []
+        arg_types = getattr(func, "arg_types", []) or []
+        
+        params_str = ", ".join(
+            [f"{t} {n}" for t, n in zip(arg_types, arg_names)]
+        ) if arg_names else "void"
+        
+        return f"""You are an expert CodeQL query generator specializing in C/C++ memory safety analysis.
+
+Your task has TWO parts:
+1. Determine if this function has SPECIAL SEMANTICS that cause false positive warnings
+2. If special, generate a FILTER QUERY to identify safe code patterns that should be suppressed
+
+========================================
+FUNCTION ANALYSIS
+========================================
+
+**Function Name:** `{name}`
+**Return Type:** `{ret}`
+**Parameters:** `{params_str}`
+
+**Source Code:**
+```c
+{code}
+```
+
+========================================
+MEMORY SAFETY HINTS (Z3-Validated)
+========================================
+{hints_text}
+
+{("========================================\\nPARAMETER SEMANTICS (MAD Analysis)\\n========================================\\n" + arg_semantics_text) if arg_semantics_text else ""}
+
+========================================
+DECISION FRAMEWORK
+========================================
+
+A function is "SPECIAL" if standard CodeQL queries produce **false positives** because:
+- The function has partial/conditional cleanup semantics
+- Multiple calls are safe due to internal state tracking
+- The function's behavior depends on specific argument values
+- Reference counting or pool allocation makes repeated calls safe
+
+**Your Goal:** Generate a filter query that identifies SAFE patterns where CodeQL incorrectly reports issues.
+
+⚠️ IMPORTANT: Your query doesn't suppress alerts directly. It produces structured evidence showing which specific call pairs are SAFE, and the pipeline uses this to filter false positives.
+
+========================================
+COMMON SPECIAL PATTERNS THAT NEED FILTER QUERIES
+========================================
+
+**Pattern 1: Partial/Index-Selected Cleanup (MOST COMMON)**
+
+The function performs partial cleanup - it frees internal sub-structures but NOT the main object itself, or it selectively cleans based on an index/flag parameter.
+
+**Example 1 - dictRelease (Partial Cleanup):**
+```c
+void dictRelease(dict *d)
+{{
+    _dictClear(d, 0, NULL);  // Clears internal hash table 0
+    _dictClear(d, 1, NULL);  // Clears internal hash table 1
+    zfree(d);                // Finally frees the dict itself
+}}
+```
+- `_dictClear()` is a DEALLOCATOR but only clears internal structures `d->ht[0]` and `d->ht[1]`
+- Calling `_dictClear(d, 0, NULL)` twice would be suspicious (double-clear same table)
+- Calling `_dictClear(d, 0, NULL)` then `_dictClear(d, 1, NULL)` is SAFE (different indices)
+- **Filter Query Goal:** Suppress double-free warnings when index arguments differ
+
+**Example 2 - Index-Selected Cleanup:**
+```c
+void clearBuffer(obj *o, int bufferIndex) {{
+    if (o->buffers[bufferIndex]) {{
+        free(o->buffers[bufferIndex]);
+        o->buffers[bufferIndex] = NULL;
+    }}
+}}
+```
+- Safe: `clearBuffer(o, 0)` then `clearBuffer(o, 1)` (different buffers)
+- Unsafe: `clearBuffer(o, 0)` then `clearBuffer(o, 0)` (same buffer twice)
+- **Filter Query Goal:** Check if literal index arguments differ between calls
+
+**Pattern 2: Reference-Counted Release**
+
+The function decrements a reference count and only frees when count reaches zero. Multiple calls are expected and safe.
+
+**Example:**
+```c
+void objRelease(obj *o) {{
+    if (--o->refcount == 0) {{
+        free(o);
+    }}
+}}
+```
+- Safe: Multiple `objRelease(o)` calls as long as refcount was properly incremented
+- **Filter Query Goal:** Suppress all double-free warnings for refcounted deallocators
+
+**Pattern 3: Conditional/Idempotent Cleanup**
+
+The function checks internal state flags before freeing, making it safe to call multiple times.
+
+**Example:**
+```c
+void cleanup(obj *o) {{
+    if (o->isInitialized) {{
+        freeResources(o);
+        o->isInitialized = false;
+    }}
+}}
+```
+- Safe: Multiple calls - first call sets flag to false, subsequent calls do nothing
+- **Filter Query Goal:** Suppress warnings when state-checking makes calls idempotent
+
+**Pattern 4: Pool/Arena Allocation**
+
+The function returns memory to a pool/arena rather than directly calling free().
+
+**Example:**
+```c
+void poolFree(arena *a, void *ptr) {{
+    // Returns memory to pool, doesn't call free()
+    markBlockAvailable(a, ptr);
+}}
+```
+- Safe: Multiple returns to pool (implementation handles this)
+- **Filter Query Goal:** Suppress warnings for arena-based allocators
+
+========================================
+FILTER QUERY OUTPUT CONTRACT
+========================================
+
+Your filter query MUST follow these rules to integrate with the pipeline:
+
+**1. Metadata Requirements:**
+- Use `@kind problem` (NOT path-problem)
+- Use stable `@id` starting with `cpp/custom-safe-`
+- Example: `@id cpp/custom-safe-{name}`
+- Severity: `@problem.severity recommendation`
+
+**2. Message Format (CRITICAL FOR PIPELINE PARSING):**
+Every result MUST emit a message containing BOTH:
+- The exact phrase: `SAFE_PAIR`
+- The exact phrase: `second call at line <line_number>`
+
+**Example messages:**
+- "SAFE_PAIR: Index-selected cleanup with different indices (second call at line 123)"
+- "SAFE_PAIR: Partial cleanup of different internal structures (second call at line 456)"
+- "SAFE_PAIR: Reference-counted release, multiple calls expected (second call at line 789)"
+
+This structured format allows the pipeline to:
+1. Identify which results are safe pairs (via `SAFE_PAIR`)
+2. Match them to CodeQL warnings by line number (via `second call at line X`)
+
+**3. What to Check:**
+Identify pairs of calls to `{name}` where:
+- Both calls operate on the same object/pointer (same base address)
+- The calls are safe due to the function's special semantics
+- For index-based: Different index arguments (check Literal values)
+- For refcounted: Any pair is safe (refcount handles it)
+- For conditional: State checking makes it idempotent
+
+**4. Allowed CodeQL Constructs:**
+✅ ALLOWED:
+- `import cpp`
+- Basic AST: `FunctionCall`, `Expr`, `Literal`, `Variable`, `IfStmt`
+- Literal comparison: `Literal.getValue()`, `.toString()`
+- Location info: `.getLocation().getStartLine()`
+
+❌ FORBIDDEN:
+- `DataFlow` or `TaintTracking` imports
+- `semmle.code.cpp.dataflow.*`
+- Path-problem queries
+
+========================================
+EXAMPLE FILTER QUERY (Index-Based Pattern)
+========================================
+
+For a function like `_dictClear(dict *d, int htidx)` that clears `d->ht[htidx]`:
+
+```codeql
+/**
+ * @name Safe double call - {name}
+ * @description Identifies safe pairs of calls to {name} where different indices prevent conflicts
+ * @kind problem
+ * @id cpp/custom-safe-{name}
+ * @problem.severity recommendation
+ */
+
+import cpp
+
+from FunctionCall call1, FunctionCall call2, Literal idx1, Literal idx2
+where
+  // Both calls target our function
+  call1.getTarget().getName() = "{name}" and
+  call2.getTarget().getName() = "{name}" and
+  
+  // Second call comes after first call
+  call1.getLocation().getStartLine() < call2.getLocation().getStartLine() and
+  
+  // Both calls operate on the same base pointer (argument 0)
+  call1.getArgument(0).toString() = call2.getArgument(0).toString() and
+  
+  // Extract index arguments (assuming index is argument 1)
+  idx1 = call1.getArgument(1) and
+  idx2 = call2.getArgument(1) and
+  
+  // SAFE CONDITION: Different literal index values
+  idx1.getValue() != idx2.getValue()
+  
+select call2, 
+  "SAFE_PAIR: Index-selected cleanup with different indices (" + 
+  idx1.getValue() + " vs " + idx2.getValue() + 
+  ") (second call at line " + call2.getLocation().getStartLine() + ")"
+```
+
+**Key points:**
+- Checks that both calls target the same object (argument 0)
+- Verifies index arguments (argument 1) have different literal values
+- Emits structured message with `SAFE_PAIR` and line number
+- Only reports when we can prove it's safe (different indices)
+
+========================================
+OUTPUT FORMAT
+========================================
+
+Return ONLY a valid JSON object with these exact fields:
+
+```json
+{{
+  "is_special": boolean,
+  "reason": "Clear explanation of why this function is/isn't special, based on the actual code and hints",
+  "query_code": "Complete CodeQL filter query (empty string if is_special=false)"
+}}
+```
+
+**Reasoning Guidelines:**
+- Explain your decision based on the actual function behavior
+- Reference specific code patterns or hint information
+- For special functions: explain what false positives will occur and why
+- For regular functions: explain why standard queries handle it correctly
+- For filter queries: explain what pattern you're detecting as safe
+
+**Examples of good reasoning:**
+
+✅ "This function is special because it performs index-selected cleanup. The `htidx` parameter selects which internal hash table to clear (d->ht[0] or d->ht[1]). Multiple calls with different indices are safe, but CodeQL will flag them as double-free. Filter query checks for different literal index values."
+
+✅ "Not special - this is a straightforward deallocator that frees the entire object. Multiple calls would be a genuine double-free. No filter needed."
+
+✅ "This function is special due to reference counting. It only frees when refcount reaches zero. Multiple calls are expected and safe, but CodeQL doesn't understand refcount semantics and will report false positive double-free warnings."
+
+Now analyze the function and respond with JSON."""
+    
+    # -------------------------------------------------------------------------
+    # Validation and fixing
+    # -------------------------------------------------------------------------
+    
+    def _validate_and_fix_query(
+        self,
+        func_name: str,
+        query_code: str,
+        reason: str,
+        original_prompt: str,
+    ) -> Tuple[str, bool, str, bool, str]:
+        """
+        Validate generated CodeQL query and attempt to fix errors.
+        
+        Returns:
+            Tuple of (query_code, is_special, reason, validated, validation_error)
+            - validated: True if query passed validation, False otherwise
+            - validation_error: Error message if validation failed, empty string if passed
+        """
+        # Quick lint check first
+        ok, lint_msg = self._quick_lint_codeql_query(query_code)
+        if not ok:
+            logger.warning(
+                "Generated query for '%s' failed quick lint: %s",
+                func_name,
+                lint_msg
+            )
+            is_valid = False
+            error_msg = lint_msg
+        else:
+            is_valid, error_msg = self._validate_codeql_query(query_code)
+            if not is_valid:
+                logger.warning(
+                    "Generated query for '%s' failed validation: %s",
+                    func_name,
+                    error_msg
+                )
+            else:
+                logger.info("Generated query for '%s' passed CodeQL validation", func_name)
+        
+        if is_valid:
+            return query_code, True, reason, True, ""
+        
+        logger.info(
+            "Attempting to fix the query for '%s' with LLM assistance (error: %s)...",
+            func_name,
+            error_msg[:100]  # Truncate long error messages
+        )
+        
+        # Try up to 2 fix attempts (3 total attempts)
+        for attempt in range(2):
+            fix_prompt = self._build_fix_prompt(error_msg, query_code)
+            
+            # Build a focused fix prompt that includes the error and current code
+            focused_prompt = f"""You previously generated a CodeQL query, but it has an error.
+
+**ERROR:**
+{error_msg}
+
+**CURRENT QUERY CODE (with error):**
+```codeql
+{query_code}
+```
+
+Please fix ONLY the error above. Return the corrected query in JSON format:
+{{
+  "is_special": true,
+  "reason": "Fixed: {error_msg[:50]}...",
+  "query_code": "corrected CodeQL query here"
+}}"""
+            
+            result = self.llm.query(focused_prompt) or {}
+            content = result.get("content", {}) or {}
+            
+            new_is_special = bool(content.get("is_special", True))
+            new_code = (content.get("query_code", "") or "").strip()
+            new_reason = (content.get("reason", reason) or reason).strip()
+            
+            if not (new_is_special and new_code):
+                error_msg = "LLM did not return a valid special query in retry."
+                logger.warning(error_msg)
+                break
+            
+            ok, lint_msg = self._quick_lint_codeql_query(new_code)
+            if not ok:
+                error_msg = lint_msg
+                logger.warning("Fix attempt %d/2 failed lint: %s", attempt + 1, error_msg)
+                continue
+            
+            is_valid, error_msg = self._validate_codeql_query(new_code)
+            if is_valid:
+                logger.info("✓ Fixed query for '%s' passed validation", func_name)
+                return new_code, True, new_reason, True, ""
+            
+            logger.warning("Fix attempt %d/2 still has error: %s", attempt + 1, error_msg)
+        
+        # All attempts failed
+        logger.error(
+            "Failed to generate valid query for '%s' after 3 attempts",
+            func_name
+        )
+        return (
+            "",
+            False,
+            f"Query generation failed after 3 attempts. Last error: {error_msg}",
+            False,
+            error_msg
+        )
+    
+    def _build_fix_prompt(self, error_msg: str, query_code: str = "") -> str:
+        """Build a prompt to fix a failing CodeQL query.
+        
+        Note: This method signature is kept for compatibility, but the actual
+        fix prompt is now built inline in _validate_and_fix_query for better
+        context.
+        """
+        return f"""
+========================================
+QUERY ERROR - FIX REQUIRED
+========================================
+
+Your previous CodeQL filter query has a compilation or validation error:
+
+**ERROR:**
+{error_msg}
+
+Please fix the query following these STRICT rules:
+
+**1. Imports:**
+- ONLY use `import cpp`
+- DO NOT import DataFlow, TaintTracking, or any dataflow libraries
+
+**2. Query Structure:**
+- Keep `@kind problem` (NOT path-problem)
+- Keep all required metadata tags (@name, @description, @kind, @id)
+
+**3. Message Format (CRITICAL):**
+The message MUST contain BOTH:
+- The exact phrase: `SAFE_PAIR`
+- The exact phrase: `second call at line <line_number>`
+
+Example: "SAFE_PAIR: Different indices used (second call at line 123)"
+
+**4. Use Robust AST Matching:**
+- Use concrete types: FunctionCall, Expr, Literal, Variable
+- Avoid complex predicates that might fail
+- Test conditions carefully
+
+Return the corrected query in the same JSON format:
+{{
+  "is_special": boolean,
+  "reason": "explanation",
+  "query_code": "corrected CodeQL query"
+}}
+"""
+    
+    # -------------------------------------------------------------------------
+    # Validation helpers
+    # -------------------------------------------------------------------------
+    
+    def _quick_lint_codeql_query(self, query_code: str) -> Tuple[bool, str]:
+        """
+        Perform quick syntactic checks on the query before full validation.
+        
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        if not query_code or not query_code.strip():
+            return False, "Query code is empty"
+        
+        # Check for metadata block
+        if "/**" not in query_code:
+            return False, "Missing metadata comment block (/** ... */)"
+        
+        # Check required metadata tags
+        required_tags = ["@name", "@description", "@kind", "@id"]
+        for tag in required_tags:
+            if tag not in query_code:
+                return False, f"Missing required metadata tag: {tag}"
+        
+        # Check for cpp import
+        if "import cpp" not in query_code:
+            return False, "Missing 'import cpp' statement"
+        
+        # Check basic query structure
+        has_from = "from " in query_code
+        has_where = "where " in query_code or "where\n" in query_code
+        has_select = "select " in query_code
+        
+        if not (has_from and has_where and has_select):
+            return False, "Missing required query structure (from/where/select)"
+        
+        # Check for forbidden imports
+        forbidden = [
+            "semmle.code.cpp.dataflow",
+            "DataFlow",
+            "TaintTracking",
+            "FlowAfterFree",
+        ]
+        for bad in forbidden:
+            if bad in query_code:
+                return False, f"Forbidden import or library detected: {bad}"
+        
+        return True, ""
+    
+    def _validate_codeql_query(self, query_code: str) -> Tuple[bool, str]:
+        """
+        Validate the query using the CodeQL validator if available.
+        
+        Returns:
+            Tuple of (is_valid, error_message)
+        """
+        if not self.codeql_validator:
+            # No validator configured -> perform enhanced quick validation
+            # This catches common CodeQL syntax errors that quick lint misses
+            return self._enhanced_quick_validation(query_code)
+        
+        return self.codeql_validator.validate_query(query_code)
+    
+    @staticmethod
+    def create_codeql_validator(codeql_binary: str = "codeql", codeql_dir: Path | None = None) -> Optional[Any]:
+        """
+        Create a CodeQL validator that uses the CodeQL CLI to compile queries.
+        
+        Args:
+            codeql_binary: Path to CodeQL binary (default: "codeql")
+            codeql_dir: Optional path to CodeQL installation directory
+        
+        Returns:
+            CodeQLValidator instance if CodeQL is available, None otherwise
+        """
+        try:
+            return CodeQLValidator(codeql_binary=codeql_binary, codeql_dir=codeql_dir)
+        except Exception as e:
+            logger.warning(f"Failed to create CodeQL validator: {e}")
+            return None
+    
+    def _enhanced_quick_validation(self, query_code: str) -> Tuple[bool, str]:
+        """
+        Enhanced validation that catches common CodeQL syntax errors when
+        no full validator is available.
+        
+        This addresses the issue where validation was completely skipped when
+        codeql_validator was None. Previously, _validate_codeql_query would
+        return True, "" without any checks, allowing invalid queries to pass.
+        
+        This enhanced validation catches:
+        - hasGlobalOrInstantiatedName() misuse on Function type
+        - Common method name errors (getFunctionName, getMethodName)
+        - Incorrect FunctionCall usage (calling methods directly instead of via getTarget())
+        - Missing imports
+        
+        Note: This is better than nothing, but a real CodeQL validator that
+        can compile queries is preferred for comprehensive validation.
+        """
+        # Check for common CodeQL API misuse patterns
+        # Pattern 1: hasGlobalOrInstantiatedName on wrong type
+        # This method doesn't exist on Function, only on Variable, etc.
+        if "hasGlobalOrInstantiatedName" in query_code:
+            # Check if it's being called on Function (common mistake)
+            lines = query_code.split('\n')
+            for i, line in enumerate(lines, 1):
+                if "hasGlobalOrInstantiatedName" in line and ("Function" in line or ".getTarget()" in line):
+                    return False, (
+                        f"Line {i}: hasGlobalOrInstantiatedName() cannot be used on Function type. "
+                        "Use getName() or getQualifiedName() instead. "
+                        "Example: call.getTarget().getName() = \"function_name\""
+                    )
+        
+        # Pattern 1b: hasGlobalOrStdName might not exist on Function either
+        # Check if it's being used incorrectly
+        if "hasGlobalOrStdName" in query_code:
+            lines = query_code.split('\n')
+            for i, line in enumerate(lines, 1):
+                if "hasGlobalOrStdName" in line and (".getTarget()" in line or "Function" in line):
+                    # This might be valid, but if it fails, suggest alternatives
+                    # We'll let it pass here but note it might need getName() instead
+                    pass  # Allow it, but the actual CodeQL compiler will catch if invalid
+        
+        # Pattern 2: Common method name errors
+        method_errors = {
+            "getFunctionName()": "Function doesn't have getFunctionName(). Use getName() or getQualifiedName()",
+            "getMethodName()": "Function doesn't have getMethodName(). Use getName() or getQualifiedName()",
+        }
+        for bad_method, suggestion in method_errors.items():
+            if bad_method in query_code:
+                return False, f"Invalid method: {bad_method}. {suggestion}"
+        
+        # Pattern 3: Check for proper FunctionCall usage
+        # If using FunctionCall, should use getTarget() to get Function
+        if "FunctionCall" in query_code and "getTarget()" not in query_code:
+            # This might be okay, but warn if they're trying to call methods directly
+            if ".getName()" in query_code or ".getQualifiedName()" in query_code:
+                # Check if it's being called on FunctionCall directly (wrong)
+                lines = query_code.split('\n')
+                for i, line in enumerate(lines, 1):
+                    if "FunctionCall" in line and any(m in line for m in [".getName()", ".getQualifiedName()"]):
+                        if "getTarget()" not in line:
+                            return False, (
+                                f"Line {i}: Cannot call getName()/getQualifiedName() directly on FunctionCall. "
+                                "Use call.getTarget().getName() instead."
+                            )
+        
+        # Pattern 4: Check for proper Literal usage
+        # getValue() returns a string, should compare with strings
+        if "Literal" in query_code and "getValue()" in query_code:
+            # Check if comparing with non-string (common mistake)
+            if "getValue() != " in query_code or "getValue() = " in query_code:
+                # This is usually okay, but check for obvious type mismatches
+                pass  # Hard to detect without full parsing
+        
+        # Pattern 5: Check for missing imports that are commonly needed
+        # If using certain types, need specific imports
+        if "FunctionCall" in query_code and "import cpp" not in query_code:
+            return False, "Missing 'import cpp' - required for FunctionCall"
+        
+        # All checks passed
+        return True, ""
+    
+    # -------------------------------------------------------------------------
+    # Cost tracking
+    # -------------------------------------------------------------------------
+    
+    def _track_cost(self, func_name: str, usage: Dict[str, Any]) -> None:
+        """Track API costs and token usage for analytics."""
+        cost = float(usage.get("cost", 0.0) or 0.0)
+        total_tokens = int(usage.get("total_tokens", 0) or 0)
+        
+        self.total_cost += cost
+        self.total_tokens += total_tokens
+        
+        entry = self.function_costs.get(func_name)
+        if not entry:
+            entry = {
+                "cost": 0.0,
+                "tokens": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "input_cost": 0.0,
+                "output_cost": 0.0,
+            }
+            self.function_costs[func_name] = entry
+        
+        entry["cost"] += cost
+        entry["tokens"] += total_tokens
+        entry["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
+        entry["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
+        entry["input_cost"] += float(usage.get("input_cost", 0.0) or 0.0)
+        entry["output_cost"] += float(usage.get("output_cost", 0.0) or 0.0)

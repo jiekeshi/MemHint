@@ -15,8 +15,7 @@ import yaml
 from pathlib import Path
 from shutil import which
 from typing import Optional
-
-from src.core.models import Warning, HintSet, MemoryIssueType
+from src.core.models import Warning, HintSet, MemoryIssueType, CustomQuerySet
 
 logger = logging.getLogger(__name__)
 
@@ -457,8 +456,8 @@ class CodeQLAnalyzer:
         self,
         binary: str = "codeql",
         timeout: int = 600,
-        codeql_dir: Path = None,
-        cpp_queries_dir: Path = None,
+        codeql_dir: Path | None = None,
+        cpp_queries_dir: Path | None = None,
         reuse_db: bool = True,
     ):
         self.binary = binary
@@ -471,22 +470,28 @@ class CodeQLAnalyzer:
     def analyze(
         self,
         project_path: Path,
-        hints: HintSet = None,
-        issue_types: list[MemoryIssueType] = None,
+        hints: HintSet | None = None,
+        issue_types: list[MemoryIssueType] | None = None,
         use_enhanced_queries: bool = True,
+        custom_queries: CustomQuerySet | None = None,
     ) -> list[Warning]:
         """
         Run CodeQL analysis.
+
+        Note: If you want to "filter out" known false positives (e.g., _dictClear(d,0) then _dictClear(d,1)),
+        you MUST do it in *your pipeline* after SARIF parsing. A CodeQL "query" cannot remove another query's results.
+        This function now supports that via CustomQuerySet.suppress_rules.
 
         Args:
             project_path: Project to analyze
             hints: Allocator/deallocator hints
             issue_types: Which issue types to map/return (currently parsed from SARIF ruleId)
             use_enhanced_queries: If True, write and run hardcoded enhanced queries; otherwise run standard CodeQL queries
+            custom_queries: Custom CodeQL queries generated from hints (optional). May include suppress_rules.
         """
         output_dir = Path(tempfile.mkdtemp())
         results_path = output_dir / "results.sarif"
-        enhanced_query_files = []
+        query_files_to_cleanup: list[Path] = []
 
         try:
             # Step 1: Database
@@ -496,26 +501,55 @@ class CodeQLAnalyzer:
                 return []
 
             # Step 2: Inject models
-            if hints and hints.hints:
+            if hints and getattr(hints, "hints", None):
                 logger.info("Step 2: Injecting custom memory models...")
                 self._inject_models(hints)
                 self._verify_injected_models()
 
             # Step 3: Prepare queries
+            queries: list[Path] = []
+
+            # Add custom CodeQL queries if provided (these only ADD results; they don't suppress)
+            if custom_queries and len(custom_queries) > 0:
+                logger.info(f"Step 3a: Writing {len(custom_queries)} custom queries...")
+                custom_query_files, custom_cleanup = self._write_custom_queries(custom_queries)
+                queries.extend(custom_query_files)
+                query_files_to_cleanup.extend(custom_cleanup)
+                logger.info(f"  Added {len(custom_query_files)} custom query files")
+
+            # Add enhanced queries if enabled
             if use_enhanced_queries:
-                logger.info("Step 3: Using enhanced queries...")
-                queries, enhanced_query_files = self._prepare_enhanced_queries()
+                logger.info("Step 3b: Writing enhanced queries...")
+                enhanced_query_files_list, enhanced_cleanup = self._prepare_enhanced_queries()
+                queries.extend(enhanced_query_files_list)
+                query_files_to_cleanup.extend(enhanced_cleanup)
+                logger.info(f"  Added {len(enhanced_query_files_list)} enhanced query files")
+
+            # If no custom or enhanced queries, use standard queries
+            if not queries:
+                logger.info("Step 3c: Using standard queries...")
+                queries_to_run: list[Path] | None = None
             else:
-                logger.info("Step 3: Using standard queries...")
-                queries = None
+                queries_to_run = queries
 
             # Step 4: Run analysis
             logger.info("Step 4: Running CodeQL analysis...")
-            success = self._run_queries(db_path, results_path, queries)
+            success = self._run_queries(db_path, results_path, queries_to_run)
 
-            if success:
-                return self._parse_sarif(results_path, project_path)
-            return []
+            if not success:
+                return []
+
+            warnings = self._parse_sarif(results_path, project_path)
+
+            # Step 5: Pipeline-level suppression (NEW)
+            if custom_queries:
+                before = len(warnings)
+                warnings = self._apply_suppressions(warnings, custom_queries)
+                after = len(warnings)
+                if after != before:
+                    logger.info(f"Step 5: Suppressed {before - after} warnings using custom suppression rules")
+
+            return warnings
 
         except Exception as e:
             logger.error(f"Analysis failed: {e}")
@@ -524,38 +558,132 @@ class CodeQLAnalyzer:
             return []
         finally:
             self._cleanup_models()
-            # Clean up enhanced query files
-            for f in enhanced_query_files:
-                if f.exists():
-                    f.unlink()
-                    logger.debug(f"Cleaned up: {f}")
+            # Clean up query files
+            for f in query_files_to_cleanup:
+                try:
+                    if isinstance(f, Path) and f.exists():
+                        f.unlink()
+                except Exception:
+                    pass
             if output_dir.exists():
                 shutil.rmtree(output_dir, ignore_errors=True)
+
+    # -------------------------------------------------------------------------
+    # NEW: Suppression layer
+    # -------------------------------------------------------------------------
+
+    def _apply_suppressions(self, warnings: list[Warning], custom_queries: CustomQuerySet) -> list[Warning]:
+        """
+        Apply suppression rules stored in CustomQuerySet (pipeline filtering).
+
+        This is the place where your "_dictClear(d,0) + _dictClear(d,1) is safe"
+        logic should live.
+
+        Matching strategy:
+          - Each suppress rule can match on any subset of:
+              function_name, warning_type (ruleId substring), file_path (regex), message (regex)
+          - Optionally require existence of another call pattern via 'requires' (regex over trace or message)
+        """
+        rules = []
+        for cq in custom_queries.queries.values():
+            for r in getattr(cq, "suppress_rules", []) or []:
+                rules.append(r)
+
+        if not rules:
+            return warnings
+
+        compiled = []
+        for r in rules:
+            compiled.append({
+                "function_name": r.get("function_name"),
+                "warning_type_contains": (r.get("warning_type_contains") or "").lower() or None,
+                "file_path_regex": re.compile(r["file_path_regex"]) if r.get("file_path_regex") else None,
+                "message_regex": re.compile(r["message_regex"], re.IGNORECASE) if r.get("message_regex") else None,
+                "trace_regex": re.compile(r["trace_regex"], re.IGNORECASE) if r.get("trace_regex") else None,
+            })
+
+        def matches(w: Warning, rule) -> bool:
+            if rule["function_name"] and w.function_name != rule["function_name"]:
+                return False
+            if rule["warning_type_contains"] and rule["warning_type_contains"] not in (w.warning_type or "").lower():
+                return False
+            if rule["file_path_regex"] and not rule["file_path_regex"].search(w.file_path or ""):
+                return False
+            if rule["message_regex"] and not rule["message_regex"].search(w.message or ""):
+                return False
+            if rule["trace_regex"]:
+                joined = "\n".join(w.trace or [])
+                if not rule["trace_regex"].search(joined):
+                    return False
+            return True
+
+        out: list[Warning] = []
+        for w in warnings:
+            suppressed = any(matches(w, r) for r in compiled)
+            if not suppressed:
+                out.append(w)
+        return out
+
+    # -------------------------------------------------------------------------
+    # Custom query writing (unchanged except: ignore entries that are "suppression-only")
+    # -------------------------------------------------------------------------
+
+    def _write_custom_queries(self, custom_queries: CustomQuerySet) -> tuple[list[Path], list[Path]]:
+        """
+        Write custom CodeQL queries to the qlpack directory for CodeQL to run.
+
+        NOTE: Suppression rules do NOT need query files. So:
+          - only write queries where query_code is non-empty.
+        """
+        query_files: list[Path] = []
+        cleanup_files: list[Path] = []
+
+        if not custom_queries or len(custom_queries) == 0:
+            return query_files, cleanup_files
+
+        sample_query_ref = "codeql/cpp-queries:Critical/MemoryNeverFreed.ql"
+        sample_path = self._find_query_file_path(sample_query_ref)
+
+        if not sample_path:
+            logger.warning("Could not locate qlpack Critical directory for custom queries")
+            custom_query_dir = Path(tempfile.mkdtemp(prefix="codeql_custom_queries_"))
+        else:
+            custom_query_dir = sample_path.parent
+
+        logger.debug(f"Writing custom queries to: {custom_query_dir}")
+
+        for func_name, query in custom_queries.queries.items():
+            qc = (query.query_code or "").strip()
+            if not qc:
+                continue
+
+            query_file = custom_query_dir / f"{func_name}_custom.ql"
+            query_file.write_text(qc)
+            query_files.append(query_file)
+            cleanup_files.append(query_file)
+            logger.debug(f"  Written custom query for '{func_name}' to {query_file.name}")
+
+        logger.info(f"Wrote {len(query_files)} custom query files to {custom_query_dir}")
+        return query_files, cleanup_files
 
     def _prepare_enhanced_queries(self) -> tuple[list[Path], list[Path]]:
         """
         Write enhanced queries next to original queries.
-
-        Returns:
-            tuple of (query files to run, files to cleanup)
         """
-        query_files = []
-        cleanup_files = []
+        query_files: list[Path] = []
+        cleanup_files: list[Path] = []
 
         for query_ref in MEMORY_QUERIES:
             query_name = query_ref.split("/")[-1].replace(".ql", "")
-
             if query_name not in ENHANCED_QUERIES:
                 logger.warning(f"No enhanced version for {query_name}")
                 continue
 
-            # Find where the original query is
             original_path = self._find_query_file_path(query_ref)
             if not original_path:
                 logger.warning(f"Could not find {query_ref}")
                 continue
 
-            # Write enhanced query next to original
             enhanced_path = original_path.parent / f"{query_name}_enhanced.ql"
             enhanced_path.write_text(ENHANCED_QUERIES[query_name])
 
@@ -583,23 +711,17 @@ class CodeQLAnalyzer:
         if not base.exists():
             return None
 
-        # Find latest version
-        versions = sorted([d for d in base.iterdir() if d.is_dir() and not d.name.startswith('.')], reverse=True)
+        versions = sorted([d for d in base.iterdir() if d.is_dir() and not d.name.startswith(".")], reverse=True)
         if not versions:
             return None
 
         query_file = versions[0] / query_path
         return query_file if query_file.exists() else None
 
-    def _run_queries(
-        self,
-        db_path: Path,
-        results_path: Path,
-        custom_queries: list[Path] = None
-    ) -> bool:
+    def _run_queries(self, db_path: Path, results_path: Path, query_files: list[Path] | None = None) -> bool:
         """Run CodeQL queries."""
-        if custom_queries:
-            query_args = [str(q) for q in custom_queries]
+        if query_files:
+            query_args = [str(q) for q in query_files]
         else:
             query_args = MEMORY_QUERIES
 
@@ -614,7 +736,7 @@ class CodeQLAnalyzer:
         result = subprocess.run(cmd, timeout=self.timeout, capture_output=True)
 
         if result.returncode != 0:
-            logger.warning(f"CodeQL stderr: {result.stderr.decode()}")
+            logger.warning(f"CodeQL stderr: {result.stderr.decode(errors='replace')[:1000]}")
 
         return results_path.exists()
 
@@ -659,7 +781,7 @@ class CodeQLAnalyzer:
         try:
             with open(metadata) as f:
                 info = yaml.safe_load(f)
-            return info.get('primaryLanguage', '').lower() in ('cpp', 'c++')
+            return info.get("primaryLanguage", "").lower() in ("cpp", "c++")
         except Exception:
             return False
 
@@ -667,7 +789,7 @@ class CodeQLAnalyzer:
         try:
             metadata = db_path / "codeql-database.yml"
             with open(metadata) as f:
-                if yaml.safe_load(f).get('finalised', False):
+                if yaml.safe_load(f).get("finalised", False):
                     return True
         except Exception:
             pass
@@ -676,7 +798,7 @@ class CodeQLAnalyzer:
             [self.binary, "database", "finalize", str(db_path)],
             timeout=self.timeout, capture_output=True, text=True
         )
-        return result.returncode == 0 or "already finalized" in result.stderr.lower()
+        return result.returncode == 0 or "already finalized" in (result.stderr or "").lower()
 
     def _create_database(self, project_path: Path, db_path: Path) -> bool:
         config = self._load_build_config(project_path)
@@ -718,7 +840,7 @@ class CodeQLAnalyzer:
         logger.info(f"Running CodeQL database create: {' '.join(cmd)}")
         result = subprocess.run(cmd, timeout=self.timeout, capture_output=True, cwd=str(project_path))
         if result.returncode != 0:
-            logger.error(f"Database creation failed: {result.stderr.decode()[:500]}")
+            logger.error(f"Database creation failed: {result.stderr.decode(errors='replace')[:500]}")
             return False
 
         return self._finalize_database(db_path)
@@ -746,7 +868,7 @@ class CodeQLAnalyzer:
         for cmd_info in commands:
             if cmd_info["command"]:
                 subprocess.run(cmd_info["command"], shell=True, cwd=str(cwd),
-                             timeout=self.timeout, capture_output=True)
+                               timeout=self.timeout, capture_output=True)
 
     def _detect_build_command(self, project_path: Path) -> Optional[str]:
         if (project_path / "Makefile").exists() and which("make"):
@@ -765,7 +887,7 @@ class CodeQLAnalyzer:
         return None
 
     # =========================================================================
-    # Model Injection
+    # Model Injection (BUGFIX: allocators type mismatch)
     # =========================================================================
 
     def _get_ext_dir(self) -> Path:
@@ -776,7 +898,7 @@ class CodeQLAnalyzer:
         else:
             base = Path.home() / ".codeql" / "packages" / "codeql" / "cpp-queries"
 
-        versions = sorted([d for d in base.iterdir() if d.is_dir() and not d.name.startswith('.')], reverse=True)
+        versions = sorted([d for d in base.iterdir() if d.is_dir() and not d.name.startswith(".")], reverse=True)
         if not versions:
             raise FileNotFoundError(f"No cpp-queries versions in {base}")
 
@@ -788,10 +910,26 @@ class CodeQLAnalyzer:
         return cpp_all / cpp_versions[0] / "ext"
 
     def _inject_models(self, hints: HintSet) -> None:
+        """
+        BUGFIX:
+          - Your original code did: allocators = [f for f in hints.get_allocators() ...]
+            but _build_alloc_yaml expects list[(name, idx)].
+          - This version accepts BOTH:
+              hints.get_allocators() returning ["malloc_like", ...]  OR [("malloc_like",-1), ...]
+            and normalizes.
+        """
         ext_dir = self._get_ext_dir()
 
-        allocators = [f for f in hints.get_allocators() if f not in ("main", "_main", "")]
-        deallocators = [(f, i) for f, i in hints.get_deallocators() if f not in ("main", "_main", "")]
+        raw_allocs = [a for a in (hints.get_allocators() or []) if a not in ("main", "_main", "")]
+        allocators: list[tuple[str, int]] = []
+        for a in raw_allocs:
+            if isinstance(a, (list, tuple)) and len(a) == 2:
+                allocators.append((str(a[0]), int(a[1])))
+            else:
+                # default: treat as return-value allocator
+                allocators.append((str(a), -1))
+
+        deallocators = [(f, i) for f, i in (hints.get_deallocators() or []) if f not in ("main", "_main", "")]
 
         if allocators:
             path = ext_dir / "allocation" / "hint.allocation.model.yml"
@@ -865,58 +1003,60 @@ class CodeQLAnalyzer:
 
     def _cleanup_models(self) -> None:
         for f in self._injected_files:
-            if f.exists():
-                f.unlink()
+            try:
+                if f.exists():
+                    f.unlink()
+            except Exception:
+                pass
         self._injected_files.clear()
 
     # =========================================================================
-    # Result Parsing
+    # SARIF Parsing (unchanged; consider moving suppression here if preferred)
     # =========================================================================
 
     def _parse_sarif(self, sarif_path: Path, project_path: Path) -> list[Warning]:
-      if not sarif_path.exists():
-          return []
+        if not sarif_path.exists():
+            return []
 
-      warnings = []
-      try:
-          data = json.loads(sarif_path.read_text())
-          for run in data.get("runs", []):
-              for result in run.get("results", []):
-                  rule_id = result.get("ruleId", "").lower()
+        warnings: list[Warning] = []
+        try:
+            data = json.loads(sarif_path.read_text())
+            for run in data.get("runs", []):
+                for result in run.get("results", []):
+                    rule_id = (result.get("ruleId", "") or "").lower()
 
-                  issue_type = MemoryIssueType.MEMORY_LEAK
-                  for key, val in CODEQL_ISSUE_MAP.items():
-                      if key in rule_id:
-                          issue_type = val
-                          break
+                    issue_type = MemoryIssueType.MEMORY_LEAK
+                    for key, val in CODEQL_ISSUE_MAP.items():
+                        if key in rule_id:
+                            issue_type = val
+                            break
 
-                  locs = result.get("locations", [])
-                  if not locs:
-                      continue
+                    locs = result.get("locations", []) or []
+                    if not locs:
+                        continue
 
-                  loc0 = locs[0].get("physicalLocation", {})
-                  file_path = loc0.get("artifactLocation", {}).get("uri", "")
-                  line = loc0.get("region", {}).get("startLine", 0)
+                    loc0 = (locs[0].get("physicalLocation", {}) or {})
+                    file_path = (loc0.get("artifactLocation", {}) or {}).get("uri", "") or ""
+                    line = (loc0.get("region", {}) or {}).get("startLine", 0) or 0
 
-                  alloc_site = self._extract_allocation_site(result, run)
-                  trace = self._extract_trace(result, run)
+                    alloc_site = self._extract_allocation_site(result, run)
+                    trace = self._extract_trace(result, run)
 
-                  warnings.append(Warning(
-                      file_path=file_path,
-                      line_number=line,
-                      function_name=self._find_function(file_path, line, project_path),
-                      warning_type=rule_id,
-                      message=result.get("message", {}).get("text", ""),
-                      issue_type=issue_type,
-                      allocation_site=alloc_site,
-                      trace=trace
-                  ))
+                    warnings.append(Warning(
+                        file_path=file_path,
+                        line_number=line,
+                        function_name=self._find_function(file_path, line, project_path),
+                        warning_type=rule_id,
+                        message=(result.get("message", {}) or {}).get("text", "") or "",
+                        issue_type=issue_type,
+                        allocation_site=alloc_site,
+                        trace=trace
+                    ))
 
-      except Exception as e:
-          logger.error(f"SARIF parse error: {e}")
+        except Exception as e:
+            logger.error(f"SARIF parse error: {e}")
 
-      return warnings
-
+        return warnings
 
     def _find_function(self, file_path: str, line: int, project_path: Path) -> str:
         if not file_path or not line:
@@ -932,38 +1072,6 @@ class CodeQLAnalyzer:
         except Exception:
             pass
         return ""
-      
-
-
-    def _extract_path_trace(self, result: dict) -> list[str]:
-        """
-        Extract a light trace from SARIF for path-problem results.
-        Returns list of 'file:line' strings in order.
-        """
-        trace = []
-        for cf in result.get("codeFlows", []) or []:
-            for tf in cf.get("threadFlows", []) or []:
-                for tloc in tf.get("locations", []) or []:
-                    loc = tloc.get("location", {})
-                    s = self._sarif_loc_to_str(loc)
-                    if s:
-                        trace.append(s)
-        # de-dup while preserving order
-        seen = set()
-        out = []
-        for x in trace:
-            if x not in seen:
-                seen.add(x)
-                out.append(x)
-        return out
-
-
-
-    
- 
-    
-    from pathlib import Path
-    from typing import Optional
 
     def _sarif_loc_to_str(self, loc: dict) -> str:
         """
@@ -975,88 +1083,50 @@ class CodeQLAnalyzer:
         """
         if not loc:
             return ""
-
-        # SARIF: { "physicalLocation": { "artifactLocation": {"uri": ...}, "region": {"startLine": ...}}}
         phys = loc.get("physicalLocation") or {}
         art = phys.get("artifactLocation") or {}
         uri = art.get("uri") or ""
-
         region = phys.get("region") or {}
         line = region.get("startLine") or 0
-
         if not uri:
             return ""
-        if line:
-            return f"{uri}:{line}"
-        return uri
-
+        return f"{uri}:{line}" if line else uri
 
     def _resolve_related_locations(self, result: dict, run: dict) -> list[dict]:
-        """
-        Return related location objects for a SARIF result, resolving
-        relatedLocations indices via run["relatedLocations"] if needed.
-        """
         related = result.get("relatedLocations") or []
         if not related:
             return []
 
-        # SARIF can store related locations either as full objects or as indices
         resolved = []
         pool = (run.get("relatedLocations") or [])
-
         for rl in related:
-            # Case A: already a full location object
             if isinstance(rl, dict) and ("physicalLocation" in rl or "location" in rl):
-                # Some SARIF producers wrap it: {"location": {...}}
                 resolved.append(rl.get("location") if "location" in rl else rl)
                 continue
-
-            # Case B: index into run.relatedLocations
             if isinstance(rl, int) and 0 <= rl < len(pool):
                 resolved.append(pool[rl])
                 continue
-
-            # Case C: dict with "id" referencing run pool
             if isinstance(rl, dict):
                 idx = rl.get("id")
                 if isinstance(idx, int) and 0 <= idx < len(pool):
                     resolved.append(pool[idx])
-
         return resolved
 
-
     def _extract_allocation_site(self, result: dict, run: dict) -> str:
-        """
-        Best-effort allocation site extraction.
-        For path-problem queries, allocation is often the primary location,
-        and sinks (exit points) are in related locations or message references.
-        """
-        # 1) Prefer the primary location (most CodeQL memory queries report the alloc here)
         locs = result.get("locations") or []
         if locs:
-            s = self._sarif_loc_to_str(locs[0].get("physicalLocation") and locs[0] or locs[0].get("location") or locs[0])
+            s = self._sarif_loc_to_str(locs[0].get("location") or locs[0])
             if s:
                 return s
-
-        # 2) Otherwise try related locations
         rls = self._resolve_related_locations(result, run)
         for rl in rls:
             s = self._sarif_loc_to_str(rl)
             if s:
                 return s
-
         return ""
 
-
     def _extract_trace(self, result: dict, run: dict) -> list[str]:
-        """
-        Extract a simple trace list (file:line strings).
-        - If codeFlows exist, use threadFlowLocations.
-        - Otherwise fall back to relatedLocations.
-        """
         trace: list[str] = []
-
-        # 1) codeFlows -> threadFlows -> threadFlowLocations
         codeflows = result.get("codeFlows") or []
         for cf in codeflows:
             for tf in (cf.get("threadFlows") or []):
@@ -1067,7 +1137,6 @@ class CodeQLAnalyzer:
                         trace.append(s)
 
         if trace:
-            # de-dup while preserving order
             seen = set()
             out = []
             for x in trace:
@@ -1083,14 +1152,12 @@ class CodeQLAnalyzer:
             if s:
                 trace.append(s)
 
-        # 3) also include primary location at front if exists
         locs = result.get("locations") or []
         if locs:
-            primary = self._sarif_loc_to_str(locs[0].get("physicalLocation") and locs[0] or locs[0].get("location") or locs[0])
+            primary = self._sarif_loc_to_str(locs[0].get("location") or locs[0])
             if primary:
                 trace = [primary] + [x for x in trace if x != primary]
 
-        # de-dup
         seen = set()
         out = []
         for x in trace:
@@ -1098,5 +1165,3 @@ class CodeQLAnalyzer:
                 seen.add(x)
                 out.append(x)
         return out
-
-

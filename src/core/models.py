@@ -17,8 +17,8 @@ Z3's role: Validate hints and filter infeasible warnings
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional
-
+from typing import Optional, Dict, List, Any, Literal
+import datetime
 
 # =============================================================================
 # Memory Safety Hint Types (LLM generates these)
@@ -91,6 +91,8 @@ class Hint:
     target: str = "return"    # "return", "arg0", "arg1", etc.
     arg_index: int = -1       # For DEALLOCATOR: which argument
     reason: str = ""
+    arg_semantics: dict[int, str] = field(default_factory=dict)  # arg_index -> semantic description
+    # Example: {0: "dictionary object pointer to clear", 1: "memory index parameter for d"}
 
 
 @dataclass
@@ -99,13 +101,15 @@ class HintSet:
     hints: dict[str, list[Hint]] = field(default_factory=dict)
 
     def add(self, hint: Hint) -> None:
-        """Add a hint, avoiding duplicates."""
+        """Add a hint, avoiding duplicates. Merge arg_semantics if hint already exists."""
         func_name = hint.function_name
         if func_name not in self.hints:
             self.hints[func_name] = []
-        # Avoid duplicates
+        # Check for duplicates
         for existing in self.hints[func_name]:
             if existing.hint_type == hint.hint_type and existing.target == hint.target:
+                # Merge arg_semantics from the new hint into existing hint
+                existing.arg_semantics.update(hint.arg_semantics)
                 return
         self.hints[func_name].append(hint)
 
@@ -165,6 +169,7 @@ class HintSet:
                     "target": h.target,
                     "arg_index": h.arg_index,
                     "reason": h.reason,
+                    "arg_semantics": h.arg_semantics,  # Include parameter semantics
                 }
                 for h in hints
             ]
@@ -176,12 +181,22 @@ class HintSet:
         hint_set = cls()
         for func_name, hints in data.get("hints", {}).items():
             for h in hints:
+                # Convert arg_semantics from list of [index, desc] pairs to dict if needed
+                arg_semantics = h.get("arg_semantics", {})
+                if isinstance(arg_semantics, list):
+                    # Handle old format: list of [index, description] pairs
+                    arg_semantics = {int(idx): desc for idx, desc in arg_semantics}
+                elif not isinstance(arg_semantics, dict):
+                    # Ensure it's a dict with int keys
+                    arg_semantics = {int(k): v for k, v in arg_semantics.items()} if arg_semantics else {}
+                
                 hint_set.add(Hint(
                     function_name=func_name,
                     hint_type=HintType[h["type"]],
                     target=h.get("target", "return"),
                     arg_index=h.get("arg_index", -1),
                     reason=h.get("reason", ""),
+                    arg_semantics=arg_semantics,
                 ))
         return hint_set
 
@@ -199,6 +214,276 @@ class HintSet:
     def __len__(self) -> int:
         return len(self.hints)
 
+
+"""
+Custom query objects for LLM-generated CodeQL filter queries.
+
+This module defines:
+- CustomQuery: a single filter query produced by the LLM to identify safe code patterns
+- CustomQuerySet: a container for both "special" (query-producing) and
+  "non-special" (reason-only) evaluations, with backward-compatible JSON IO.
+
+Design goals
+------------
+1) Backward compatible with older JSON dumps.
+2) Focus exclusively on false positive suppression (filter queries).
+3) Clear separation between:
+   - CodeQL filter queries (via query_code) that produce SAFE_PAIR evidence
+   - Pipeline suppression rules (via suppress_rules) for direct filtering
+"""
+
+import datetime
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Literal, Optional
+
+
+@dataclass
+class SuppressRule:
+    """
+    A lightweight rule to suppress/mark CodeQL warnings in the pipeline.
+
+    This is intentionally NOT CodeQL code. It allows pipeline-level filtering
+    without requiring CodeQL itself to support suppression.
+
+    Common patterns:
+    - Match on rule_id (e.g., cpp/double-free)
+    - Match on function_name
+    - Match on callee name and argument patterns (stringified)
+    """
+    name: str
+    reason: str
+    
+    # Matching criteria (all optional; if multiple specified, treat as AND)
+    rule_id_contains: Optional[str] = None
+    function_name_equals: Optional[str] = None
+    callee_global_name_equals: Optional[str] = None
+
+    # Optional argument pattern checks (string compare, keep it cheap and robust)
+    # Example: {"0": "d", "1": "0"} means arg0.toString()=="d" and arg1.toString()=="0"
+    arg_to_string_equals: Dict[str, str] = field(default_factory=dict)
+
+    # Optional: "must differ" constraints for pairs of calls
+    # Example: {"1": True} means arg1 must be different across two calls (e.g., htidx)
+    arg_must_differ_for_pair: Dict[str, bool] = field(default_factory=dict)
+
+
+@dataclass
+class CustomQuery:
+    """
+    A custom CodeQL filter query generated for a function with special semantics.
+
+    Purpose: Generate evidence queries that identify SAFE code patterns which
+    the pipeline can use to filter out false positive warnings.
+
+    Two suppression approaches:
+    (A) query_code: CodeQL query that emits SAFE_PAIR evidence results
+    (B) suppress_rules: Direct pipeline rules for filtering (no CodeQL needed)
+    
+    Both can be used together for maximum flexibility.
+    """
+
+    # Core identity
+    function_name: str
+    reason: str = ""
+
+    # Produced CodeQL filter query code (optional)
+    # When present, should emit results with "SAFE_PAIR" and "second call at line X"
+    query_code: str = ""
+
+    # Classification
+    is_special: bool = True
+
+    # Extra metadata (useful for tracking and debugging)
+    tags: List[str] = field(default_factory=list)
+
+    # Validation bookkeeping
+    validated: bool = False
+    validation_error: str = ""
+
+    # When this object was created (ISO8601, UTC)
+    created_at: str = field(
+        default_factory=lambda: datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    )
+
+    # Pipeline suppression rules (optional alternative to query_code)
+    suppress_rules: List[SuppressRule] = field(default_factory=list)
+
+
+@dataclass
+class CustomQuerySet:
+    """
+    Collection of custom filter queries and evaluations.
+
+    Stores two categories:
+    - queries: special functions (include query_code and/or suppress_rules)
+    - non_special: non-special functions with reason only
+    """
+    queries: Dict[str, CustomQuery] = field(default_factory=dict)
+    non_special: Dict[str, str] = field(default_factory=dict)
+
+    def add(self, query: CustomQuery) -> None:
+        """Add a custom query or non-special evaluation."""
+        if query.is_special:
+            self.queries[query.function_name] = query
+        else:
+            self.non_special[query.function_name] = query.reason
+
+    def get(self, function_name: str) -> Optional[CustomQuery]:
+        """Get a custom query by function name."""
+        return self.queries.get(function_name)
+
+    def __len__(self) -> int:
+        return len(self.queries) + len(self.non_special)
+
+    def summary(self) -> str:
+        """Get a summary string of the query set."""
+        return (
+            f"Evaluated {len(self)} functions: "
+            f"{len(self.queries)} special, {len(self.non_special)} non-special"
+        )
+
+    # -------------------------------------------------------------------------
+    # JSON IO (backward compatible)
+    # -------------------------------------------------------------------------
+
+    def to_json(self) -> Dict[str, Any]:
+        """
+        Export as JSON.
+
+        Structure:
+        {
+          "queries": {
+            "<func>": {
+              "query_code": "...",
+              "reason": "...",
+              "tags": [...],
+              "validated": true/false,
+              "validation_error": "...",
+              "created_at": "...",
+              "suppress_rules": [ ... ]
+            },
+            ...
+          },
+          "non_special": {
+            "<func>": { "reason": "..." },
+            ...
+          }
+        }
+        """
+        out: Dict[str, Any] = {"queries": {}, "non_special": {}}
+
+        for func_name, q in self.queries.items():
+            out["queries"][func_name] = {
+                "query_code": q.query_code,
+                "reason": q.reason,
+                "tags": list(q.tags),
+                "validated": bool(q.validated),
+                "validation_error": q.validation_error,
+                "created_at": q.created_at,
+                "suppress_rules": [
+                    {
+                        "name": r.name,
+                        "reason": r.reason,
+                        "rule_id_contains": r.rule_id_contains,
+                        "function_name_equals": r.function_name_equals,
+                        "callee_global_name_equals": r.callee_global_name_equals,
+                        "arg_to_string_equals": dict(r.arg_to_string_equals),
+                        "arg_must_differ_for_pair": dict(r.arg_must_differ_for_pair),
+                    }
+                    for r in (q.suppress_rules or [])
+                ],
+            }
+
+        for func_name, reason in self.non_special.items():
+            out["non_special"][func_name] = {"reason": reason}
+
+        return out
+
+    @classmethod
+    def from_json(cls, data: Dict[str, Any]) -> "CustomQuerySet":
+        """
+        Import from JSON with backward compatibility.
+
+        Supports older formats where:
+        - non_special[func] was a string
+        - queries[func] only had {query_code, reason}
+        """
+        qs = cls()
+
+        # --- special queries ---
+        for func_name, q in (data.get("queries") or {}).items():
+            query_code = ""
+            reason = ""
+            tags: List[str] = []
+            validated = False
+            validation_error = ""
+            created_at = ""
+            suppress_rules: List[SuppressRule] = []
+
+            if isinstance(q, str):
+                # Extremely old format: value was the query code
+                query_code = q
+            elif isinstance(q, dict):
+                query_code = q.get("query_code", "") or ""
+                reason = q.get("reason", "") or ""
+                tags = list(q.get("tags", []) or [])
+                validated = bool(q.get("validated", False))
+                validation_error = q.get("validation_error", "") or ""
+                created_at = q.get("created_at", "") or ""
+
+                # Import suppress_rules if present
+                for r in (q.get("suppress_rules") or []):
+                    if not isinstance(r, dict):
+                        continue
+                    suppress_rules.append(
+                        SuppressRule(
+                            name=r.get("name", ""),
+                            reason=r.get("reason", ""),
+                            rule_id_contains=r.get("rule_id_contains"),
+                            function_name_equals=r.get("function_name_equals"),
+                            callee_global_name_equals=r.get("callee_global_name_equals"),
+                            arg_to_string_equals=dict(r.get("arg_to_string_equals", {}) or {}),
+                            arg_must_differ_for_pair=dict(r.get("arg_must_differ_for_pair", {}) or {}),
+                        )
+                    )
+
+            cq = CustomQuery(
+                function_name=func_name,
+                query_code=query_code,
+                reason=reason,
+                is_special=True,
+                tags=tags,
+                validated=validated,
+                validation_error=validation_error,
+                created_at=created_at or datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                suppress_rules=suppress_rules,
+            )
+            qs.queries[func_name] = cq
+
+        # --- non-special ---
+        for func_name, info in (data.get("non_special") or {}).items():
+            if isinstance(info, str):
+                qs.non_special[func_name] = info
+            elif isinstance(info, dict):
+                qs.non_special[func_name] = info.get("reason", "") or ""
+            else:
+                qs.non_special[func_name] = ""
+
+        return qs
+
+    def save(self, filepath: str) -> None:
+        """Save to JSON file."""
+        import json
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(self.to_json(), f, indent=2, ensure_ascii=False)
+
+    @classmethod
+    def load(cls, filepath: str) -> "CustomQuerySet":
+        """Load from JSON file."""
+        import json
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return cls.from_json(data)
 
 # =============================================================================
 # Analysis Results (CodeQL generates these, Z3 filters them)
