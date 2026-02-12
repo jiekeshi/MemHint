@@ -445,169 +445,156 @@ ENHANCED_DOUBLE_FREE_FILTERED = '''
 /**
  * @name Potential double free (Enhanced + filters)
  * @description Enhanced version with better control-flow sensitivity for conditional frees, plus pluggable special-case filters.
- * @kind path-problem
- * @precision high
+* @kind path-problem
+* @precision high
  * @id cpp/double-free-enhanced-filtered
- * @problem.severity warning
- * @security-severity 9.3
- * @tags reliability
- *       security
- *       external/cwe/cwe-415
- */
+* @problem.severity warning
+* @security-severity 9.3
+* @tags reliability
+*       security
+*       external/cwe/cwe-415
+*/
 
 import cpp
 import semmle.code.cpp.dataflow.new.DataFlow
 import semmle.code.cpp.security.flowafterfree.FlowAfterFree
 import DoubleFree::PathGraph
 
-/**
- * Wrap the library's isFree/4 into isFree/2 without using '_' placeholders.
- *
- * Library predicate used in the original query: isFree( DataFlow::Node, Expr, Expr, DeallocationExpr )
- * We existentially quantify the "unused" arguments.
- */
-predicate isFree(DataFlow::Node n, Expr e) {
-  exists(DataFlow::Node dummy0, DeallocationExpr dummyDealloc |
-    isFree(dummy0, n, e, dummyDealloc)
-  )
-}
-
-
+predicate isFree(DataFlow::Node n, Expr e) { isFree(_, n, e, _) }
 
 /**
- * Enhanced: Detect free in both branches of an if statement
- */
+* Enhanced: Detect free in both branches of an if statement
+*/
 predicate freeInBothBranches(DeallocationExpr free1, DeallocationExpr free2, Variable v) {
-  exists(IfStmt ifStmt |
-    free1.getFreedExpr().(VariableAccess).getTarget() = v and
-    free2.getFreedExpr().(VariableAccess).getTarget() = v and
-    free1.getEnclosingStmt().getParentStmt*() = ifStmt.getThen() and
-    free2.getEnclosingStmt().getParentStmt*() = ifStmt.getElse() and
-    exists(DeallocationExpr free3 |
-      free3.getFreedExpr().(VariableAccess).getTarget() = v and
-      ifStmt.getASuccessor+() = free3
-    )
-  )
+ exists(IfStmt ifStmt |
+   free1.getFreedExpr().(VariableAccess).getTarget() = v and
+   free2.getFreedExpr().(VariableAccess).getTarget() = v and
+   free1.getEnclosingStmt().getParentStmt*() = ifStmt.getThen() and
+   free2.getEnclosingStmt().getParentStmt*() = ifStmt.getElse() and
+   exists(DeallocationExpr free3 |
+     free3.getFreedExpr().(VariableAccess).getTarget() = v and
+     ifStmt.getASuccessor+() = free3
+   )
+ )
 }
 
 /**
- * Enhanced: Detect free in a loop that may execute multiple times
- */
+* Enhanced: Detect free in a loop that may execute multiple times
+*/
 predicate freeInLoop(DeallocationExpr free, Variable v) {
-  exists(Loop loop |
-    free.getFreedExpr().(VariableAccess).getTarget() = v and
-    free.getEnclosingStmt().getParentStmt*() = loop.getStmt() and
-    not exists(AllocationExpr alloc |
-      alloc.getEnclosingStmt().getParentStmt*() = loop.getStmt() and
-      exists(AssignExpr assign |
-        assign.getRValue() = alloc and
-        assign.getLValue().(VariableAccess).getTarget() = v
+ exists(Loop loop |
+   free.getFreedExpr().(VariableAccess).getTarget() = v and
+   free.getEnclosingStmt().getParentStmt*() = loop.getStmt() and
+   not exists(AllocationExpr alloc |
+     alloc.getEnclosingStmt().getParentStmt*() = loop.getStmt() and
+     exists(AssignExpr assign |
+       assign.getRValue() = alloc and
+       assign.getLValue().(VariableAccess).getTarget() = v
+     )
+   )
+ )
+}
+ /* ============================================================
+  * Pluggable filters
+  * Contract for plugin:
+  *   predicate df_filter_xxx(DeallocationExpr srcDealloc, DataFlow::Node sinkNode, Expr sinkFreedExpr)
+  * Aggregator:
+  *   predicate df_filtered(...) is true iff ANY plugin returns true.
+  * ============================================================ */
+ 
+ /* -----------------------------
+  * Filter plugin: dictClear/_dictClear
+  * ----------------------------- */
+ 
+  predicate dfIsDictClearName(Function f) {
+    f.hasName("dictClear") or f.hasName("_dictClear")
+  }
+  
+  predicate dfIsDictClearDealloc(DeallocationExpr d, Expr freedArg, Expr flagArg) {
+    exists(FunctionCall c |
+      c = d and
+      dfIsDictClearName(c.getTarget()) and
+      freedArg = c.getArgument(0) and
+      flagArg = c.getArgument(1)
+    )
+  }
+  
+  predicate dfSameVar(Expr a, Expr b) {
+    exists(Variable v |
+      a.(VariableAccess).getTarget() = v and
+      b.(VariableAccess).getTarget() = v
+    )
+  }
+  
+  // --- replace dfConstInt with value-text based check (minimal + robust) ---
+  predicate dfConstInt(Expr e) {
+    e.isConstant() and exists(string s | e.getValueText() = s)
+  }
+
+  predicate dfDictClearSpecialPair(DeallocationExpr d1, DeallocationExpr d2) {
+    exists(Expr p1, Expr p2, Expr flag1, Expr flag2 |
+      dfIsDictClearDealloc(d1, p1, flag1) and
+      dfIsDictClearDealloc(d2, p2, flag2) and
+
+      // CHANGE #1: same variable, not same AST node
+      dfSameVar(p1, p2) and
+
+      // BOTH flags must be constants
+      dfConstInt(flag1) and dfConstInt(flag2) and
+
+      // CHANGE #2: compare constant text (robust across C/C++ packs)
+      (
+        (flag1.getValueText() = "0" and flag2.getValueText() = "1") or
+        (flag1.getValueText() = "1" and flag2.getValueText() = "0")
       )
     )
-  )
-}
+  }
 
-/* ============================================================
- * Pluggable filters
- * Contract for plugin:
- *   predicate df_filter_xxx(DeallocationExpr srcDealloc, DataFlow::Node sinkNode, Expr sinkFreedExpr)
- * Aggregator:
- *   predicate df_filtered(...) is true iff ANY plugin returns true.
- * ============================================================ */
-
-/* -----------------------------
- * Filter plugin: dictClear/_dictClear
- * ----------------------------- */
-
-predicate dfIsDictClearName(Function f) {
-  f.hasName("dictClear") or f.hasName("_dictClear")
-}
-
-predicate dfIsDictClearDealloc(DeallocationExpr d, Expr freedArg, Expr flagArg) {
-  exists(FunctionCall c |
-    c = d and
-    dfIsDictClearName(c.getTarget()) and
-    freedArg = c.getArgument(0) and
-    flagArg = c.getArgument(1)
-  )
-}
-
-predicate dfIsConstInt(Expr e, int v) {
-  e.getValue().toInt() = v
-}
-
-predicate dfDictClearSpecialPair(DeallocationExpr d1, DeallocationExpr d2) {
-  exists(Expr p1, Expr p2, Expr flag1, Expr flag2, int v1, int v2 |
-    dfIsDictClearDealloc(d1, p1, flag1) and
-    dfIsDictClearDealloc(d2, p2, flag2) and
-    p1 = p2 and
-    dfIsConstInt(flag1, v1) and
-    dfIsConstInt(flag2, v2) and
-    v1 != v2
-  )
-}
-
-/**
- * Bind sink-side DeallocationExpr without '_' placeholders:
- * use exists(dummyA, dummyB | isFree(sinkNode, dummyA, sinkFreedExpr, sinkDealloc))
- */
-predicate dfFilterDictClear(DeallocationExpr srcDealloc, DataFlow::Node sinkNode, Expr sinkFreedExpr) {
-  exists(DeallocationExpr sinkDealloc, DataFlow::Node dummy0 |
-    isFree(dummy0, sinkNode, sinkFreedExpr, sinkDealloc) and
-    dfDictClearSpecialPair(srcDealloc, sinkDealloc)
-  )
-}
-
-
-/* -----------------------------
- * Aggregator: add more filters with "or ..."
- * ----------------------------- */
-predicate dfFiltered(DeallocationExpr srcDealloc, DataFlow::Node sinkNode, Expr sinkFreedExpr) {
-  dfFilterDictClear(srcDealloc, sinkNode, sinkFreedExpr)
-}
-
-/* ============================================================
- * Double-free flow configuration (same as your original)
- * ============================================================ */
-
+  
+  /**
+   * Bind sink-side DeallocationExpr without '_' placeholders:
+   * use exists(dummyA, dummyB | isFree(sinkNode, dummyA, sinkFreedExpr, sinkDealloc))
+   */
+  predicate dfFilterDictClear(DeallocationExpr srcDealloc, DataFlow::Node sinkNode, Expr sinkFreedExpr) {
+    exists(DeallocationExpr sinkDealloc, DataFlow::Node dummy0 |
+      isFree(dummy0, sinkNode, sinkFreedExpr, sinkDealloc) and
+      dfDictClearSpecialPair(srcDealloc, sinkDealloc)
+    )
+  }
+  
+  
+  /* -----------------------------
+   * Aggregator: add more filters with "or ..."
+   * ----------------------------- */
+  predicate dfFiltered(DeallocationExpr srcDealloc, DataFlow::Node sinkNode, Expr sinkFreedExpr) {
+    dfFilterDictClear(srcDealloc, sinkNode, sinkFreedExpr)
+  }
 module DoubleFreeParam implements FlowFromFreeParamSig {
-  predicate isSink = isFree/2;
-  predicate isExcluded = isExcludedMmFreePageFromMdl/2;
-  predicate sourceSinkIsRelated = defaultSourceSinkIsRelated/2;
+ predicate isSink = isFree/2;
+ predicate isExcluded = isExcludedMmFreePageFromMdl/2;
+ predicate sourceSinkIsRelated = defaultSourceSinkIsRelated/2;
 }
 
 module DoubleFree = FlowFromFree<DoubleFreeParam>;
 
-/* ============================================================
- * Main query
- * ============================================================ */
-
 from DoubleFree::PathNode source, DoubleFree::PathNode sink, DeallocationExpr dealloc, Expr e2, string detail
 where
-  DoubleFree::flowPath(source, sink) and
+ DoubleFree::flowPath(source, sink) and
+ isFree(source.getNode(), _, _, dealloc) and
+ isFree(sink.getNode(), e2) and
+ not dfFiltered(dealloc, sink.getNode(), e2) and
 
-  /* Bind source-side deallocation expr without '_' placeholders */
-  exists(DataFlow::Node dummy0, Expr dummyFreed |
-  isFree(dummy0, source.getNode(), dummyFreed, dealloc)
-)   and
-
-  isFree(sink.getNode(), e2) and
-
-  /* Post-filter stage */
-  not dfFiltered(dealloc, sink.getNode(), e2) and
-
-  (
-    exists(Variable v |
-      freeInBothBranches(dealloc, _, v) and detail = " (freed in both branches)"
-      or
-      freeInLoop(dealloc, v) and detail = " (freed in loop)"
-    )
-    or
-    not exists(Variable v | freeInBothBranches(dealloc, _, v) or freeInLoop(dealloc, v)) and detail = ""
-  )
-select sink.getNode(), source, sink,
-  "Memory pointed to by $@ may already have been freed by $@" + detail + ".",
-  e2, e2.toString(), dealloc, dealloc.toString()
+ (
+   exists(Variable v |
+     freeInBothBranches(dealloc, _, v) and detail = " (freed in both branches)"
+     or
+     freeInLoop(dealloc, v) and detail = " (freed in loop)"
+   )
+   or
+   not exists(Variable v | freeInBothBranches(dealloc, _, v) or freeInLoop(dealloc, v)) and detail = ""
+ )
+select sink.getNode(), source, sink, "Memory pointed to by $@ may already have been freed by $@" + detail + ".",
+ e2, e2.toString(), dealloc, dealloc.toString()
 '''
 
 
