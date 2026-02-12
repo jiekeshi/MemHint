@@ -441,19 +441,20 @@ select sink.getNode(), source, sink, "Memory may have been previously freed by $
   dealloc.toString()
 '''
 
-ENHANCED_DOUBLE_FREE_FILTERED = '''
+
+ENHANCED_DOUBLE_FREE_FILTERED_TEMPLATE = '''
 /**
  * @name Potential double free (Enhanced + filters)
  * @description Enhanced version with better control-flow sensitivity for conditional frees, plus pluggable special-case filters.
-* @kind path-problem
-* @precision high
+ * @kind path-problem
+ * @precision high
  * @id cpp/double-free-enhanced-filtered
-* @problem.severity warning
-* @security-severity 9.3
-* @tags reliability
-*       security
-*       external/cwe/cwe-415
-*/
+ * @problem.severity warning
+ * @security-severity 9.3
+ * @tags reliability
+ *       security
+ *       external/cwe/cwe-415
+ */
 
 import cpp
 import semmle.code.cpp.dataflow.new.DataFlow
@@ -463,139 +464,67 @@ import DoubleFree::PathGraph
 predicate isFree(DataFlow::Node n, Expr e) { isFree(_, n, e, _) }
 
 /**
-* Enhanced: Detect free in both branches of an if statement
-*/
+ * Enhanced: Detect free in both branches of an if statement
+ */
 predicate freeInBothBranches(DeallocationExpr free1, DeallocationExpr free2, Variable v) {
- exists(IfStmt ifStmt |
-   free1.getFreedExpr().(VariableAccess).getTarget() = v and
-   free2.getFreedExpr().(VariableAccess).getTarget() = v and
-   free1.getEnclosingStmt().getParentStmt*() = ifStmt.getThen() and
-   free2.getEnclosingStmt().getParentStmt*() = ifStmt.getElse() and
-   exists(DeallocationExpr free3 |
-     free3.getFreedExpr().(VariableAccess).getTarget() = v and
-     ifStmt.getASuccessor+() = free3
-   )
- )
+  exists(IfStmt ifStmt |
+    free1.getFreedExpr().(VariableAccess).getTarget() = v and
+    free2.getFreedExpr().(VariableAccess).getTarget() = v and
+    free1.getEnclosingStmt().getParentStmt*() = ifStmt.getThen() and
+    free2.getEnclosingStmt().getParentStmt*() = ifStmt.getElse() and
+    exists(DeallocationExpr free3 |
+      free3.getFreedExpr().(VariableAccess).getTarget() = v and
+      ifStmt.getASuccessor+() = free3
+    )
+  )
 }
 
 /**
-* Enhanced: Detect free in a loop that may execute multiple times
-*/
+ * Enhanced: Detect free in a loop that may execute multiple times
+ */
 predicate freeInLoop(DeallocationExpr free, Variable v) {
- exists(Loop loop |
-   free.getFreedExpr().(VariableAccess).getTarget() = v and
-   free.getEnclosingStmt().getParentStmt*() = loop.getStmt() and
-   not exists(AllocationExpr alloc |
-     alloc.getEnclosingStmt().getParentStmt*() = loop.getStmt() and
-     exists(AssignExpr assign |
-       assign.getRValue() = alloc and
-       assign.getLValue().(VariableAccess).getTarget() = v
-     )
-   )
- )
-}
- /* ============================================================
-  * Pluggable filters
-  * Contract for plugin:
-  *   predicate df_filter_xxx(DeallocationExpr srcDealloc, DataFlow::Node sinkNode, Expr sinkFreedExpr)
-  * Aggregator:
-  *   predicate df_filtered(...) is true iff ANY plugin returns true.
-  * ============================================================ */
- 
- /* -----------------------------
-  * Filter plugin: dictClear/_dictClear
-  * ----------------------------- */
- 
-  predicate dfIsDictClearName(Function f) {
-    f.hasName("dictClear") or f.hasName("_dictClear")
-  }
-  
-  predicate dfIsDictClearDealloc(DeallocationExpr d, Expr freedArg, Expr flagArg) {
-    exists(FunctionCall c |
-      c = d and
-      dfIsDictClearName(c.getTarget()) and
-      freedArg = c.getArgument(0) and
-      flagArg = c.getArgument(1)
-    )
-  }
-  
-  predicate dfSameVar(Expr a, Expr b) {
-    exists(Variable v |
-      a.(VariableAccess).getTarget() = v and
-      b.(VariableAccess).getTarget() = v
-    )
-  }
-  
-  // --- replace dfConstInt with value-text based check (minimal + robust) ---
-  predicate dfConstInt(Expr e) {
-    e.isConstant() and exists(string s | e.getValueText() = s)
-  }
-
-  predicate dfDictClearSpecialPair(DeallocationExpr d1, DeallocationExpr d2) {
-    exists(Expr p1, Expr p2, Expr flag1, Expr flag2 |
-      dfIsDictClearDealloc(d1, p1, flag1) and
-      dfIsDictClearDealloc(d2, p2, flag2) and
-
-      // CHANGE #1: same variable, not same AST node
-      dfSameVar(p1, p2) and
-
-      // BOTH flags must be constants
-      dfConstInt(flag1) and dfConstInt(flag2) and
-
-      // CHANGE #2: compare constant text (robust across C/C++ packs)
-      (
-        (flag1.getValueText() = "0" and flag2.getValueText() = "1") or
-        (flag1.getValueText() = "1" and flag2.getValueText() = "0")
+  exists(Loop loop |
+    free.getFreedExpr().(VariableAccess).getTarget() = v and
+    free.getEnclosingStmt().getParentStmt*() = loop.getStmt() and
+    not exists(AllocationExpr alloc |
+      alloc.getEnclosingStmt().getParentStmt*() = loop.getStmt() and
+      exists(AssignExpr assign |
+        assign.getRValue() = alloc and
+        assign.getLValue().(VariableAccess).getTarget() = v
       )
     )
-  }
+  )
+}
 
-  
-  /**
-   * Bind sink-side DeallocationExpr without '_' placeholders:
-   * use exists(dummyA, dummyB | isFree(sinkNode, dummyA, sinkFreedExpr, sinkDealloc))
-   */
-  predicate dfFilterDictClear(DeallocationExpr srcDealloc, DataFlow::Node sinkNode, Expr sinkFreedExpr) {
-    exists(DeallocationExpr sinkDealloc, DataFlow::Node dummy0 |
-      isFree(dummy0, sinkNode, sinkFreedExpr, sinkDealloc) and
-      dfDictClearSpecialPair(srcDealloc, sinkDealloc)
-    )
-  }
-  
-  
-  /* -----------------------------
-   * Aggregator: add more filters with "or ..."
-   * ----------------------------- */
-  predicate dfFiltered(DeallocationExpr srcDealloc, DataFlow::Node sinkNode, Expr sinkFreedExpr) {
-    dfFilterDictClear(srcDealloc, sinkNode, sinkFreedExpr)
-  }
 module DoubleFreeParam implements FlowFromFreeParamSig {
- predicate isSink = isFree/2;
- predicate isExcluded = isExcludedMmFreePageFromMdl/2;
- predicate sourceSinkIsRelated = defaultSourceSinkIsRelated/2;
+  predicate isSink = isFree/2;
+  predicate isExcluded = isExcludedMmFreePageFromMdl/2;
+  predicate sourceSinkIsRelated = defaultSourceSinkIsRelated/2;
 }
 
 module DoubleFree = FlowFromFree<DoubleFreeParam>;
 
 from DoubleFree::PathNode source, DoubleFree::PathNode sink, DeallocationExpr dealloc, Expr e2, string detail
 where
- DoubleFree::flowPath(source, sink) and
- isFree(source.getNode(), _, _, dealloc) and
- isFree(sink.getNode(), e2) and
- not dfFiltered(dealloc, sink.getNode(), e2) and
-
- (
-   exists(Variable v |
-     freeInBothBranches(dealloc, _, v) and detail = " (freed in both branches)"
-     or
-     freeInLoop(dealloc, v) and detail = " (freed in loop)"
-   )
-   or
-   not exists(Variable v | freeInBothBranches(dealloc, _, v) or freeInLoop(dealloc, v)) and detail = ""
- )
-select sink.getNode(), source, sink, "Memory pointed to by $@ may already have been freed by $@" + detail + ".",
- e2, e2.toString(), dealloc, dealloc.toString()
+  DoubleFree::flowPath(source, sink) and
+  isFree(source.getNode(), _, _, dealloc) and
+  isFree(sink.getNode(), e2) and
+  not dfFiltered(dealloc, sink.getNode(), e2) and
+  (
+    exists(Variable v |
+      freeInBothBranches(dealloc, _, v) and detail = " (freed in both branches)"
+      or
+      freeInLoop(dealloc, v) and detail = " (freed in loop)"
+    )
+    or
+    not exists(Variable v | freeInBothBranches(dealloc, _, v) or freeInLoop(dealloc, v)) and detail = ""
+  )
+select sink.getNode(), source, sink,
+  "Memory pointed to by $@ may already have been freed by $@" + detail + ".",
+  e2, e2.toString(), dealloc, dealloc.toString()
 '''
+
+ENHANCED_DOUBLE_FREE_FILTERED = ENHANCED_DOUBLE_FREE_FILTERED_TEMPLATE
 
 
 # Map query names to enhanced versions
@@ -606,6 +535,7 @@ ENHANCED_QUERIES = {
     "UseAfterFree": ENHANCED_USE_AFTER_FREE,
 }
 
+# Base (built-in) filtered query text; may be extended with LLM-generated filters at runtime.
 ENHANCED_QUERIES_FILTERED = {
     "DoubleFree": ENHANCED_DOUBLE_FREE_FILTERED,
 }
@@ -628,6 +558,9 @@ class CodeQLAnalyzer:
         self.cpp_queries_dir = cpp_queries_dir
         self.reuse_db = reuse_db
         self._injected_files: list[Path] = []
+        # Dynamic enhanced filtered query for DoubleFree; may be overridden
+        # with LLM-generated filters at analysis time.
+        self._double_free_filtered_query: str | None = None
 
     def analyze(
         self,
@@ -671,14 +604,14 @@ class CodeQLAnalyzer:
             # Step 3: Prepare queries
             queries: list[Path] = []
 
-            # Add custom CodeQL queries if provided (these only ADD results; they don't suppress)
-            # if custom_queries and len(custom_queries) > 0:
-            #     logger.info(f"Step 3a: Writing {len(custom_queries)} custom queries...")
-            #     custom_query_files, custom_cleanup = self._write_custom_queries(custom_queries)
-            #     queries.extend(custom_query_files)
-            #     query_files_to_cleanup.extend(custom_cleanup)
-            #     logger.info(f"  Added {len(custom_query_files)} custom query files")
-
+            # Build dynamic enhanced filtered DoubleFree query by merging the
+            # hard-coded template with any LLM-generated filter snippets in custom_queries.
+            if custom_queries and len(custom_queries) > 0:
+                logger.info("Merging custom double-free filters into enhanced template...")
+                self._double_free_filtered_query = self._build_double_free_filtered_with_custom_filters(
+                    custom_queries
+                )
+            
             # Add enhanced queries if enabled
             if use_enhanced_queries:
                 logger.info("Step 3b: Writing enhanced queries...")
@@ -764,6 +697,35 @@ class CodeQLAnalyzer:
         logger.info(f"Wrote {len(query_files)} custom query files to {custom_query_dir}")
         return query_files, cleanup_files
 
+    def _build_double_free_filtered_with_custom_filters(
+        self,
+        custom_queries: CustomQuerySet,
+    ) -> str:
+        """
+        Build the final enhanced+filtered DoubleFree query text by combining:
+          - the hard-coded ENHANCED_DOUBLE_FREE_FILTERED_TEMPLATE, and
+          - all LLM-generated double-free filter snippets from CustomQuerySet.
+
+        Each CustomQuery currently stores the double-free filter QL in its
+        `query_code` field (see CustomQuerySet.from_json). We simply concat them
+        after the template so they can contribute additional dfFiltered(...) logic.
+        """
+        snippets: list[str] = []
+        for func_name, q in (custom_queries.queries or {}).items():
+            code = (getattr(q, "query_code", "") or "").strip()
+            if not code:
+                continue
+            snippets.append(f"// ---- LLM filter for {func_name} ----\n{code}\n")
+
+        # If there are no dynamic snippets, fall back to the built-in filtered query.
+        if not snippets:
+            return ENHANCED_QUERIES_FILTERED.get("DoubleFree", ENHANCED_DOUBLE_FREE_FILTERED)
+
+        merged_filters = "\n\n".join(snippets)
+        # Template already includes dfFiltered(...) reference; snippets are expected
+        # to define dfFiltered / dfFilterXxx predicates that the template calls.
+        return ENHANCED_DOUBLE_FREE_FILTERED_TEMPLATE + "\n\n" + merged_filters
+
     def _prepare_enhanced_queries(self) -> tuple[list[Path], list[Path]]:
         """
         Write enhanced queries next to original queries.
@@ -793,7 +755,9 @@ class CodeQLAnalyzer:
                   continue
 
               enhanced_path = original_path.parent / f"{query_name}_enhanced_filtered.ql"
-              enhanced_path.write_text(ENHANCED_QUERIES_FILTERED[query_name])
+              # Prefer dynamically built filtered query (with LLM filters) if available.
+              qtext = self._double_free_filtered_query or ENHANCED_QUERIES_FILTERED[query_name]
+              enhanced_path.write_text(qtext)
 
               query_files.append(enhanced_path)
               cleanup_files.append(enhanced_path)

@@ -44,14 +44,15 @@ class MemoryIssueType(Enum):
     MEMORY_LEAK = auto()        # Allocated memory never freed
     USE_AFTER_FREE = auto()     # Accessing freed memory
     DOUBLE_FREE = auto()        # Freeing already freed memory
+    DOUBLE_FREE_FILTERED = auto() # Freeing already freed memory with a filtered condition
 
 
 # Mapping: Which hints help detect which bugs
 HINT_TO_BUGS = {
     HintType.ALLOCATOR: [MemoryIssueType.MEMORY_LEAK, MemoryIssueType.USE_AFTER_FREE,
-                         MemoryIssueType.DOUBLE_FREE],
+                         MemoryIssueType.DOUBLE_FREE, MemoryIssueType.DOUBLE_FREE_FILTERED],
     HintType.DEALLOCATOR: [MemoryIssueType.MEMORY_LEAK, MemoryIssueType.USE_AFTER_FREE,
-                           MemoryIssueType.DOUBLE_FREE],
+                           MemoryIssueType.DOUBLE_FREE, MemoryIssueType.DOUBLE_FREE_FILTERED],
 }
 
 
@@ -373,12 +374,31 @@ class CustomQuerySet:
         out: Dict[str, Any] = {"queries": {}, "non_special": {}}
 
         for func_name, q in self.queries.items():
-            out["queries"][func_name] = {
+            # New structured format: per-bug-type filter blocks for this function.
+            # For now, we only actively use the double-free filter block; the others
+            # are placeholders so the JSON schema is stable and extensible.
+            double_free_block: Dict[str, Any] = {
                 "query_code": q.query_code,
-                "reason": q.reason,
-                "tags": list(q.tags),
                 "validated": bool(q.validated),
                 "validation_error": q.validation_error,
+            }
+            use_after_free_block: Dict[str, Any] = {
+                "query_code": "",
+                "validated": False,
+                "validation_error": "",
+            }
+            memory_leak_block: Dict[str, Any] = {
+                "query_code": "",
+                "validated": False,
+                "validation_error": "",
+            }
+
+            out["queries"][func_name] = {
+                "double_free_filter": double_free_block,
+                "use_after_free_filter": use_after_free_block,
+                "memory_leak_filter": memory_leak_block,
+                "reason": q.reason,
+                "tags": list(q.tags),
                 "created_at": q.created_at,
                 "suppress_rules": [
                     {
@@ -424,28 +444,61 @@ class CustomQuerySet:
                 # Extremely old format: value was the query code
                 query_code = q
             elif isinstance(q, dict):
-                query_code = q.get("query_code", "") or ""
-                reason = q.get("reason", "") or ""
-                tags = list(q.get("tags", []) or [])
-                validated = bool(q.get("validated", False))
-                validation_error = q.get("validation_error", "") or ""
-                created_at = q.get("created_at", "") or ""
+                # New structured format with per-bug-type filters
+                if (
+                    "double_free_filter" in q
+                    or "use_after_free_filter" in q
+                    or "memory_leak_filter" in q
+                ):
+                    df_block = q.get("double_free_filter") or {}
+                    # For now, map the double-free filter block back into query_code/validated
+                    query_code = (df_block.get("query_code", "") or "").strip()
+                    validated = bool(df_block.get("validated", False))
+                    validation_error = df_block.get("validation_error", "") or ""
 
-                # Import suppress_rules if present
-                for r in (q.get("suppress_rules") or []):
-                    if not isinstance(r, dict):
-                        continue
-                    suppress_rules.append(
-                        SuppressRule(
-                            name=r.get("name", ""),
-                            reason=r.get("reason", ""),
-                            rule_id_contains=r.get("rule_id_contains"),
-                            function_name_equals=r.get("function_name_equals"),
-                            callee_global_name_equals=r.get("callee_global_name_equals"),
-                            arg_to_string_equals=dict(r.get("arg_to_string_equals", {}) or {}),
-                            arg_must_differ_for_pair=dict(r.get("arg_must_differ_for_pair", {}) or {}),
+                    reason = q.get("reason", "") or ""
+                    tags = list(q.get("tags", []) or [])
+                    created_at = q.get("created_at", "") or ""
+
+                    # Import suppress_rules if present (same shape as old format)
+                    for r in (q.get("suppress_rules") or []):
+                        if not isinstance(r, dict):
+                            continue
+                        suppress_rules.append(
+                            SuppressRule(
+                                name=r.get("name", ""),
+                                reason=r.get("reason", ""),
+                                rule_id_contains=r.get("rule_id_contains"),
+                                function_name_equals=r.get("function_name_equals"),
+                                callee_global_name_equals=r.get("callee_global_name_equals"),
+                                arg_to_string_equals=dict(r.get("arg_to_string_equals", {}) or {}),
+                                arg_must_differ_for_pair=dict(r.get("arg_must_differ_for_pair", {}) or {}),
+                            )
                         )
-                    )
+                else:
+                    # Legacy dict format with top-level query_code/etc.
+                    query_code = q.get("query_code", "") or ""
+                    reason = q.get("reason", "") or ""
+                    tags = list(q.get("tags", []) or [])
+                    validated = bool(q.get("validated", False))
+                    validation_error = q.get("validation_error", "") or ""
+                    created_at = q.get("created_at", "") or ""
+
+                    # Import suppress_rules if present
+                    for r in (q.get("suppress_rules") or []):
+                        if not isinstance(r, dict):
+                            continue
+                        suppress_rules.append(
+                            SuppressRule(
+                                name=r.get("name", ""),
+                                reason=r.get("reason", ""),
+                                rule_id_contains=r.get("rule_id_contains"),
+                                function_name_equals=r.get("function_name_equals"),
+                                callee_global_name_equals=r.get("callee_global_name_equals"),
+                                arg_to_string_equals=dict(r.get("arg_to_string_equals", {}) or {}),
+                                arg_must_differ_for_pair=dict(r.get("arg_must_differ_for_pair", {}) or {}),
+                            )
+                        )
 
             cq = CustomQuery(
                 function_name=func_name,
