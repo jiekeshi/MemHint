@@ -33,6 +33,7 @@ CODEQL_ISSUE_MAP = {
     "cpp/memory-may-not-be-freed-enhanced": MemoryIssueType.MEMORY_LEAK,
     "cpp/double-free-enhanced": MemoryIssueType.DOUBLE_FREE,
     "cpp/use-after-free-enhanced": MemoryIssueType.USE_AFTER_FREE,
+    "cpp/double-free-enhanced-filtered": MemoryIssueType.DOUBLE_FREE_FILTERED,
 }
 
 # Standard memory queries
@@ -440,12 +441,186 @@ select sink.getNode(), source, sink, "Memory may have been previously freed by $
   dealloc.toString()
 '''
 
+ENHANCED_DOUBLE_FREE_FILTERED = '''
+/**
+ * @name Potential double free (Enhanced + filters)
+ * @description Enhanced version with better control-flow sensitivity for conditional frees, plus pluggable special-case filters.
+ * @kind path-problem
+ * @precision high
+ * @id cpp/double-free-enhanced-filtered
+ * @problem.severity warning
+ * @security-severity 9.3
+ * @tags reliability
+ *       security
+ *       external/cwe/cwe-415
+ */
+
+import cpp
+import semmle.code.cpp.dataflow.new.DataFlow
+import semmle.code.cpp.security.flowafterfree.FlowAfterFree
+import DoubleFree::PathGraph
+
+/**
+ * Wrap the library's isFree/4 into isFree/2 without using '_' placeholders.
+ *
+ * Library predicate used in the original query: isFree( DataFlow::Node, Expr, Expr, DeallocationExpr )
+ * We existentially quantify the "unused" arguments.
+ */
+predicate isFree(DataFlow::Node n, Expr e) {
+  exists(DataFlow::Node dummy0, DeallocationExpr dummyDealloc |
+    isFree(dummy0, n, e, dummyDealloc)
+  )
+}
+
+
+
+/**
+ * Enhanced: Detect free in both branches of an if statement
+ */
+predicate freeInBothBranches(DeallocationExpr free1, DeallocationExpr free2, Variable v) {
+  exists(IfStmt ifStmt |
+    free1.getFreedExpr().(VariableAccess).getTarget() = v and
+    free2.getFreedExpr().(VariableAccess).getTarget() = v and
+    free1.getEnclosingStmt().getParentStmt*() = ifStmt.getThen() and
+    free2.getEnclosingStmt().getParentStmt*() = ifStmt.getElse() and
+    exists(DeallocationExpr free3 |
+      free3.getFreedExpr().(VariableAccess).getTarget() = v and
+      ifStmt.getASuccessor+() = free3
+    )
+  )
+}
+
+/**
+ * Enhanced: Detect free in a loop that may execute multiple times
+ */
+predicate freeInLoop(DeallocationExpr free, Variable v) {
+  exists(Loop loop |
+    free.getFreedExpr().(VariableAccess).getTarget() = v and
+    free.getEnclosingStmt().getParentStmt*() = loop.getStmt() and
+    not exists(AllocationExpr alloc |
+      alloc.getEnclosingStmt().getParentStmt*() = loop.getStmt() and
+      exists(AssignExpr assign |
+        assign.getRValue() = alloc and
+        assign.getLValue().(VariableAccess).getTarget() = v
+      )
+    )
+  )
+}
+
+/* ============================================================
+ * Pluggable filters
+ * Contract for plugin:
+ *   predicate df_filter_xxx(DeallocationExpr srcDealloc, DataFlow::Node sinkNode, Expr sinkFreedExpr)
+ * Aggregator:
+ *   predicate df_filtered(...) is true iff ANY plugin returns true.
+ * ============================================================ */
+
+/* -----------------------------
+ * Filter plugin: dictClear/_dictClear
+ * ----------------------------- */
+
+predicate dfIsDictClearName(Function f) {
+  f.hasName("dictClear") or f.hasName("_dictClear")
+}
+
+predicate dfIsDictClearDealloc(DeallocationExpr d, Expr freedArg, Expr flagArg) {
+  exists(FunctionCall c |
+    c = d and
+    dfIsDictClearName(c.getTarget()) and
+    freedArg = c.getArgument(0) and
+    flagArg = c.getArgument(1)
+  )
+}
+
+predicate dfIsConstInt(Expr e, int v) {
+  e.getValue().toInt() = v
+}
+
+predicate dfDictClearSpecialPair(DeallocationExpr d1, DeallocationExpr d2) {
+  exists(Expr p1, Expr p2, Expr flag1, Expr flag2, int v1, int v2 |
+    dfIsDictClearDealloc(d1, p1, flag1) and
+    dfIsDictClearDealloc(d2, p2, flag2) and
+    p1 = p2 and
+    dfIsConstInt(flag1, v1) and
+    dfIsConstInt(flag2, v2) and
+    v1 != v2
+  )
+}
+
+/**
+ * Bind sink-side DeallocationExpr without '_' placeholders:
+ * use exists(dummyA, dummyB | isFree(sinkNode, dummyA, sinkFreedExpr, sinkDealloc))
+ */
+predicate dfFilterDictClear(DeallocationExpr srcDealloc, DataFlow::Node sinkNode, Expr sinkFreedExpr) {
+  exists(DeallocationExpr sinkDealloc, DataFlow::Node dummy0 |
+    isFree(dummy0, sinkNode, sinkFreedExpr, sinkDealloc) and
+    dfDictClearSpecialPair(srcDealloc, sinkDealloc)
+  )
+}
+
+
+/* -----------------------------
+ * Aggregator: add more filters with "or ..."
+ * ----------------------------- */
+predicate dfFiltered(DeallocationExpr srcDealloc, DataFlow::Node sinkNode, Expr sinkFreedExpr) {
+  dfFilterDictClear(srcDealloc, sinkNode, sinkFreedExpr)
+}
+
+/* ============================================================
+ * Double-free flow configuration (same as your original)
+ * ============================================================ */
+
+module DoubleFreeParam implements FlowFromFreeParamSig {
+  predicate isSink = isFree/2;
+  predicate isExcluded = isExcludedMmFreePageFromMdl/2;
+  predicate sourceSinkIsRelated = defaultSourceSinkIsRelated/2;
+}
+
+module DoubleFree = FlowFromFree<DoubleFreeParam>;
+
+/* ============================================================
+ * Main query
+ * ============================================================ */
+
+from DoubleFree::PathNode source, DoubleFree::PathNode sink, DeallocationExpr dealloc, Expr e2, string detail
+where
+  DoubleFree::flowPath(source, sink) and
+
+  /* Bind source-side deallocation expr without '_' placeholders */
+  exists(DataFlow::Node dummy0, Expr dummyFreed |
+  isFree(dummy0, source.getNode(), dummyFreed, dealloc)
+)   and
+
+  isFree(sink.getNode(), e2) and
+
+  /* Post-filter stage */
+  not dfFiltered(dealloc, sink.getNode(), e2) and
+
+  (
+    exists(Variable v |
+      freeInBothBranches(dealloc, _, v) and detail = " (freed in both branches)"
+      or
+      freeInLoop(dealloc, v) and detail = " (freed in loop)"
+    )
+    or
+    not exists(Variable v | freeInBothBranches(dealloc, _, v) or freeInLoop(dealloc, v)) and detail = ""
+  )
+select sink.getNode(), source, sink,
+  "Memory pointed to by $@ may already have been freed by $@" + detail + ".",
+  e2, e2.toString(), dealloc, dealloc.toString()
+'''
+
+
 # Map query names to enhanced versions
 ENHANCED_QUERIES = {
     "MemoryNeverFreed": ENHANCED_MEMORY_NEVER_FREED,
     "MemoryMayNotBeFreed": ENHANCED_MEMORY_MAY_NOT_BE_FREED,
     "DoubleFree": ENHANCED_DOUBLE_FREE,
     "UseAfterFree": ENHANCED_USE_AFTER_FREE,
+}
+
+ENHANCED_QUERIES_FILTERED = {
+    "DoubleFree": ENHANCED_DOUBLE_FREE_FILTERED,
 }
 
 
@@ -510,12 +685,12 @@ class CodeQLAnalyzer:
             queries: list[Path] = []
 
             # Add custom CodeQL queries if provided (these only ADD results; they don't suppress)
-            if custom_queries and len(custom_queries) > 0:
-                logger.info(f"Step 3a: Writing {len(custom_queries)} custom queries...")
-                custom_query_files, custom_cleanup = self._write_custom_queries(custom_queries)
-                queries.extend(custom_query_files)
-                query_files_to_cleanup.extend(custom_cleanup)
-                logger.info(f"  Added {len(custom_query_files)} custom query files")
+            # if custom_queries and len(custom_queries) > 0:
+            #     logger.info(f"Step 3a: Writing {len(custom_queries)} custom queries...")
+            #     custom_query_files, custom_cleanup = self._write_custom_queries(custom_queries)
+            #     queries.extend(custom_query_files)
+            #     query_files_to_cleanup.extend(custom_cleanup)
+            #     logger.info(f"  Added {len(custom_query_files)} custom query files")
 
             # Add enhanced queries if enabled
             if use_enhanced_queries:
@@ -540,15 +715,6 @@ class CodeQLAnalyzer:
                 return []
 
             warnings = self._parse_sarif(results_path, project_path)
-
-            # Step 5: Pipeline-level suppression (NEW)
-            if custom_queries:
-                before = len(warnings)
-                warnings = self._apply_suppressions(warnings, custom_queries)
-                after = len(warnings)
-                if after != before:
-                    logger.info(f"Step 5: Suppressed {before - after} warnings using custom suppression rules")
-
             return warnings
 
         except Exception as e:
@@ -568,61 +734,6 @@ class CodeQLAnalyzer:
             if output_dir.exists():
                 shutil.rmtree(output_dir, ignore_errors=True)
 
-    # -------------------------------------------------------------------------
-    # NEW: Suppression layer
-    # -------------------------------------------------------------------------
-
-    def _apply_suppressions(self, warnings: list[Warning], custom_queries: CustomQuerySet) -> list[Warning]:
-        """
-        Apply suppression rules stored in CustomQuerySet (pipeline filtering).
-
-        This is the place where your "_dictClear(d,0) + _dictClear(d,1) is safe"
-        logic should live.
-
-        Matching strategy:
-          - Each suppress rule can match on any subset of:
-              function_name, warning_type (ruleId substring), file_path (regex), message (regex)
-          - Optionally require existence of another call pattern via 'requires' (regex over trace or message)
-        """
-        rules = []
-        for cq in custom_queries.queries.values():
-            for r in getattr(cq, "suppress_rules", []) or []:
-                rules.append(r)
-
-        if not rules:
-            return warnings
-
-        compiled = []
-        for r in rules:
-            compiled.append({
-                "function_name": r.get("function_name"),
-                "warning_type_contains": (r.get("warning_type_contains") or "").lower() or None,
-                "file_path_regex": re.compile(r["file_path_regex"]) if r.get("file_path_regex") else None,
-                "message_regex": re.compile(r["message_regex"], re.IGNORECASE) if r.get("message_regex") else None,
-                "trace_regex": re.compile(r["trace_regex"], re.IGNORECASE) if r.get("trace_regex") else None,
-            })
-
-        def matches(w: Warning, rule) -> bool:
-            if rule["function_name"] and w.function_name != rule["function_name"]:
-                return False
-            if rule["warning_type_contains"] and rule["warning_type_contains"] not in (w.warning_type or "").lower():
-                return False
-            if rule["file_path_regex"] and not rule["file_path_regex"].search(w.file_path or ""):
-                return False
-            if rule["message_regex"] and not rule["message_regex"].search(w.message or ""):
-                return False
-            if rule["trace_regex"]:
-                joined = "\n".join(w.trace or [])
-                if not rule["trace_regex"].search(joined):
-                    return False
-            return True
-
-        out: list[Warning] = []
-        for w in warnings:
-            suppressed = any(matches(w, r) for r in compiled)
-            if not suppressed:
-                out.append(w)
-        return out
 
     # -------------------------------------------------------------------------
     # Custom query writing (unchanged except: ignore entries that are "suppression-only")
@@ -661,7 +772,7 @@ class CodeQLAnalyzer:
             query_file.write_text(qc)
             query_files.append(query_file)
             cleanup_files.append(query_file)
-            logger.debug(f"  Written custom query for '{func_name}' to {query_file.name}")
+            logger.info(f"  Written custom query for '{func_name}' to {query_file.name}")
 
         logger.info(f"Wrote {len(query_files)} custom query files to {custom_query_dir}")
         return query_files, cleanup_files
@@ -675,21 +786,35 @@ class CodeQLAnalyzer:
 
         for query_ref in MEMORY_QUERIES:
             query_name = query_ref.split("/")[-1].replace(".ql", "")
-            if query_name not in ENHANCED_QUERIES:
-                logger.warning(f"No enhanced version for {query_name}")
-                continue
+            if query_name in ENHANCED_QUERIES:
+              original_path = self._find_query_file_path(query_ref)
+              if not original_path:
+                  logger.warning(f"Could not find {query_ref}")
+                  continue
 
-            original_path = self._find_query_file_path(query_ref)
-            if not original_path:
-                logger.warning(f"Could not find {query_ref}")
-                continue
+              enhanced_path = original_path.parent / f"{query_name}_enhanced.ql"
+              enhanced_path.write_text(ENHANCED_QUERIES[query_name])
 
-            enhanced_path = original_path.parent / f"{query_name}_enhanced.ql"
-            enhanced_path.write_text(ENHANCED_QUERIES[query_name])
+              query_files.append(enhanced_path)
+              cleanup_files.append(enhanced_path)
+              logger.info(f"  Written: {enhanced_path}")
+              
+            if query_name in ENHANCED_QUERIES_FILTERED:
+              original_path = self._find_query_file_path(query_ref)
+              if not original_path:
+                  logger.warning(f"Could not find {query_ref}")
+                  continue
 
-            query_files.append(enhanced_path)
-            cleanup_files.append(enhanced_path)
-            logger.info(f"  Written: {enhanced_path}")
+              enhanced_path = original_path.parent / f"{query_name}_enhanced_filtered.ql"
+              enhanced_path.write_text(ENHANCED_QUERIES_FILTERED[query_name])
+
+              query_files.append(enhanced_path)
+              cleanup_files.append(enhanced_path)
+              logger.info(f"  Written: {enhanced_path}")
+              
+            if query_name not in ENHANCED_QUERIES and query_name not in ENHANCED_QUERIES_FILTERED:
+              logger.warning(f"No enhanced/filtered version for {query_name}")
+              continue
 
         return query_files, cleanup_files
 
@@ -1025,11 +1150,18 @@ class CodeQLAnalyzer:
                 for result in run.get("results", []):
                     rule_id = (result.get("ruleId", "") or "").lower()
 
+                    # Default issue type; will refine based on rule_id
                     issue_type = MemoryIssueType.MEMORY_LEAK
-                    for key, val in CODEQL_ISSUE_MAP.items():
-                        if key in rule_id:
-                            issue_type = val
-                            break
+
+                    # First try exact match on rule_id
+                    if rule_id in CODEQL_ISSUE_MAP:
+                        issue_type = CODEQL_ISSUE_MAP[rule_id]
+                    else:
+                        # Fallback: substring match (for older CodeQL ids), preferring longer keys first
+                        for key, val in sorted(CODEQL_ISSUE_MAP.items(), key=lambda kv: len(kv[0]), reverse=True):
+                            if key in rule_id:
+                                issue_type = val
+                                break
 
                     locs = result.get("locations", []) or []
                     if not locs:
