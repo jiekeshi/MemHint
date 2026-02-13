@@ -44,15 +44,17 @@ class MemoryIssueType(Enum):
     MEMORY_LEAK = auto()        # Allocated memory never freed
     USE_AFTER_FREE = auto()     # Accessing freed memory
     DOUBLE_FREE = auto()        # Freeing already freed memory
+    MEMORY_LEAK_FILTERED = auto() # Allocated memory never freed with a filtered condition
+    USE_AFTER_FREE_FILTERED = auto() # Accessing freed memory with a filtered condition
     DOUBLE_FREE_FILTERED = auto() # Freeing already freed memory with a filtered condition
 
 
 # Mapping: Which hints help detect which bugs
 HINT_TO_BUGS = {
     HintType.ALLOCATOR: [MemoryIssueType.MEMORY_LEAK, MemoryIssueType.USE_AFTER_FREE,
-                         MemoryIssueType.DOUBLE_FREE, MemoryIssueType.DOUBLE_FREE_FILTERED],
+                         MemoryIssueType.DOUBLE_FREE, MemoryIssueType.MEMORY_LEAK_FILTERED, MemoryIssueType.USE_AFTER_FREE_FILTERED, MemoryIssueType.DOUBLE_FREE_FILTERED],
     HintType.DEALLOCATOR: [MemoryIssueType.MEMORY_LEAK, MemoryIssueType.USE_AFTER_FREE,
-                           MemoryIssueType.DOUBLE_FREE, MemoryIssueType.DOUBLE_FREE_FILTERED],
+                           MemoryIssueType.DOUBLE_FREE, MemoryIssueType.MEMORY_LEAK_FILTERED, MemoryIssueType.USE_AFTER_FREE_FILTERED, MemoryIssueType.DOUBLE_FREE_FILTERED],
 }
 
 
@@ -451,6 +453,8 @@ class CustomQuerySet:
                     or "memory_leak_filter" in q
                 ):
                     df_block = q.get("double_free_filter") or {}
+                    mlf_block = q.get("memory_leak_filter") or {}
+                    uaf_block = q.get("use_after_free_filter") or {}
                     # For now, map the double-free filter block back into query_code/validated
                     query_code = (df_block.get("query_code", "") or "").strip()
                     validated = bool(df_block.get("validated", False))

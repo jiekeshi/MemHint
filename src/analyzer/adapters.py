@@ -33,7 +33,12 @@ CODEQL_ISSUE_MAP = {
     "cpp/memory-may-not-be-freed-enhanced": MemoryIssueType.MEMORY_LEAK,
     "cpp/double-free-enhanced": MemoryIssueType.DOUBLE_FREE,
     "cpp/use-after-free-enhanced": MemoryIssueType.USE_AFTER_FREE,
+    # Filtered queries
+    "cpp/memory-never-freed-enhanced-filtered": MemoryIssueType.MEMORY_LEAK_FILTERED,
+    "cpp/memory-may-not-be-freed-enhanced-filtered": MemoryIssueType.MEMORY_LEAK_FILTERED,
     "cpp/double-free-enhanced-filtered": MemoryIssueType.DOUBLE_FREE_FILTERED,
+    "cpp/use-after-free-enhanced-filtered": MemoryIssueType.USE_AFTER_FREE_FILTERED,
+    
 }
 
 # Standard memory queries
@@ -524,8 +529,328 @@ select sink.getNode(), source, sink,
   e2, e2.toString(), dealloc, dealloc.toString()
 '''
 
-ENHANCED_DOUBLE_FREE_FILTERED = ENHANCED_DOUBLE_FREE_FILTERED_TEMPLATE
+ENHANCED_MEMORY_NEVER_FREED_FILTERED_TEMPLATE = '''
+/**
+ * @name Memory is never freed (Enhanced)
+ * @description Enhanced version with better error-path detection.
+ *              Detects memory allocated but never freed, including in error paths.
+ * @kind problem
+ * @id cpp/memory-never-freed-enhanced-filtered
+ * @problem.severity warning
+ * @security-severity 7.5
+ * @tags efficiency
+ *       security
+ *       external/cwe/cwe-401
+ */
+import MemoryFreed
 
+/**
+ * Additional predicate to detect allocations in error-handling branches
+ * that may be missed by the standard query.
+ */
+predicate allocInErrorBranch(AllocationExpr alloc) {
+  exists(IfStmt ifStmt, BlockStmt block |
+    // Allocation is in a conditional branch
+    (block = ifStmt.getThen() or block = ifStmt.getElse()) and
+    alloc.getEnclosingStmt().getParentStmt*() = block
+  )
+}
+
+/**
+ * Detects allocation in a loop where the pointer may be overwritten.
+ */
+predicate allocInLoopMayOverwrite(AllocationExpr alloc) {
+  exists(Loop loop, Variable v, AssignExpr assign |
+    alloc.getEnclosingStmt().getParentStmt*() = loop.getStmt() and
+    assign.getRValue() = alloc and
+    assign.getLValue().(VariableAccess).getTarget() = v and
+    // Same variable assigned elsewhere in the loop
+    exists(AssignExpr other |
+      other != assign and
+      other.getLValue().(VariableAccess).getTarget() = v and
+      other.getEnclosingStmt().getParentStmt*() = loop.getStmt()
+    )
+  )
+}
+
+from AllocationExpr alloc, string reason
+where
+  alloc.requiresDealloc() and
+  not allocMayBeFreed(alloc) and
+  (
+    // Standard case
+    not allocInErrorBranch(alloc) and not allocInLoopMayOverwrite(alloc) and reason = "never freed"
+    or
+    // Error branch case
+    allocInErrorBranch(alloc) and reason = "never freed (in conditional branch)"
+    or
+    // Loop overwrite case
+    allocInLoopMayOverwrite(alloc) and reason = "may leak in loop (pointer overwritten)"
+  )
+select alloc, "This memory is " + reason + "."
+'''
+
+ENHANCED_MEMORY_MAY_NOT_BE_FREED_FILTERED_TEMPLATE = '''/**
+ * @name Memory may not be freed (Enhanced)
+ * @description Enhanced version that better tracks memory through early returns.
+ * @kind problem
+ * @id cpp/memory-may-not-be-freed-enhanced-filtered
+ * @problem.severity warning
+ * @security-severity 7.5
+ * @tags efficiency
+ *       security
+ *       external/cwe/cwe-401
+ */
+
+import MemoryFreed
+import semmle.code.cpp.controlflow.StackVariableReachability
+
+predicate mayCallFunction(Expr call, Function f) {
+  call.(FunctionCall).getTarget() = f or
+  call.(VariableCall).getVariable().getAnAssignedValue().getAChild*().(FunctionAccess).getTarget() = f
+}
+
+predicate allocCallOrIndirect(Expr e) {
+  e.(AllocationExpr).requiresDealloc() and
+  allocMayBeFreed(e)
+  or
+  exists(ReturnStmt rtn |
+    mayCallFunction(e, rtn.getEnclosingFunction()) and
+    (
+      allocCallOrIndirect(rtn.getExpr())
+      or
+      exists(StackVariable v |
+        v = rtn.getExpr().(VariableAccess).getTarget() and
+        allocCallOrIndirect(v.getAnAssignedValue()) and
+        not assignedToFieldOrGlobal(v, _)
+      )
+    )
+  )
+}
+
+predicate verifiedRealloc(FunctionCall reallocCall, Variable v, ControlFlowNode verified) {
+  reallocCall.(AllocationExpr).getReallocPtr() = v.getAnAccess() and
+  (
+    exists(Variable newV, ControlFlowNode node |
+      newV.getAnAssignedValue() = reallocCall and
+      node.(AnalysedExpr).getNonNullSuccessor(newV) = verified and
+      newV != v
+    )
+    or
+    reallocCall.(AllocationExpr).getReallocPtr().getValue() = "0" and
+    verified = reallocCall
+  )
+}
+
+predicate freeCallOrIndirect(ControlFlowNode n, Variable v) {
+  n.(DeallocationExpr).getFreedExpr() = v.getAnAccess() and
+  not exists(n.(AllocationExpr).getReallocPtr())
+  or
+  verifiedRealloc(_, v, n)
+  or
+  exists(FunctionCall midcall, Function mid, int arg |
+    n.(Call).getArgument(arg) = v.getAnAccess() and
+    mayCallFunction(n, mid) and
+    midcall.getEnclosingFunction() = mid and
+    freeCallOrIndirect(midcall, mid.getParameter(arg))
+  )
+}
+
+predicate allocationDefinition(StackVariable v, ControlFlowNode def) {
+  exists(Expr expr | exprDefinition(v, def, expr) and allocCallOrIndirect(expr))
+}
+
+class AllocVariableReachability extends StackVariableReachabilityWithReassignment {
+  AllocVariableReachability() { this = "AllocVariableReachability" }
+
+  override predicate isSourceActual(ControlFlowNode node, StackVariable v) {
+    allocationDefinition(v, node)
+  }
+
+  override predicate isSinkActual(ControlFlowNode node, StackVariable v) {
+    exists(node.(AnalysedExpr).getNullSuccessor(v)) or
+    freeCallOrIndirect(node, v) or
+    assignedToFieldOrGlobal(v, node) or
+    v.getFunction() = node.(ReturnStmt).getEnclosingFunction()
+  }
+
+  override predicate isBarrier(ControlFlowNode node, StackVariable v) { definitionBarrier(v, node) }
+}
+
+predicate allocatedVariableReaches(StackVariable v, ControlFlowNode def, ControlFlowNode node) {
+  exists(AllocVariableReachability r |
+    r.reachesTo(def, _, node, v)
+    or
+    r.isSource(def, v) and node = def
+  )
+}
+
+class AllocReachability extends StackVariableReachabilityExt {
+  AllocReachability() { this = "AllocReachability" }
+
+  override predicate isSource(ControlFlowNode node, StackVariable v) {
+    allocationDefinition(v, node)
+  }
+
+  override predicate isSink(ControlFlowNode node, StackVariable v) {
+    v.getFunction() = node.(ReturnStmt).getEnclosingFunction()
+  }
+
+  override predicate isBarrier(
+    ControlFlowNode source, ControlFlowNode node, ControlFlowNode next, StackVariable v
+  ) {
+    this.isSource(source, v) and
+    next = node.getASuccessor() and
+    exists(StackVariable v0 | allocatedVariableReaches(v0, source, node) |
+      node.(AnalysedExpr).getNullSuccessor(v0) = next or
+      freeCallOrIndirect(node, v0) or
+      assignedToFieldOrGlobal(v0, node)
+    )
+  }
+}
+
+predicate allocationReaches(ControlFlowNode def, ControlFlowNode node) {
+  exists(AllocReachability r | r.reaches(def, _, node))
+}
+
+predicate assignedToFieldOrGlobal(StackVariable v, Expr e) {
+  e.(Assignment).getRValue() = v.getAnAccess() and
+  not e.(Assignment).getLValue().(VariableAccess).getTarget() instanceof StackVariable
+  or
+  exists(Expr midExpr, Function mid, int arg |
+    e.(FunctionCall).getArgument(arg) = v.getAnAccess() and
+    mayCallFunction(e, mid) and
+    midExpr.getEnclosingFunction() = mid and
+    assignedToFieldOrGlobal(mid.getParameter(arg), midExpr)
+  )
+  or
+  e.(ConstructorFieldInit).getExpr() = v.getAnAccess()
+}
+
+/**
+ * Enhanced: Check if return is in an error-handling context
+ */
+predicate isErrorReturn(ReturnStmt ret) {
+  exists(IfStmt ifStmt |
+    ret.getEnclosingStmt().getParentStmt*() = ifStmt.getThen() and
+    (
+      ifStmt.getCondition().(EqualityOperation).getAnOperand() instanceof NullValue
+      or
+      exists(ComparisonOperation cmp | cmp = ifStmt.getCondition() |
+        cmp.getAnOperand().(Literal).getValue().toInt() <= 0
+      )
+    )
+  )
+}
+
+from ControlFlowNode def, ReturnStmt ret, string context
+where
+  allocationReaches(def, ret) and
+  not exists(StackVariable v |
+    allocatedVariableReaches(v, def, ret) and
+    ret.getAChild*() = v.getAnAccess()
+  ) and
+  (
+    isErrorReturn(ret) and context = "error return"
+    or
+    not isErrorReturn(ret) and context = "exit point"
+  )
+select def, "This memory allocation may not be released at $@ (" + context + ").", ret, "this " + context
+'''
+
+
+ENHANCED_USE_AFTER_FREE_FILTERED_TEMPLATE = '''
+/**
+ * @name Potential use after free (Enhanced)
+ * @description Enhanced version with better detection of uses in different control flow paths.
+ * @kind path-problem
+ * @precision high
+ * @id cpp/use-after-free-enhanced-filtered
+ * @problem.severity warning
+ * @security-severity 9.3
+ * @tags reliability
+ *       security
+ *       external/cwe/cwe-416
+ */
+
+import cpp
+import semmle.code.cpp.dataflow.new.DataFlow
+import semmle.code.cpp.ir.IR
+import semmle.code.cpp.security.flowafterfree.FlowAfterFree
+import semmle.code.cpp.security.flowafterfree.UseAfterFree
+import UseAfterFreeTrace::PathGraph
+
+/**
+ * Enhanced: Detect use in a different branch after free
+ */
+predicate useInDifferentBranch(DeallocationExpr free, Expr use, Variable v) {
+  exists(IfStmt ifStmt |
+    free.getFreedExpr().(VariableAccess).getTarget() = v and
+    use.(VariableAccess).getTarget() = v and
+    (
+      free.getEnclosingStmt().getParentStmt*() = ifStmt.getThen() and
+      use.getEnclosingStmt().getParentStmt*() = ifStmt.getElse()
+      or
+      free.getEnclosingStmt().getParentStmt*() = ifStmt.getElse() and
+      use.getEnclosingStmt().getParentStmt*() = ifStmt.getThen()
+    )
+  )
+}
+
+/**
+ * Enhanced: Detect use after conditional free
+ */
+predicate useAfterConditionalFree(DeallocationExpr free, Expr use, Variable v) {
+  exists(IfStmt ifStmt |
+    free.getFreedExpr().(VariableAccess).getTarget() = v and
+    use.(VariableAccess).getTarget() = v and
+    (
+      free.getEnclosingStmt().getParentStmt*() = ifStmt.getThen() or
+      free.getEnclosingStmt().getParentStmt*() = ifStmt.getElse()
+    ) and
+    ifStmt.getASuccessor+() = use.getEnclosingStmt()
+  )
+}
+
+module UseAfterFreeParam implements FlowFromFreeParamSig {
+  predicate isSink = isUse/2;
+  predicate isExcluded = isExcludedMmFreePageFromMdl/2;
+  predicate sourceSinkIsRelated = defaultSourceSinkIsRelated/2;
+}
+
+import UseAfterFreeParam
+
+module UseAfterFreeTrace = FlowFromFree<UseAfterFreeParam>;
+
+from UseAfterFreeTrace::PathNode source, UseAfterFreeTrace::PathNode sink, DeallocationExpr dealloc, string detail
+where
+  UseAfterFreeTrace::flowPath(source, sink) and
+  isFree(source.getNode(), _, _, dealloc) and
+  (
+    exists(Variable v, Expr use |
+      sink.getNode().asExpr() = use and
+      (
+        useInDifferentBranch(dealloc, use, v) and detail = " (use in different branch)"
+        or
+        useAfterConditionalFree(dealloc, use, v) and detail = " (use after conditional free)"
+      )
+    )
+    or
+    not exists(Variable v, Expr use |
+      sink.getNode().asExpr() = use and
+      (useInDifferentBranch(dealloc, use, v) or useAfterConditionalFree(dealloc, use, v))
+    ) and detail = ""
+  )
+select sink.getNode(), source, sink, "Memory may have been previously freed by $@" + detail + ".", dealloc,
+  dealloc.toString()
+'''
+
+
+
+ENHANCED_DOUBLE_FREE_FILTERED = ENHANCED_DOUBLE_FREE_FILTERED_TEMPLATE
+ENHANCED_MEMORY_NEVER_FREED_FILTERED = ENHANCED_MEMORY_NEVER_FREED_FILTERED_TEMPLATE
+ENHANCED_MEMORY_MAY_NOT_BE_FREED_FILTERED = ENHANCED_MEMORY_MAY_NOT_BE_FREED_FILTERED_TEMPLATE
+ENHANCED_USE_AFTER_FREE_FILTERED = ENHANCED_USE_AFTER_FREE_FILTERED_TEMPLATE
 
 # Map query names to enhanced versions
 ENHANCED_QUERIES = {
@@ -537,7 +862,10 @@ ENHANCED_QUERIES = {
 
 # Base (built-in) filtered query text; may be extended with LLM-generated filters at runtime.
 ENHANCED_QUERIES_FILTERED = {
+    "MemoryNeverFreed": ENHANCED_MEMORY_NEVER_FREED_FILTERED,
+    "MemoryMayNotBeFreed": ENHANCED_MEMORY_MAY_NOT_BE_FREED_FILTERED,
     "DoubleFree": ENHANCED_DOUBLE_FREE_FILTERED,
+    "UseAfterFree": ENHANCED_USE_AFTER_FREE_FILTERED,
 }
 
 
@@ -561,6 +889,9 @@ class CodeQLAnalyzer:
         # Dynamic enhanced filtered query for DoubleFree; may be overridden
         # with LLM-generated filters at analysis time.
         self._double_free_filtered_query: str | None = None
+        self._memory_never_freed_filtered_query: str | None = None
+        self._memory_may_not_be_freed_filtered_query: str | None = None
+        self._use_after_free_filtered_query: str | None = None
 
     def analyze(
         self,
@@ -604,14 +935,24 @@ class CodeQLAnalyzer:
             # Step 3: Prepare queries
             queries: list[Path] = []
 
-            # Build dynamic enhanced filtered DoubleFree query by merging the
-            # hard-coded template with any LLM-generated filter snippets in custom_queries.
+            # Build dynamic enhanced filtered queries by merging the hard-coded
+            # templates with any LLM-generated filter snippets in custom_queries.
             if custom_queries and len(custom_queries) > 0:
-                logger.info("Merging custom double-free filters into enhanced template...")
+                logger.info("Merging custom filters into enhanced templates...")
                 self._double_free_filtered_query = self._build_double_free_filtered_with_custom_filters(
                     custom_queries
                 )
-            
+                self._memory_never_freed_filtered_query = self._build_memory_never_freed_filtered_with_custom_filters(
+                    custom_queries
+                )
+                self._memory_may_not_be_freed_filtered_query = self._build_memory_may_not_be_freed_filtered_with_custom_filters(
+                        custom_queries
+                )
+                
+                self._use_after_free_filtered_query = self._build_use_after_free_filtered_with_custom_filters(
+                    custom_queries
+                )
+
             # Add enhanced queries if enabled
             if use_enhanced_queries:
                 logger.info("Step 3b: Writing enhanced queries...")
@@ -704,18 +1045,35 @@ class CodeQLAnalyzer:
         """
         Build the final enhanced+filtered DoubleFree query text by combining:
           - the hard-coded ENHANCED_DOUBLE_FREE_FILTERED_TEMPLATE, and
-          - all LLM-generated double-free filter snippets from CustomQuerySet.
+          - all LLM-generated *double_free_filter* snippets from CustomQuerySet.
 
-        Each CustomQuery currently stores the double-free filter QL in its
-        `query_code` field (see CustomQuerySet.from_json). We simply concat them
-        after the template so they can contribute additional dfFiltered(...) logic.
+        This matches the JSON structure:
+
+          "queries": {
+            "<func>": {
+              "double_free_filter": {
+                "query_code": "..."
+              },
+              "use_after_free_filter": { ... },
+              "memory_leak_filter": { ... },
+              ...
+            }
+          }
         """
         snippets: list[str] = []
-        for func_name, q in (custom_queries.queries or {}).items():
-            code = (getattr(q, "query_code", "") or "").strip()
+
+        # Work on the JSON view so we respect the per-bug-type filter layout.
+        cq_json = custom_queries.to_json()
+        for func_name, qinfo in (cq_json.get("queries") or {}).items():
+            if not isinstance(qinfo, dict):
+                continue
+            df_block = qinfo.get("double_free_filter") or {}
+            if not isinstance(df_block, dict):
+                continue
+            code = (df_block.get("query_code", "") or "").strip()
             if not code:
                 continue
-            snippets.append(f"// ---- LLM filter for {func_name} ----\n{code}\n")
+            snippets.append(f"// ---- LLM double-free filter for {func_name} ----\n{code}\n")
 
         # If there are no dynamic snippets, fall back to the built-in filtered query.
         if not snippets:
@@ -725,6 +1083,99 @@ class CodeQLAnalyzer:
         # Template already includes dfFiltered(...) reference; snippets are expected
         # to define dfFiltered / dfFilterXxx predicates that the template calls.
         return ENHANCED_DOUBLE_FREE_FILTERED_TEMPLATE + "\n\n" + merged_filters
+
+    def _build_memory_never_freed_filtered_with_custom_filters(
+        self,
+        custom_queries: CustomQuerySet,
+    ) -> str:
+        """
+        Build the final enhanced+filtered MemoryNeverFreed query text by combining:
+          - ENHANCED_MEMORY_NEVER_FREED_FILTERED_TEMPLATE, and
+          - all LLM-generated *memory_leak_filter* snippets from CustomQuerySet.
+        """
+        snippets: list[str] = []
+
+        cq_json = custom_queries.to_json()
+        for func_name, qinfo in (cq_json.get("queries") or {}).items():
+            if not isinstance(qinfo, dict):
+                continue
+            leak_block = qinfo.get("memory_leak_filter") or {}
+            if not isinstance(leak_block, dict):
+                continue
+            code = (leak_block.get("query_code", "") or "").strip()
+            if not code:
+                continue
+            snippets.append(f"// ---- LLM memory-leak filter for {func_name} ----\n{code}\n")
+
+        if not snippets:
+            return ENHANCED_QUERIES_FILTERED.get(
+                "MemoryNeverFreed", ENHANCED_MEMORY_NEVER_FREED_FILTERED
+            )
+
+        merged_filters = "\n\n".join(snippets)
+        return ENHANCED_MEMORY_NEVER_FREED_FILTERED_TEMPLATE + "\n\n" + merged_filters
+
+    def _build_memory_may_not_be_freed_filtered_with_custom_filters(
+        self,
+        custom_queries: CustomQuerySet,
+    ) -> str:
+        """
+        Build the final enhanced+filtered MemoryMayNotBeFreed query text by combining:
+          - ENHANCED_MEMORY_MAY_NOT_BE_FREED_FILTERED_TEMPLATE, and
+          - all LLM-generated *memory_leak_filter* snippets from CustomQuerySet.
+        """
+        snippets: list[str] = []
+
+        cq_json = custom_queries.to_json()
+        for func_name, qinfo in (cq_json.get("queries") or {}).items():
+            if not isinstance(qinfo, dict):
+                continue
+            leak_block = qinfo.get("memory_leak_filter") or {}
+            if not isinstance(leak_block, dict):
+                continue
+            code = (leak_block.get("query_code", "") or "").strip()
+            if not code:
+                continue
+            snippets.append(f"// ---- LLM memory-leak filter for {func_name} ----\n{code}\n")
+
+        if not snippets:
+            return ENHANCED_QUERIES_FILTERED.get(
+                "MemoryMayNotBeFreed", ENHANCED_MEMORY_MAY_NOT_BE_FREED_FILTERED
+            )
+
+        merged_filters = "\n\n".join(snippets)
+        return ENHANCED_MEMORY_MAY_NOT_BE_FREED_FILTERED_TEMPLATE + "\n\n" + merged_filters
+
+    def _build_use_after_free_filtered_with_custom_filters(
+        self,
+        custom_queries: CustomQuerySet,
+    ) -> str:
+        """
+        Build the final enhanced+filtered UseAfterFree query text by combining:
+          - ENHANCED_USE_AFTER_FREE_FILTERED_TEMPLATE, and
+          - all LLM-generated *use_after_free_filter* snippets from CustomQuerySet.
+        """
+        snippets: list[str] = []
+
+        cq_json = custom_queries.to_json()
+        for func_name, qinfo in (cq_json.get("queries") or {}).items():
+            if not isinstance(qinfo, dict):
+                continue
+            uaf_block = qinfo.get("use_after_free_filter") or {}
+            if not isinstance(uaf_block, dict):
+                continue
+            code = (uaf_block.get("query_code", "") or "").strip()
+            if not code:
+                continue
+            snippets.append(f"// ---- LLM use-after-free filter for {func_name} ----\n{code}\n")
+
+        if not snippets:
+            return ENHANCED_QUERIES_FILTERED.get(
+                "UseAfterFree", ENHANCED_USE_AFTER_FREE_FILTERED
+            )
+
+        merged_filters = "\n\n".join(snippets)
+        return ENHANCED_USE_AFTER_FREE_FILTERED_TEMPLATE + "\n\n" + merged_filters
 
     def _prepare_enhanced_queries(self) -> tuple[list[Path], list[Path]]:
         """
@@ -755,8 +1206,28 @@ class CodeQLAnalyzer:
                   continue
 
               enhanced_path = original_path.parent / f"{query_name}_enhanced_filtered.ql"
+
               # Prefer dynamically built filtered query (with LLM filters) if available.
-              qtext = self._double_free_filtered_query or ENHANCED_QUERIES_FILTERED[query_name]
+              if query_name == "DoubleFree":
+                  qtext = self._double_free_filtered_query or ENHANCED_QUERIES_FILTERED[query_name]
+              elif query_name == "MemoryNeverFreed":
+                  qtext = (
+                      self._memory_never_freed_filtered_query
+                      or ENHANCED_QUERIES_FILTERED[query_name]
+                  )
+              elif query_name == "MemoryMayNotBeFreed":
+                  qtext = (
+                      self._memory_may_not_be_freed_filtered_query
+                      or ENHANCED_QUERIES_FILTERED[query_name]
+                  )
+              elif query_name == "UseAfterFree":
+                  qtext = (
+                      self._use_after_free_filtered_query
+                      or ENHANCED_QUERIES_FILTERED[query_name]
+                  )
+              else:
+                  qtext = ENHANCED_QUERIES_FILTERED[query_name]
+
               enhanced_path.write_text(qtext)
 
               query_files.append(enhanced_path)
