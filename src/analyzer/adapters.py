@@ -909,14 +909,14 @@ class CodeQLAnalyzer:
 
         Note: If you want to "filter out" known false positives (e.g., _dictClear(d,0) then _dictClear(d,1)),
         you MUST do it in *your pipeline* after SARIF parsing. A CodeQL "query" cannot remove another query's results.
-        This function now supports that via CustomQuerySet.suppress_rules.
+        This function now supports that via CustomQuerySet filter predicates.
 
         Args:
             project_path: Project to analyze
             hints: Allocator/deallocator hints
             issue_types: Which issue types to map/return (currently parsed from SARIF ruleId)
             use_enhanced_queries: If True, write and run hardcoded enhanced queries; otherwise run standard CodeQL queries
-            custom_queries: Custom CodeQL queries generated from hints (optional). May include suppress_rules.
+            custom_queries: Custom CodeQL queries generated from hints (optional). Includes filter predicates.
         """
         output_dir = Path(tempfile.mkdtemp())
         results_path = output_dir / "results.sarif"
@@ -1005,41 +1005,11 @@ class CodeQLAnalyzer:
 
     def _write_custom_queries(self, custom_queries: CustomQuerySet) -> tuple[list[Path], list[Path]]:
         """
-        Write custom CodeQL queries to the qlpack directory for CodeQL to run.
-
-        NOTE: Suppression rules do NOT need query files. So:
-          - only write queries where query_code is non-empty.
+        Legacy method - no longer writes custom queries since query_code is removed.
+        Filters are now integrated into enhanced filtered queries instead.
         """
-        query_files: list[Path] = []
-        cleanup_files: list[Path] = []
-
-        if not custom_queries or len(custom_queries) == 0:
-            return query_files, cleanup_files
-
-        sample_query_ref = "codeql/cpp-queries:Critical/MemoryNeverFreed.ql"
-        sample_path = self._find_query_file_path(sample_query_ref)
-
-        if not sample_path:
-            logger.warning("Could not locate qlpack Critical directory for custom queries")
-            custom_query_dir = Path(tempfile.mkdtemp(prefix="codeql_custom_queries_"))
-        else:
-            custom_query_dir = sample_path.parent
-
-        logger.debug(f"Writing custom queries to: {custom_query_dir}")
-
-        for func_name, query in custom_queries.queries.items():
-            qc = (query.query_code or "").strip()
-            if not qc:
-                continue
-
-            query_file = custom_query_dir / f"{func_name}_custom.ql"
-            query_file.write_text(qc)
-            query_files.append(query_file)
-            cleanup_files.append(query_file)
-            logger.info(f"  Written custom query for '{func_name}' to {query_file.name}")
-
-        logger.info(f"Wrote {len(query_files)} custom query files to {custom_query_dir}")
-        return query_files, cleanup_files
+        # No longer needed - filters are integrated into enhanced filtered queries
+        return [], []
 
     def _build_double_free_filtered_with_custom_filters(
         self,
@@ -1055,7 +1025,6 @@ class CodeQLAnalyzer:
           "queries": {
             "<func>": {
               "double_free_filter": {
-                "query_code": "..."
               },
               "use_after_free_filter": { ... },
               "memory_never_freed_filter": { ... },

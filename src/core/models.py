@@ -231,8 +231,8 @@ Design goals
 1) Backward compatible with older JSON dumps.
 2) Focus exclusively on false positive suppression (filter queries).
 3) Clear separation between:
-   - CodeQL filter queries (via query_code) that produce SAFE_PAIR evidence
-   - Pipeline suppression rules (via suppress_rules) for direct filtering
+   - CodeQL filter predicates that produce filter evidence
+   - Filter predicates for identifying safe patterns
 """
 
 import datetime
@@ -278,26 +278,16 @@ class CustomQuery:
     Purpose: Generate evidence queries that identify SAFE code patterns which
     the pipeline can use to filter out false positive warnings.
 
-    Two suppression approaches:
-    (A) query_code: CodeQL query that emits SAFE_PAIR evidence results
-    (B) suppress_rules: Direct pipeline rules for filtering (no CodeQL needed)
-    
-    Both can be used together for maximum flexibility.
+    Suppression approach:
+    Filter predicates: CodeQL predicates that identify safe patterns (per-bug-type filters)
     """
 
     # Core identity
     function_name: str
     reason: str = ""
 
-    # Legacy: complete CodeQL filter query code (optional, kept for backward compatibility)
-    # New design stores per-bug-type filter blocks instead (see below).
-    query_code: str = ""
-
     # Classification
     is_special: bool = True
-
-    # Extra metadata (useful for tracking and debugging)
-    tags: List[str] = field(default_factory=list)
 
     # Validation bookkeeping
     validated: bool = False
@@ -308,14 +298,10 @@ class CustomQuery:
         default_factory=lambda: datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
     )
 
-    # Pipeline suppression rules (optional alternative to query_code)
-    suppress_rules: List[SuppressRule] = field(default_factory=list)
-
     # New-style per-bug-type filter blocks as returned by the LLM.
     # Each block is a small dict, typically with:
     #   - "predicates_code": CodeQL predicate definitions
     #   - "use_expr": how to call those predicates from the main filtered query
-    #   - optionally "query_code"/"validated"/"validation_error" for legacy support.
     double_free_filter: Dict[str, Any] = field(default_factory=dict)
     use_after_free_filter: Dict[str, Any] = field(default_factory=dict)
     memory_never_freed_filter: Dict[str, Any] = field(default_factory=dict)
@@ -328,7 +314,7 @@ class CustomQuerySet:
     Collection of custom filter queries and evaluations.
 
     Stores two categories:
-    - queries: special functions (include query_code and/or suppress_rules)
+    - queries: special functions (include filter predicates)
     - non_special: non-special functions with reason only
     """
     queries: Dict[str, CustomQuery] = field(default_factory=dict)
@@ -367,13 +353,12 @@ class CustomQuerySet:
         {
           "queries": {
             "<func>": {
-              "query_code": "...",
+              "double_free_filter": {...},
+              "use_after_free_filter": {...},
+              "memory_never_freed_filter": {...},
+              "memory_may_not_be_freed_filter": {...},
               "reason": "...",
-              "tags": [...],
-              "validated": true/false,
-              "validation_error": "...",
-              "created_at": "...",
-              "suppress_rules": [ ... ]
+              "created_at": "..."
             },
             ...
           },
@@ -387,21 +372,10 @@ class CustomQuerySet:
 
         for func_name, q in self.queries.items():
             # New structured format: per-bug-type filter blocks for this function.
-            # Prefer the explicit blocks on CustomQuery; fall back to query_code for
-            # double-free when present (legacy).
             df_block: Dict[str, Any] = dict(q.double_free_filter or {})
             uaf_block: Dict[str, Any] = dict(q.use_after_free_filter or {})
             never_freed_block: Dict[str, Any] = dict(q.memory_never_freed_filter or {})
             may_not_be_freed_block: Dict[str, Any] = dict(q.memory_may_not_be_freed_filter or {})
-
-            # Backward compatibility: if no explicit double-free block but we have
-            # a legacy query_code, store it there.
-            if not df_block and q.query_code:
-                df_block = {
-                    "query_code": q.query_code,
-                    "validated": bool(q.validated),
-                    "validation_error": q.validation_error,
-                }
 
             out["queries"][func_name] = {
                 "double_free_filter": df_block,
@@ -409,20 +383,7 @@ class CustomQuerySet:
                 "memory_never_freed_filter": never_freed_block,
                 "memory_may_not_be_freed_filter": may_not_be_freed_block,
                 "reason": q.reason,
-                "tags": list(q.tags),
                 "created_at": q.created_at,
-                "suppress_rules": [
-                    {
-                        "name": r.name,
-                        "reason": r.reason,
-                        "rule_id_contains": r.rule_id_contains,
-                        "function_name_equals": r.function_name_equals,
-                        "callee_global_name_equals": r.callee_global_name_equals,
-                        "arg_to_string_equals": dict(r.arg_to_string_equals),
-                        "arg_must_differ_for_pair": dict(r.arg_must_differ_for_pair),
-                    }
-                    for r in (q.suppress_rules or [])
-                ],
             }
 
         for func_name, reason in self.non_special.items():
@@ -437,19 +398,16 @@ class CustomQuerySet:
 
         Supports older formats where:
         - non_special[func] was a string
-        - queries[func] only had {query_code, reason}
+        - queries[func] only had {reason} (legacy format)
         """
         qs = cls()
 
         # --- special queries ---
         for func_name, q in (data.get("queries") or {}).items():
-            query_code = ""
             reason = ""
-            tags: List[str] = []
             validated = False
             validation_error = ""
             created_at = ""
-            suppress_rules: List[SuppressRule] = []
             df_block: Dict[str, Any] = {}
             uaf_block: Dict[str, Any] = {}
             never_freed_block: Dict[str, Any] = {}
@@ -457,8 +415,9 @@ class CustomQuerySet:
             leak_block: Dict[str, Any] = {}  # Legacy field
 
             if isinstance(q, str):
-                # Extremely old format: value was the query code
-                query_code = q
+                # Extremely old format: value was the query code (no longer supported)
+                # Skip this entry as we no longer support query_code
+                continue
             elif isinstance(q, dict):
                 # New structured format with per-bug-type filters
                 if (
@@ -472,65 +431,32 @@ class CustomQuerySet:
                     never_freed_block = dict(q.get("memory_never_freed_filter") or {})
                     may_not_be_freed_block = dict(q.get("memory_may_not_be_freed_filter") or {})
 
-                    # Map the double-free filter block back into query_code/validated (legacy view)
-                    query_code = (df_block.get("query_code", "") or "").strip()
-                    validated = bool(df_block.get("validated", False))
-                    validation_error = df_block.get("validation_error", "") or ""
+                    # Extract validation info from filter blocks
+                    validated = bool(df_block.get("validated", False) or 
+                                   uaf_block.get("validated", False) or
+                                   never_freed_block.get("validated", False) or
+                                   may_not_be_freed_block.get("validated", False))
+                    validation_error = (df_block.get("validation_error", "") or 
+                                      uaf_block.get("validation_error", "") or
+                                      never_freed_block.get("validation_error", "") or
+                                      may_not_be_freed_block.get("validation_error", "") or "")
 
                     reason = q.get("reason", "") or ""
-                    tags = list(q.get("tags", []) or [])
                     created_at = q.get("created_at", "") or ""
-
-                    # Import suppress_rules if present (same shape as old format)
-                    for r in (q.get("suppress_rules") or []):
-                        if not isinstance(r, dict):
-                            continue
-                        suppress_rules.append(
-                            SuppressRule(
-                                name=r.get("name", ""),
-                                reason=r.get("reason", ""),
-                                rule_id_contains=r.get("rule_id_contains"),
-                                function_name_equals=r.get("function_name_equals"),
-                                callee_global_name_equals=r.get("callee_global_name_equals"),
-                                arg_to_string_equals=dict(r.get("arg_to_string_equals", {}) or {}),
-                                arg_must_differ_for_pair=dict(r.get("arg_must_differ_for_pair", {}) or {}),
-                            )
-                        )
                 else:
-                    # Legacy dict format with top-level query_code/etc.
-                    query_code = q.get("query_code", "") or ""
+                    # Legacy dict format - just read reason and created_at
                     reason = q.get("reason", "") or ""
-                    tags = list(q.get("tags", []) or [])
                     validated = bool(q.get("validated", False))
                     validation_error = q.get("validation_error", "") or ""
                     created_at = q.get("created_at", "") or ""
 
-                    # Import suppress_rules if present
-                    for r in (q.get("suppress_rules") or []):
-                        if not isinstance(r, dict):
-                            continue
-                        suppress_rules.append(
-                            SuppressRule(
-                                name=r.get("name", ""),
-                                reason=r.get("reason", ""),
-                                rule_id_contains=r.get("rule_id_contains"),
-                                function_name_equals=r.get("function_name_equals"),
-                                callee_global_name_equals=r.get("callee_global_name_equals"),
-                                arg_to_string_equals=dict(r.get("arg_to_string_equals", {}) or {}),
-                                arg_must_differ_for_pair=dict(r.get("arg_must_differ_for_pair", {}) or {}),
-                            )
-                        )
-
             cq = CustomQuery(
                 function_name=func_name,
-                query_code=query_code,
                 reason=reason,
                 is_special=True,
-                tags=tags,
                 validated=validated,
                 validation_error=validation_error,
                 created_at=created_at or datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                suppress_rules=suppress_rules,
                 double_free_filter=df_block,
                 use_after_free_filter=uaf_block,
                 memory_never_freed_filter=never_freed_block,

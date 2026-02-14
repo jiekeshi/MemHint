@@ -763,7 +763,6 @@ class Pipeline:
                 "message": w.message,
                 "allocation_site": w.allocation_site,
                 "trace": w.trace,
-                "reason": w.reason,
             })
         filtered_file = output_dir / "filtered_warnings.json"
         filtered_file.write_text(json.dumps(filtered_data, indent=2))
@@ -969,7 +968,7 @@ class Pipeline:
         hints to determine if it needs a custom query. Process them one by one with logging.
         
         All evaluated functions are stored in CustomQuerySet with their decisions:
-        - Special functions: includes generated query_code and reasoning
+        - Special functions: includes generated filter predicates and reasoning
         - Non-special functions: includes reasoning for why no query was needed
         
         Args:

@@ -883,10 +883,10 @@ class CustomQueryGenerator:
                  - "content": dict with:
                        is_special: bool
                        reason: str
-                       double_free_filter: {predicates_code, use_expr, query_code?}
-                       use_after_free_filter: {predicates_code, use_expr, query_code?}
-                       memory_never_freed_filter: {predicates_code, use_expr, query_code?}
-                       memory_may_not_be_freed_filter: {predicates_code, use_expr, query_code?}
+                       double_free_filter: {predicates_code, use_expr}
+                       use_after_free_filter: {predicates_code, use_expr}
+                       memory_never_freed_filter: {predicates_code, use_expr}
+                       memory_may_not_be_freed_filter: {predicates_code, use_expr}
                  - "usage": dict with cost/token breakdown (optional)
             codeql_validator: Optional validator object (if None, will try to create one automatically)
         """
@@ -953,32 +953,19 @@ class CustomQueryGenerator:
         never_freed_block = content.get("memory_never_freed_filter") or {}
         may_not_be_freed_block = content.get("memory_may_not_be_freed_filter") or {}
 
-        # Legacy single-query mode (query_code) – kept for backward compatibility.
-        legacy_query_code = (content.get("query_code", "") or "").strip()
-
         # Decide if we have any new-style filter content
         def _has_filter_block(block: Any) -> bool:
             return isinstance(block, dict) and any(
                 (block.get("predicates_code") or "").strip()
                 or (block.get("use_expr") or "").strip()
-                or (block.get("query_code") or "").strip()
             )
 
         has_new_filters = any(_has_filter_block(b) for b in (df_block, uaf_block, never_freed_block, may_not_be_freed_block))
 
         validated = False
         validation_error = ""
-        query_code = ""
 
-        if is_special and not has_new_filters and legacy_query_code:
-            # Old behavior: validate a full custom query_code.
-            query_code, is_special, reason, validated, validation_error = self._validate_and_fix_query(
-                func_name=getattr(func, "name", ""),
-                query_code=legacy_query_code,
-                reason=reason,
-                original_prompt=prompt,
-            )
-        elif is_special and has_new_filters:
+        if is_special and has_new_filters:
             # New behavior: validate each filter type separately at generation time
             func_name = getattr(func, "name", "")
             
@@ -1020,7 +1007,6 @@ class CustomQueryGenerator:
 
         return CustomQuery(
             function_name=getattr(func, "name", ""),
-            query_code=query_code if is_special else "",
             reason=reason,
             is_special=is_special,
             validated=validated,
@@ -1371,26 +1357,22 @@ Return ONLY a valid JSON object with these exact fields:
 
   "double_free_filter": {{{{
     "predicates_code": "ONLY predicate definitions for dfFiltered(...) plugins (no imports, no select, no metadata, no aggregator). Empty string if not needed.",
-    "use_expr": "A single boolean expression like dfFilterXxx(srcDealloc, sinkNode, sinkFreedExpr), or empty string",
-    "query_code": ""
+    "use_expr": "A single boolean expression like dfFilterXxx(srcDealloc, sinkNode, sinkFreedExpr), or empty string"
   }}}},
 
   "use_after_free_filter": {{{{
     "predicates_code": "ONLY predicate definitions for uafFiltered(...) plugins. Empty string if not needed.",
-    "use_expr": "A single boolean expression like uafFilterXxx(dealloc, sinkNode), or empty string",
-    "query_code": ""
+    "use_expr": "A single boolean expression like uafFilterXxx(dealloc, sinkNode), or empty string"
   }}}},
 
   "memory_never_freed_filter": {{{{
     "predicates_code": "ONLY predicate definitions for leakFiltered(alloc) plugins. Empty string if not needed.",
-    "use_expr": "A single boolean expression like leakFilterXxx(alloc), or empty string",
-    "query_code": ""
+    "use_expr": "A single boolean expression like leakFilterXxx(alloc), or empty string"
   }}}},
 
   "memory_may_not_be_freed_filter": {{{{
     "predicates_code": "ONLY predicate definitions for mayNotBeFreedFiltered(def) plugins. Empty string if not needed.",
-    "use_expr": "A single boolean expression like mayNotBeFreedFilterXxx(def), or empty string",
-    "query_code": ""
+    "use_expr": "A single boolean expression like mayNotBeFreedFilterXxx(def), or empty string"
   }}}}
 }}}}
 
@@ -1400,7 +1382,6 @@ GUIDELINES:
 - For each non-empty block:
   - predicates_code MUST contain ONLY predicate definitions (no imports, no select, no metadata, no aggregator).
   - use_expr MUST call your predicate using ONLY in-scope pipeline parameters.
-  - query_code MUST be "".
 
 ==================================================
 SELF-CHECK BEFORE RETURNING JSON
@@ -1560,7 +1541,7 @@ Now analyze the function and respond with JSON only.
             fix_prompt = f"""You previously generated a CodeQL filter for the function '{func_name}' (filter type: {filter_type}), but it has a compilation error when inserted into the production template.
 
 **ERROR:**
-{error_msg[:500]}
+{error_msg}
 
 **CURRENT FILTER CODE:**
 ```codeql
@@ -1572,12 +1553,14 @@ Now analyze the function and respond with JSON only.
 {use_expr}
 ```
 
-**FULL QUERY (production template with your filter inserted):**
+**FULL QUERY (production template with your filter inserted - this is how your code is actually used):**
 ```codeql
-{wrapper_query[:1500]}...
+{wrapper_query}
 ```
 
-Please fix ONLY the predicates_code and/or use_expr to resolve the compilation error. The fix must work when inserted into the production template shown above. Return the corrected filter in JSON format:
+Please review the FULL QUERY above to understand the complete context. Your filter code (predicates_code and use_expr) is inserted into this production template. Fix ONLY the predicates_code and/or use_expr to resolve the compilation error. The fix must work when inserted into the production template shown above.
+
+Return the corrected filter in JSON format:
 {{
   "predicates_code": "corrected predicate definitions here",
   "use_expr": "corrected use expression here"
@@ -1640,158 +1623,6 @@ Please fix ONLY the predicates_code and/or use_expr to resolve the compilation e
             "validated": False,
             "validation_error": f"Validation failed after 3 attempts: {error_msg[:200]}",
         }
-    
-    def _validate_and_fix_query(
-        self,
-        func_name: str,
-        query_code: str,
-        reason: str,
-        original_prompt: str,
-    ) -> Tuple[str, bool, str, bool, str]:
-        """
-        Validate generated CodeQL query and attempt to fix errors.
-        
-        Returns:
-            Tuple of (query_code, is_special, reason, validated, validation_error)
-            - validated: True if query passed validation, False otherwise
-            - validation_error: Error message if validation failed, empty string if passed
-        """
-        # Quick lint check first
-        ok, lint_msg = self._quick_lint_codeql_query(query_code)
-        if not ok:
-            logger.warning(
-                "Generated query for '%s' failed quick lint: %s",
-                func_name,
-                lint_msg
-            )
-            is_valid = False
-            error_msg = lint_msg
-        else:
-            is_valid, error_msg = self._validate_codeql_query(query_code)
-            if not is_valid:
-                logger.warning(
-                    "Generated query for '%s' failed validation: %s",
-                    func_name,
-                    error_msg
-                )
-            else:
-                logger.info("Generated query for '%s' passed CodeQL validation", func_name)
-        
-        if is_valid:
-            return query_code, True, reason, True, ""
-        
-        logger.info(
-            "Attempting to fix the query for '%s' with LLM assistance (error: %s)...",
-            func_name,
-            error_msg[:100]  # Truncate long error messages
-        )
-        
-        # Try up to 2 fix attempts (3 total attempts)
-        for attempt in range(2):
-            fix_prompt = self._build_fix_prompt(error_msg, query_code)
-            
-            # Build a focused fix prompt that includes the error and current code
-            focused_prompt = f"""You previously generated a CodeQL query, but it has an error.
-
-**ERROR:**
-{error_msg}
-
-**CURRENT QUERY CODE (with error):**
-```codeql
-{query_code}
-```
-
-Please fix ONLY the error above. Return the corrected query in JSON format:
-{{
-  "is_special": true,
-  "reason": "Fixed: {error_msg[:50]}...",
-  "query_code": "corrected CodeQL query here"
-}}"""
-            
-            result = self.llm.query(focused_prompt) or {}
-            content = result.get("content", {}) or {}
-            
-            new_is_special = bool(content.get("is_special", True))
-            new_code = (content.get("query_code", "") or "").strip()
-            new_reason = (content.get("reason", reason) or reason).strip()
-            
-            if not (new_is_special and new_code):
-                error_msg = "LLM did not return a valid special query in retry."
-                logger.warning(error_msg)
-                break
-            
-            ok, lint_msg = self._quick_lint_codeql_query(new_code)
-            if not ok:
-                error_msg = lint_msg
-                logger.warning("Fix attempt %d/2 failed lint: %s", attempt + 1, error_msg)
-                continue
-            
-            is_valid, error_msg = self._validate_codeql_query(new_code)
-            if is_valid:
-                logger.info("✓ Fixed query for '%s' passed validation", func_name)
-                return new_code, True, new_reason, True, ""
-            
-            logger.warning("Fix attempt %d/2 still has error: %s", attempt + 1, error_msg)
-        
-        # All attempts failed
-        logger.error(
-            "Failed to generate valid query for '%s' after 3 attempts",
-            func_name
-        )
-        return (
-            "",
-            False,
-            f"Query generation failed after 3 attempts. Last error: {error_msg}",
-            False,
-            error_msg
-        )
-    
-    def _build_fix_prompt(self, error_msg: str, query_code: str = "") -> str:
-        """Build a prompt to fix a failing CodeQL query.
-        
-        Note: This method signature is kept for compatibility, but the actual
-        fix prompt is now built inline in _validate_and_fix_query for better
-        context.
-        """
-        return f"""
-========================================
-QUERY ERROR - FIX REQUIRED
-========================================
-
-Your previous CodeQL filter query has a compilation or validation error:
-
-**ERROR:**
-{error_msg}
-
-Please fix the query following these STRICT rules:
-
-**1. Imports:**
-- ONLY use `import cpp`
-- DO NOT import DataFlow, TaintTracking, or any dataflow libraries
-
-**2. Query Structure:**
-- Keep `@kind problem` (NOT path-problem)
-- Keep all required metadata tags (@name, @description, @kind, @id)
-
-**3. Message Format (CRITICAL):**
-The message MUST contain BOTH:
-- The exact phrase: `SAFE_PAIR`
-- The exact phrase: `second call at line <line_number>`
-
-Example: "SAFE_PAIR: Different indices used (second call at line 123)"
-
-**4. Use Robust AST Matching:**
-- Use concrete types: FunctionCall, Expr, Literal, Variable
-- Avoid complex predicates that might fail
-- Test conditions carefully
-
-Return the corrected query in the same JSON format:
-{{
-  "is_special": boolean,
-  "reason": "explanation",
-  "query_code": "corrected CodeQL query"
-}}
-"""
     
     # -------------------------------------------------------------------------
     # Validation helpers
