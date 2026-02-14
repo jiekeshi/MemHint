@@ -577,6 +577,7 @@ from AllocationExpr alloc, string reason
 where
   alloc.requiresDealloc() and
   not allocMayBeFreed(alloc) and
+  not leakFiltered(alloc) and
   (
     // Standard case
     not allocInErrorBranch(alloc) and not allocInLoopMayOverwrite(alloc) and reason = "never freed"
@@ -750,6 +751,7 @@ where
     allocatedVariableReaches(v, def, ret) and
     ret.getAChild*() = v.getAnAccess()
   ) and
+  not mayNotBeFreedFiltered(def) and
   (
     isErrorReturn(ret) and context = "error return"
     or
@@ -826,6 +828,7 @@ from UseAfterFreeTrace::PathNode source, UseAfterFreeTrace::PathNode sink, Deall
 where
   UseAfterFreeTrace::flowPath(source, sink) and
   isFree(source.getNode(), _, _, dealloc) and
+  not uafFiltered(dealloc, sink.getNode()) and
   (
     exists(Variable v, Expr use |
       sink.getNode().asExpr() = use and
@@ -956,10 +959,10 @@ class CodeQLAnalyzer:
             # Add enhanced queries if enabled
             if use_enhanced_queries:
                 logger.info("Step 3b: Writing enhanced queries...")
-                enhanced_query_files_list, enhanced_cleanup = self._prepare_enhanced_queries()
+                enhanced_query_files_list, enhanced_cleanup, enhanced_count, filtered_count = self._prepare_enhanced_queries()
                 queries.extend(enhanced_query_files_list)
                 query_files_to_cleanup.extend(enhanced_cleanup)
-                logger.info(f"  Added {len(enhanced_query_files_list)} enhanced query files")
+                logger.info(f"  Added {enhanced_count} enhanced query files and {filtered_count} enhanced filtered query files")
 
             # If no custom or enhanced queries, use standard queries
             if not queries:
@@ -1055,14 +1058,15 @@ class CodeQLAnalyzer:
                 "query_code": "..."
               },
               "use_after_free_filter": { ... },
-              "memory_leak_filter": { ... },
+              "memory_never_freed_filter": { ... },
+              "memory_may_not_be_freed_filter": { ... },
               ...
             }
           }
         """
-        snippets: list[str] = []
+        predicates_snippets: list[str] = []
+        use_exprs: list[str] = []
 
-        # Work on the JSON view so we respect the per-bug-type filter layout.
         cq_json = custom_queries.to_json()
         for func_name, qinfo in (cq_json.get("queries") or {}).items():
             if not isinstance(qinfo, dict):
@@ -1070,19 +1074,43 @@ class CodeQLAnalyzer:
             df_block = qinfo.get("double_free_filter") or {}
             if not isinstance(df_block, dict):
                 continue
-            code = (df_block.get("query_code", "") or "").strip()
-            if not code:
-                continue
-            snippets.append(f"// ---- LLM double-free filter for {func_name} ----\n{code}\n")
 
-        # If there are no dynamic snippets, fall back to the built-in filtered query.
-        if not snippets:
-            return ENHANCED_QUERIES_FILTERED.get("DoubleFree", ENHANCED_DOUBLE_FREE_FILTERED)
+            predicates_code = (df_block.get("predicates_code", "") or "").strip()
+            use_expr = (df_block.get("use_expr", "") or "").strip()
+            
+            # Skip if validation failed or block is empty
+            validated = df_block.get("validated")
+            if validated is False:
+                continue  # Skip invalid blocks
+            if not predicates_code and not use_expr:
+                continue  # Skip empty blocks
 
-        merged_filters = "\n\n".join(snippets)
-        # Template already includes dfFiltered(...) reference; snippets are expected
-        # to define dfFiltered / dfFilterXxx predicates that the template calls.
-        return ENHANCED_DOUBLE_FREE_FILTERED_TEMPLATE + "\n\n" + merged_filters
+            if predicates_code:
+                predicates_snippets.append(
+                    f"// ---- LLM double-free predicates for {func_name} ----\n{predicates_code}\n"
+                )
+            if use_expr:
+                use_exprs.append(use_expr)
+
+        # Only build query if we have validated filters
+        if use_exprs or predicates_snippets:
+            preds_part = "\n\n".join(predicates_snippets) if predicates_snippets else ""
+            # Build dfFiltered aggregator from all use_exprs
+            body = " or\n  ".join(use_exprs) if use_exprs else "false"
+            df_agg = (
+                "predicate dfFiltered(DeallocationExpr srcDealloc, "
+                "DataFlow::Node sinkNode, Expr sinkFreedExpr) {\n"
+                f"  {body}\n"
+                "}\n"
+            )
+            merged = ENHANCED_DOUBLE_FREE_FILTERED_TEMPLATE
+            if preds_part:
+                merged += "\n\n" + preds_part
+            merged += "\n\n" + df_agg
+            return merged
+
+        # No validated filters: return None to skip creating the filtered query file
+        return None
 
     def _build_memory_never_freed_filtered_with_custom_filters(
         self,
@@ -1091,29 +1119,54 @@ class CodeQLAnalyzer:
         """
         Build the final enhanced+filtered MemoryNeverFreed query text by combining:
           - ENHANCED_MEMORY_NEVER_FREED_FILTERED_TEMPLATE, and
-          - all LLM-generated *memory_leak_filter* snippets from CustomQuerySet.
+          - all LLM-generated *memory_never_freed_filter* snippets from CustomQuerySet.
         """
-        snippets: list[str] = []
+        predicates_snippets: list[str] = []
+        use_exprs: list[str] = []
 
         cq_json = custom_queries.to_json()
         for func_name, qinfo in (cq_json.get("queries") or {}).items():
             if not isinstance(qinfo, dict):
                 continue
-            leak_block = qinfo.get("memory_leak_filter") or {}
+            # Try new field first, fall back to legacy memory_leak_filter for backward compatibility
+            leak_block = qinfo.get("memory_never_freed_filter") or qinfo.get("memory_leak_filter") or {}
             if not isinstance(leak_block, dict):
                 continue
-            code = (leak_block.get("query_code", "") or "").strip()
-            if not code:
-                continue
-            snippets.append(f"// ---- LLM memory-leak filter for {func_name} ----\n{code}\n")
 
-        if not snippets:
-            return ENHANCED_QUERIES_FILTERED.get(
-                "MemoryNeverFreed", ENHANCED_MEMORY_NEVER_FREED_FILTERED
+            predicates_code = (leak_block.get("predicates_code", "") or "").strip()
+            use_expr = (leak_block.get("use_expr", "") or "").strip()
+            
+            # Skip if validation failed or block is empty
+            validated = leak_block.get("validated")
+            if validated is False:
+                continue  # Skip invalid blocks
+            if not predicates_code and not use_expr:
+                continue  # Skip empty blocks
+
+            if predicates_code:
+                predicates_snippets.append(
+                    f"// ---- LLM memory-leak predicates for {func_name} ----\n{predicates_code}\n"
+                )
+            if use_expr:
+                use_exprs.append(use_expr)
+
+        # Only build query if we have validated filters
+        if use_exprs or predicates_snippets:
+            preds_part = "\n\n".join(predicates_snippets) if predicates_snippets else ""
+            body = " or\n  ".join(use_exprs) if use_exprs else "false"
+            leak_agg = (
+                "predicate leakFiltered(AllocationExpr alloc) {\n"
+                f"  {body}\n"
+                "}\n"
             )
+            merged = ENHANCED_MEMORY_NEVER_FREED_FILTERED_TEMPLATE
+            if preds_part:
+                merged += "\n\n" + preds_part
+            merged += "\n\n" + leak_agg
+            return merged
 
-        merged_filters = "\n\n".join(snippets)
-        return ENHANCED_MEMORY_NEVER_FREED_FILTERED_TEMPLATE + "\n\n" + merged_filters
+        # No validated filters: return None to skip creating the filtered query file
+        return None
 
     def _build_memory_may_not_be_freed_filtered_with_custom_filters(
         self,
@@ -1122,29 +1175,54 @@ class CodeQLAnalyzer:
         """
         Build the final enhanced+filtered MemoryMayNotBeFreed query text by combining:
           - ENHANCED_MEMORY_MAY_NOT_BE_FREED_FILTERED_TEMPLATE, and
-          - all LLM-generated *memory_leak_filter* snippets from CustomQuerySet.
+          - all LLM-generated *memory_may_not_be_freed_filter* snippets from CustomQuerySet.
         """
-        snippets: list[str] = []
+        predicates_snippets: list[str] = []
+        use_exprs: list[str] = []
 
         cq_json = custom_queries.to_json()
         for func_name, qinfo in (cq_json.get("queries") or {}).items():
             if not isinstance(qinfo, dict):
                 continue
-            leak_block = qinfo.get("memory_leak_filter") or {}
+            # Try new field first, fall back to legacy memory_leak_filter for backward compatibility
+            leak_block = qinfo.get("memory_may_not_be_freed_filter") or qinfo.get("memory_leak_filter") or {}
             if not isinstance(leak_block, dict):
                 continue
-            code = (leak_block.get("query_code", "") or "").strip()
-            if not code:
-                continue
-            snippets.append(f"// ---- LLM memory-leak filter for {func_name} ----\n{code}\n")
 
-        if not snippets:
-            return ENHANCED_QUERIES_FILTERED.get(
-                "MemoryMayNotBeFreed", ENHANCED_MEMORY_MAY_NOT_BE_FREED_FILTERED
+            predicates_code = (leak_block.get("predicates_code", "") or "").strip()
+            use_expr = (leak_block.get("use_expr", "") or "").strip()
+            
+            # Skip if validation failed or block is empty
+            validated = leak_block.get("validated")
+            if validated is False:
+                continue  # Skip invalid blocks
+            if not predicates_code and not use_expr:
+                continue  # Skip empty blocks
+
+            if predicates_code:
+                predicates_snippets.append(
+                    f"// ---- LLM memory-leak predicates for {func_name} ----\n{predicates_code}\n"
+                )
+            if use_expr:
+                use_exprs.append(use_expr)
+
+        # Only build query if we have validated filters
+        if use_exprs or predicates_snippets:
+            preds_part = "\n\n".join(predicates_snippets) if predicates_snippets else ""
+            body = " or\n  ".join(use_exprs) if use_exprs else "false"
+            leak_agg = (
+                "predicate mayNotBeFreedFiltered(ControlFlowNode def) {\n"
+                f"  {body}\n"
+                "}\n"
             )
+            merged = ENHANCED_MEMORY_MAY_NOT_BE_FREED_FILTERED_TEMPLATE
+            if preds_part:
+                merged += "\n\n" + preds_part
+            merged += "\n\n" + leak_agg
+            return merged
 
-        merged_filters = "\n\n".join(snippets)
-        return ENHANCED_MEMORY_MAY_NOT_BE_FREED_FILTERED_TEMPLATE + "\n\n" + merged_filters
+        # No validated filters: return None to skip creating the filtered query file
+        return None
 
     def _build_use_after_free_filtered_with_custom_filters(
         self,
@@ -1155,7 +1233,8 @@ class CodeQLAnalyzer:
           - ENHANCED_USE_AFTER_FREE_FILTERED_TEMPLATE, and
           - all LLM-generated *use_after_free_filter* snippets from CustomQuerySet.
         """
-        snippets: list[str] = []
+        predicates_snippets: list[str] = []
+        use_exprs: list[str] = []
 
         cq_json = custom_queries.to_json()
         for func_name, qinfo in (cq_json.get("queries") or {}).items():
@@ -1164,25 +1243,55 @@ class CodeQLAnalyzer:
             uaf_block = qinfo.get("use_after_free_filter") or {}
             if not isinstance(uaf_block, dict):
                 continue
-            code = (uaf_block.get("query_code", "") or "").strip()
-            if not code:
-                continue
-            snippets.append(f"// ---- LLM use-after-free filter for {func_name} ----\n{code}\n")
 
-        if not snippets:
-            return ENHANCED_QUERIES_FILTERED.get(
-                "UseAfterFree", ENHANCED_USE_AFTER_FREE_FILTERED
+            predicates_code = (uaf_block.get("predicates_code", "") or "").strip()
+            use_expr = (uaf_block.get("use_expr", "") or "").strip()
+            
+            # Skip if validation failed or block is empty
+            validated = uaf_block.get("validated")
+            if validated is False:
+                continue  # Skip invalid blocks
+            if not predicates_code and not use_expr:
+                continue  # Skip empty blocks
+
+            if predicates_code:
+                predicates_snippets.append(
+                    f"// ---- LLM use-after-free predicates for {func_name} ----\n{predicates_code}\n"
+                )
+            if use_expr:
+                use_exprs.append(use_expr)
+
+        # Only build query if we have validated filters
+        if use_exprs or predicates_snippets:
+            preds_part = "\n\n".join(predicates_snippets) if predicates_snippets else ""
+            body = " or\n  ".join(use_exprs) if use_exprs else "false"
+            uaf_agg = (
+                "predicate uafFiltered(DeallocationExpr dealloc, DataFlow::Node sinkNode) {\n"
+                f"  {body}\n"
+                "}\n"
             )
+            merged = ENHANCED_USE_AFTER_FREE_FILTERED_TEMPLATE
+            if preds_part:
+                merged += "\n\n" + preds_part
+            merged += "\n\n" + uaf_agg
+            return merged
 
-        merged_filters = "\n\n".join(snippets)
-        return ENHANCED_USE_AFTER_FREE_FILTERED_TEMPLATE + "\n\n" + merged_filters
+        # No validated filters: return None to skip creating the filtered query file
+        return None
 
-    def _prepare_enhanced_queries(self) -> tuple[list[Path], list[Path]]:
+    def _prepare_enhanced_queries(self) -> tuple[list[Path], list[Path], int, int]:
         """
         Write enhanced queries next to original queries.
+        
+        Returns:
+            Tuple of (query_files, cleanup_files, enhanced_count, filtered_count)
+            - enhanced_count: number of enhanced query files written
+            - filtered_count: number of enhanced filtered query files written
         """
         query_files: list[Path] = []
         cleanup_files: list[Path] = []
+        enhanced_count = 0
+        filtered_count = 0
 
         for query_ref in MEMORY_QUERIES:
             query_name = query_ref.split("/")[-1].replace(".ql", "")
@@ -1197,6 +1306,7 @@ class CodeQLAnalyzer:
 
               query_files.append(enhanced_path)
               cleanup_files.append(enhanced_path)
+              enhanced_count += 1
               logger.info(f"  Written: {enhanced_path}")
               
             if query_name in ENHANCED_QUERIES_FILTERED:
@@ -1209,36 +1319,39 @@ class CodeQLAnalyzer:
 
               # Prefer dynamically built filtered query (with LLM filters) if available.
               if query_name == "DoubleFree":
-                  qtext = self._double_free_filtered_query or ENHANCED_QUERIES_FILTERED[query_name]
+                  qtext = self._double_free_filtered_query
+                  label = "DoubleFree"
               elif query_name == "MemoryNeverFreed":
-                  qtext = (
-                      self._memory_never_freed_filtered_query
-                      or ENHANCED_QUERIES_FILTERED[query_name]
-                  )
+                  qtext = self._memory_never_freed_filtered_query
+                  label = "MemoryNeverFreed"
               elif query_name == "MemoryMayNotBeFreed":
-                  qtext = (
-                      self._memory_may_not_be_freed_filtered_query
-                      or ENHANCED_QUERIES_FILTERED[query_name]
-                  )
+                  qtext = self._memory_may_not_be_freed_filtered_query
+                  label = "MemoryMayNotBeFreed"
               elif query_name == "UseAfterFree":
-                  qtext = (
-                      self._use_after_free_filtered_query
-                      or ENHANCED_QUERIES_FILTERED[query_name]
-                  )
+                  qtext = self._use_after_free_filtered_query
+                  label = "UseAfterFree"
               else:
                   qtext = ENHANCED_QUERIES_FILTERED[query_name]
+                  label = query_name
 
+              # Skip writing the file if there are no validated filters (qtext is None)
+              if qtext is None:
+                  logger.info(f"  Skipped: {enhanced_path} (no validated filters)")
+                  continue
+
+              # No validation here - filters are already validated at generation time in llm_client.py
               enhanced_path.write_text(qtext)
 
               query_files.append(enhanced_path)
               cleanup_files.append(enhanced_path)
+              filtered_count += 1
               logger.info(f"  Written: {enhanced_path}")
               
             if query_name not in ENHANCED_QUERIES and query_name not in ENHANCED_QUERIES_FILTERED:
               logger.warning(f"No enhanced/filtered version for {query_name}")
               continue
 
-        return query_files, cleanup_files
+        return query_files, cleanup_files, enhanced_count, filtered_count
 
     def _find_query_file_path(self, query_ref: str) -> Optional[Path]:
         """Find the actual path of a query file."""

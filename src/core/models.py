@@ -289,8 +289,8 @@ class CustomQuery:
     function_name: str
     reason: str = ""
 
-    # Produced CodeQL filter query code (optional)
-    # When present, should emit results with "SAFE_PAIR" and "second call at line X"
+    # Legacy: complete CodeQL filter query code (optional, kept for backward compatibility)
+    # New design stores per-bug-type filter blocks instead (see below).
     query_code: str = ""
 
     # Classification
@@ -310,6 +310,16 @@ class CustomQuery:
 
     # Pipeline suppression rules (optional alternative to query_code)
     suppress_rules: List[SuppressRule] = field(default_factory=list)
+
+    # New-style per-bug-type filter blocks as returned by the LLM.
+    # Each block is a small dict, typically with:
+    #   - "predicates_code": CodeQL predicate definitions
+    #   - "use_expr": how to call those predicates from the main filtered query
+    #   - optionally "query_code"/"validated"/"validation_error" for legacy support.
+    double_free_filter: Dict[str, Any] = field(default_factory=dict)
+    use_after_free_filter: Dict[str, Any] = field(default_factory=dict)
+    memory_never_freed_filter: Dict[str, Any] = field(default_factory=dict)
+    memory_may_not_be_freed_filter: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -377,28 +387,27 @@ class CustomQuerySet:
 
         for func_name, q in self.queries.items():
             # New structured format: per-bug-type filter blocks for this function.
-            # For now, we only actively use the double-free filter block; the others
-            # are placeholders so the JSON schema is stable and extensible.
-            double_free_block: Dict[str, Any] = {
-                "query_code": q.query_code,
-                "validated": bool(q.validated),
-                "validation_error": q.validation_error,
-            }
-            use_after_free_block: Dict[str, Any] = {
-                "query_code": "",
-                "validated": False,
-                "validation_error": "",
-            }
-            memory_leak_block: Dict[str, Any] = {
-                "query_code": "",
-                "validated": False,
-                "validation_error": "",
-            }
+            # Prefer the explicit blocks on CustomQuery; fall back to query_code for
+            # double-free when present (legacy).
+            df_block: Dict[str, Any] = dict(q.double_free_filter or {})
+            uaf_block: Dict[str, Any] = dict(q.use_after_free_filter or {})
+            never_freed_block: Dict[str, Any] = dict(q.memory_never_freed_filter or {})
+            may_not_be_freed_block: Dict[str, Any] = dict(q.memory_may_not_be_freed_filter or {})
+
+            # Backward compatibility: if no explicit double-free block but we have
+            # a legacy query_code, store it there.
+            if not df_block and q.query_code:
+                df_block = {
+                    "query_code": q.query_code,
+                    "validated": bool(q.validated),
+                    "validation_error": q.validation_error,
+                }
 
             out["queries"][func_name] = {
-                "double_free_filter": double_free_block,
-                "use_after_free_filter": use_after_free_block,
-                "memory_leak_filter": memory_leak_block,
+                "double_free_filter": df_block,
+                "use_after_free_filter": uaf_block,
+                "memory_never_freed_filter": never_freed_block,
+                "memory_may_not_be_freed_filter": may_not_be_freed_block,
                 "reason": q.reason,
                 "tags": list(q.tags),
                 "created_at": q.created_at,
@@ -441,6 +450,11 @@ class CustomQuerySet:
             validation_error = ""
             created_at = ""
             suppress_rules: List[SuppressRule] = []
+            df_block: Dict[str, Any] = {}
+            uaf_block: Dict[str, Any] = {}
+            never_freed_block: Dict[str, Any] = {}
+            may_not_be_freed_block: Dict[str, Any] = {}
+            leak_block: Dict[str, Any] = {}  # Legacy field
 
             if isinstance(q, str):
                 # Extremely old format: value was the query code
@@ -450,12 +464,15 @@ class CustomQuerySet:
                 if (
                     "double_free_filter" in q
                     or "use_after_free_filter" in q
-                    or "memory_leak_filter" in q
+                    or "memory_never_freed_filter" in q
+                    or "memory_may_not_be_freed_filter" in q
                 ):
-                    df_block = q.get("double_free_filter") or {}
-                    mlf_block = q.get("memory_leak_filter") or {}
-                    uaf_block = q.get("use_after_free_filter") or {}
-                    # For now, map the double-free filter block back into query_code/validated
+                    df_block = dict(q.get("double_free_filter") or {})
+                    uaf_block = dict(q.get("use_after_free_filter") or {})
+                    never_freed_block = dict(q.get("memory_never_freed_filter") or {})
+                    may_not_be_freed_block = dict(q.get("memory_may_not_be_freed_filter") or {})
+
+                    # Map the double-free filter block back into query_code/validated (legacy view)
                     query_code = (df_block.get("query_code", "") or "").strip()
                     validated = bool(df_block.get("validated", False))
                     validation_error = df_block.get("validation_error", "") or ""
@@ -514,6 +531,10 @@ class CustomQuerySet:
                 validation_error=validation_error,
                 created_at=created_at or datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
                 suppress_rules=suppress_rules,
+                double_free_filter=df_block,
+                use_after_free_filter=uaf_block,
+                memory_never_freed_filter=never_freed_block,
+                memory_may_not_be_freed_filter=may_not_be_freed_block,
             )
             qs.queries[func_name] = cq
 

@@ -33,6 +33,21 @@ except ImportError:  # pragma: no cover - environment may not have Vertex SDK
 
 from src.core.models import FunctionInfo, Hint, HintType, HintSet, CustomQuery
 
+# Import templates from adapters to validate filters in the same structure as production
+try:
+    from src.analyzer.adapters import (
+        ENHANCED_DOUBLE_FREE_FILTERED_TEMPLATE,
+        ENHANCED_USE_AFTER_FREE_FILTERED_TEMPLATE,
+        ENHANCED_MEMORY_NEVER_FREED_FILTERED_TEMPLATE,
+        ENHANCED_MEMORY_MAY_NOT_BE_FREED_FILTERED_TEMPLATE,
+    )
+except ImportError:
+    # Fallback if adapters not available (shouldn't happen in normal usage)
+    ENHANCED_DOUBLE_FREE_FILTERED_TEMPLATE = ""
+    ENHANCED_USE_AFTER_FREE_FILTERED_TEMPLATE = ""
+    ENHANCED_MEMORY_NEVER_FREED_FILTERED_TEMPLATE = ""
+    ENHANCED_MEMORY_MAY_NOT_BE_FREED_FILTERED_TEMPLATE = ""
+
 logger = logging.getLogger(__name__)
 
 
@@ -865,7 +880,13 @@ class CustomQueryGenerator:
         Args:
             llm: Object with method query(prompt: str) -> dict
                  Expected dict keys:
-                 - "content": dict with is_special/query_code/reason
+                 - "content": dict with:
+                       is_special: bool
+                       reason: str
+                       double_free_filter: {predicates_code, use_expr, query_code?}
+                       use_after_free_filter: {predicates_code, use_expr, query_code?}
+                       memory_never_freed_filter: {predicates_code, use_expr, query_code?}
+                       memory_may_not_be_freed_filter: {predicates_code, use_expr, query_code?}
                  - "usage": dict with cost/token breakdown (optional)
             codeql_validator: Optional validator object (if None, will try to create one automatically)
         """
@@ -924,24 +945,79 @@ class CustomQueryGenerator:
         self._track_cost(getattr(func, "name", ""), usage)
         
         is_special = bool(content.get("is_special", False))
-        query_code = (content.get("query_code", "") or "").strip()
-        reason = (content.get("reason", "") or "LLM determined function needs custom query").strip()
-        
+        reason = (content.get("reason", "") or "LLM determined function needs custom filters").strip()
+
+        # New-style per-bug-type filters
+        df_block = content.get("double_free_filter") or {}
+        uaf_block = content.get("use_after_free_filter") or {}
+        never_freed_block = content.get("memory_never_freed_filter") or {}
+        may_not_be_freed_block = content.get("memory_may_not_be_freed_filter") or {}
+
+        # Legacy single-query mode (query_code) – kept for backward compatibility.
+        legacy_query_code = (content.get("query_code", "") or "").strip()
+
+        # Decide if we have any new-style filter content
+        def _has_filter_block(block: Any) -> bool:
+            return isinstance(block, dict) and any(
+                (block.get("predicates_code") or "").strip()
+                or (block.get("use_expr") or "").strip()
+                or (block.get("query_code") or "").strip()
+            )
+
+        has_new_filters = any(_has_filter_block(b) for b in (df_block, uaf_block, never_freed_block, may_not_be_freed_block))
+
         validated = False
         validation_error = ""
-        
-        if is_special and query_code:
+        query_code = ""
+
+        if is_special and not has_new_filters and legacy_query_code:
+            # Old behavior: validate a full custom query_code.
             query_code, is_special, reason, validated, validation_error = self._validate_and_fix_query(
                 func_name=getattr(func, "name", ""),
-                query_code=query_code,
+                query_code=legacy_query_code,
                 reason=reason,
                 original_prompt=prompt,
             )
-        elif is_special and not query_code:
-            # Special but no query code means validation failed and couldn't be fixed
-            validated = False
-            validation_error = "No query code generated"
-        
+        elif is_special and has_new_filters:
+            # New behavior: validate each filter type separately at generation time
+            func_name = getattr(func, "name", "")
+            
+            # Validate and fix double_free_filter
+            if _has_filter_block(df_block):
+                df_block = self._validate_and_fix_filter_block(
+                    func_name=func_name,
+                    filter_type="double_free_filter",
+                    block=df_block,
+                    original_prompt=prompt,
+                )
+            
+            # Validate and fix use_after_free_filter
+            if _has_filter_block(uaf_block):
+                uaf_block = self._validate_and_fix_filter_block(
+                    func_name=func_name,
+                    filter_type="use_after_free_filter",
+                    block=uaf_block,
+                    original_prompt=prompt,
+                )
+            
+            # Validate and fix memory_never_freed_filter
+            if _has_filter_block(never_freed_block):
+                never_freed_block = self._validate_and_fix_filter_block(
+                    func_name=func_name,
+                    filter_type="memory_never_freed_filter",
+                    block=never_freed_block,
+                    original_prompt=prompt,
+                )
+            
+            # Validate and fix memory_may_not_be_freed_filter
+            if _has_filter_block(may_not_be_freed_block):
+                may_not_be_freed_block = self._validate_and_fix_filter_block(
+                    func_name=func_name,
+                    filter_type="memory_may_not_be_freed_filter",
+                    block=may_not_be_freed_block,
+                    original_prompt=prompt,
+                )
+
         return CustomQuery(
             function_name=getattr(func, "name", ""),
             query_code=query_code if is_special else "",
@@ -949,6 +1025,10 @@ class CustomQueryGenerator:
             is_special=is_special,
             validated=validated,
             validation_error=validation_error,
+            double_free_filter=df_block if is_special else {},
+            use_after_free_filter=uaf_block if is_special else {},
+            memory_never_freed_filter=never_freed_block if is_special else {},
+            memory_may_not_be_freed_filter=may_not_be_freed_block if is_special else {},
         )
     
     def get_cost_summary(self) -> Dict[str, Any]:
@@ -1047,309 +1127,519 @@ class CustomQueryGenerator:
             [f"{t} {n}" for t, n in zip(arg_types, arg_names)]
         ) if arg_names else "void"
         
-        return f"""You are an expert CodeQL query generator specializing in C/C++ memory safety analysis.
+        PROMPT = f'''You are an expert CodeQL query generator specializing in C/C++ memory safety analysis.
 
 Your task has TWO parts:
 1. Determine if this function has SPECIAL SEMANTICS that cause false positive warnings
-2. If special, generate a FILTER QUERY to identify safe code patterns that should be suppressed
+2. If special, generate FILTER PLUGIN PREDICATES (not full queries) to suppress safe patterns
 
-========================================
+IMPORTANT:
+- You are generating ONLY predicate definitions that will be inserted into an existing CodeQL query pack.
+- DO NOT generate full queries.
+- DO NOT generate metadata headers (no @name/@id/...).
+- DO NOT generate import statements.
+- DO NOT generate select clauses.
+- DO NOT redefine aggregator predicates like dfFiltered/uafFiltered/leakFiltered/mayNotBeFreedFiltered.
+
+==================================================
 FUNCTION ANALYSIS
-========================================
+==================================================
 
-**Function Name:** `{name}`
-**Return Type:** `{ret}`
-**Parameters:** `{params_str}`
+Function Name: `{name}`
+Return Type: `{ret}`
+Parameters: `{params_str}`
 
-**Source Code:**
+Source Code:
 ```c
 {code}
 ```
 
-========================================
+==================================================
 MEMORY SAFETY HINTS (Z3-Validated)
-========================================
+==================================================
 {hints_text}
 
-{("========================================\\nPARAMETER SEMANTICS (MAD Analysis)\\n========================================\\n" + arg_semantics_text) if arg_semantics_text else ""}
-
-========================================
+==================================================
 DECISION FRAMEWORK
-========================================
+==================================================
 
-A function is "SPECIAL" if standard CodeQL queries produce **false positives** because:
-- The function has partial/conditional cleanup semantics
-- Multiple calls are safe due to internal state tracking
-- The function's behavior depends on specific argument values
-- Reference counting or pool allocation makes repeated calls safe
+A function is SPECIAL if standard CodeQL memory queries produce false positives because:
+- It performs partial cleanup (does not free the main object)
+- It frees different substructures depending on index/flag
+- It is reference-counted
+- It is idempotent due to internal state checks (e.g., sets pointer to NULL)
+- It uses arena/pool logic (returns memory to a pool)
+- Multiple calls are intentionally safe
 
-**Your Goal:** Generate a filter query that identifies SAFE patterns where CodeQL incorrectly reports issues.
+Your goal is to generate FILTER PLUGIN PREDICATES that identify SAFE cases for:
+- DOUBLE FREE
+- USE AFTER FREE
+- MEMORY LEAK (never freed / may not be freed)
 
-⚠️ IMPORTANT: Your query doesn't suppress alerts directly. It produces structured evidence showing which specific call pairs are SAFE, and the pipeline uses this to filter false positives.
+If the function is NOT special, return is_special=false and leave all filters empty.
 
-========================================
-COMMON SPECIAL PATTERNS THAT NEED FILTER QUERIES
-========================================
+==================================================
+PIPELINE SIGNATURE RULE (MANDATORY)
+==================================================
 
-**Pattern 1: Partial/Index-Selected Cleanup (MOST COMMON)**
+Your filters are PLUGINS called by existing aggregators in the main query.
+Therefore, your predicates MUST match the aggregator's expected parameters and ONLY use those parameters.
 
-The function performs partial cleanup - it frees internal sub-structures but NOT the main object itself, or it selectively cleans based on an index/flag parameter.
+DOUBLE FREE plugin signature (EXACT):
+  predicate <PluginName>(DeallocationExpr srcDealloc, DataFlow::Node sinkNode, Expr sinkFreedExpr) {{{{ ... }}}}
 
-**Example 1 - dictRelease (Partial Cleanup):**
-```c
-void dictRelease(dict *d)
-{{
-    _dictClear(d, 0, NULL);  // Clears internal hash table 0
-    _dictClear(d, 1, NULL);  // Clears internal hash table 1
-    zfree(d);                // Finally frees the dict itself
-}}
-```
-- `_dictClear()` is a DEALLOCATOR but only clears internal structures `d->ht[0]` and `d->ht[1]`
-- Calling `_dictClear(d, 0, NULL)` twice would be suspicious (double-clear same table)
-- Calling `_dictClear(d, 0, NULL)` then `_dictClear(d, 1, NULL)` is SAFE (different indices)
-- **Filter Query Goal:** Suppress double-free warnings when index arguments differ
+USE-AFTER-FREE plugin signature (EXACT — this pipeline uses 2 parameters):
+  predicate <PluginName>(DeallocationExpr dealloc, DataFlow::Node sinkNode) {{{{ ... }}}}
 
-**Example 2 - Index-Selected Cleanup:**
-```c
-void clearBuffer(obj *o, int bufferIndex) {{
-    if (o->buffers[bufferIndex]) {{
-        free(o->buffers[bufferIndex]);
-        o->buffers[bufferIndex] = NULL;
-    }}
-}}
-```
-- Safe: `clearBuffer(o, 0)` then `clearBuffer(o, 1)` (different buffers)
-- Unsafe: `clearBuffer(o, 0)` then `clearBuffer(o, 0)` (same buffer twice)
-- **Filter Query Goal:** Check if literal index arguments differ between calls
+MEMORY NEVER FREED plugin signature (EXACT):
+  // main query uses: not leakFiltered(alloc)
+  predicate <PluginName>(AllocationExpr alloc) {{{{ ... }}}}
 
-**Pattern 2: Reference-Counted Release**
+MEMORY MAY NOT BE FREED plugin signature (EXACT):
+  // main query uses: not mayNotBeFreedFiltered(def)
+  // where def is a ControlFlowNode
+  predicate <PluginName>(ControlFlowNode def) {{{{ ... }}}}
 
-The function decrements a reference count and only frees when count reaches zero. Multiple calls are expected and safe.
+RULES:
+- If you need extra locals (call1/call2/etc.), bind them INSIDE exists(...).
+- use_expr MUST reference ONLY pipeline parameters:
+  - double-free: (srcDealloc, sinkNode, sinkFreedExpr)
+  - UAF: (dealloc, sinkNode)
+  - never-freed: (alloc)
+  - may-not-be-freed: (def)
+- NEVER output use_expr containing free variables like call1/call2.
+- NEVER redefine dfFiltered/uafFiltered/leakFiltered/mayNotBeFreedFiltered (aggregators are owned by the main query).
 
-**Example:**
-```c
-void objRelease(obj *o) {{
-    if (--o->refcount == 0) {{
-        free(o);
-    }}
-}}
-```
-- Safe: Multiple `objRelease(o)` calls as long as refcount was properly incremented
-- **Filter Query Goal:** Suppress all double-free warnings for refcounted deallocators
+==================================================
+HARD BAN LIST (COMPILATION FAILURES)
+==================================================
 
-**Pattern 3: Conditional/Idempotent Cleanup**
+- getExpr()
+- getASubExpression()
+- getEnclosingFunctionCall()
+- Casting FunctionCall to DeallocationExpr
+- Redefining aggregator predicates
+- Any use_expr that references undefined variables (e.g., call1/call2; or srcDealloc/sinkFreedExpr inside UAF)
 
-The function checks internal state flags before freeing, making it safe to call multiple times.
+Note: If the MAIN query already uses sinkNode.asExpr(), you may also use sinkNode.asExpr() in plugins.
+Otherwise, do not invent new conversions.
 
-**Example:**
-```c
-void cleanup(obj *o) {{
-    if (o->isInitialized) {{
-        freeResources(o);
-        o->isInitialized = false;
-    }}
-}}
-```
-- Safe: Multiple calls - first call sets flag to false, subsequent calls do nothing
-- **Filter Query Goal:** Suppress warnings when state-checking makes calls idempotent
+==================================================
+SCOPING RULE (MANDATORY)
+==================================================
 
-**Pattern 4: Pool/Arena Allocation**
+Your filters MUST be scoped ONLY to this function `{name}` (or its direct wrappers if explicitly mentioned in hints).
+Do NOT generate generic filters that could apply to unrelated functions.
 
-The function returns memory to a pool/arena rather than directly calling free().
+==================================================
+HOW TO BIND SINK DEALLOCATION (DOUBLE FREE ONLY)
+==================================================
 
-**Example:**
-```c
-void poolFree(arena *a, void *ptr) {{
-    // Returns memory to pool, doesn't call free()
-    markBlockAvailable(a, ptr);
-}}
-```
-- Safe: Multiple returns to pool (implementation handles this)
-- **Filter Query Goal:** Suppress warnings for arena-based allocators
+In a double-free plugin you may need sink-side DeallocationExpr.
+The main query typically provides isFree(...) already (do NOT redefine it).
+To bind sink DeallocationExpr without using '_' placeholders, use:
 
-========================================
-FILTER QUERY OUTPUT CONTRACT
-========================================
+exists(DeallocationExpr sinkDealloc, DataFlow::Node dummy0 |
+  isFree(dummy0, sinkNode, sinkFreedExpr, sinkDealloc)
+  ...
+)
 
-Your filter query MUST follow these rules to integrate with the pipeline:
+==================================================
+EXAMPLE WHEN GENERATING A DOUBLE FREE FILTER
+(SINGLE-PREDICATE PLUGIN, NO HELPER PREDICATES)
+==================================================
 
-**1. Metadata Requirements:**
-- Use `@kind problem` (NOT path-problem)
-- Use stable `@id` starting with `cpp/custom-safe-`
-- Example: `@id cpp/custom-safe-{name}`
-- Severity: `@problem.severity recommendation`
+predicate dfFilterExample_{name}(DeallocationExpr srcDealloc, DataFlow::Node sinkNode, Expr sinkFreedExpr) {{{{
+  exists(DeallocationExpr sinkDealloc, FunctionCall c1, FunctionCall c2, Expr p1, Expr p2, Expr idx1, Expr idx2, DataFlow::Node dummy0 |
+    isFree(dummy0, sinkNode, sinkFreedExpr, sinkDealloc) and
 
-**2. Message Format (CRITICAL FOR PIPELINE PARSING):**
-Every result MUST emit a message containing BOTH:
-- The exact phrase: `SAFE_PAIR`
-- The exact phrase: `second call at line <line_number>`
+    c1 = srcDealloc and
+    c2 = sinkDealloc and
+    c1.getTarget().getName() = "{name}" and
+    c2.getTarget().getName() = "{name}" and
 
-**Example messages:**
-- "SAFE_PAIR: Index-selected cleanup with different indices (0 vs 1) (second call at line 123)"
-- "SAFE_PAIR: Partial cleanup of different internal structures (second call at line 456)"
+    // same pointer, different constant index => safe pair
+    p1 = c1.getArgument(0) and
+    p2 = c2.getArgument(0) and
+    idx1 = c1.getArgument(1) and
+    idx2 = c2.getArgument(1) and
+    p1.toString() = p2.toString() and
+    idx1.isConstant() and idx2.isConstant() and
+    idx1.getValueText() != idx2.getValueText()
+  )
+}}}}
 
-This structured format allows the pipeline to:
-1. Identify which results are safe pairs (via `SAFE_PAIR`)
-2. Match them to CodeQL warnings by line number (via `second call at line X`)
+use_expr example:
+dfFilterExample_{name}(srcDealloc, sinkNode, sinkFreedExpr)
 
-**3. CRITICAL CODEQL SYNTAX RULES:**
+==================================================
+EXAMPLE WHEN GENERATING A USE AFTER FREE FILTER
+(SINGLE-PREDICATE PLUGIN, NO HELPER PREDICATES)
+==================================================
 
-⚠️ **String Concatenation:** ALWAYS use `.toString()` when building messages
-```codeql
-// ✅ CORRECT:
-"... (second call at line " + call2.getLocation().getStartLine().toString() + ")"
+predicate uafFilterExample_{name}(DeallocationExpr dealloc, DataFlow::Node sinkNode) {{{{
+  exists(Expr use, FunctionCall freeCall, Expr freedPtr |
+    // main query uses sinkNode.asExpr(), so plugin may use it too
+    sinkNode.asExpr() = use and
 
-// ❌ WRONG (compilation error):
-"... (second call at line " + call2.getLocation().getStartLine() + ")"
-```
+    freeCall = dealloc and
+    freeCall.getTarget().getName() = "{name}" and
+    freedPtr = freeCall.getArgument(0) and
 
-⚠️ **Function Matching:** Use `getName() = "..."` for clarity
-```codeql
-// ✅ CORRECT:
-call1.getTarget().getName() = "{name}"
+    // Example safe-suppression condition: the sink "use" is not about the freed pointer
+    not (
+      exists(Variable v |
+        freedPtr.(VariableAccess).getTarget() = v and
+        use.(VariableAccess).getTarget() = v
+      )
+      or
+      freedPtr.toString() = use.toString()
+    )
+  )
+}}}}
 
-// ⚠️ ALSO WORKS but less clear:
-call1.getTarget().hasName("{name}")
-```
+use_expr example:
+uafFilterExample_{name}(dealloc, sinkNode)
 
-⚠️ **Same Function Context:** Include this check to avoid cross-function matches
-```codeql
-// ✅ CORRECT:
-call1.getEnclosingFunction() = call2.getEnclosingFunction() and
-```
+==================================================
+EXAMPLE WHEN GENERATING A MEMORY NEVER FREED FILTER
+(SINGLE-PREDICATE PLUGIN, NO HELPER PREDICATES)
+==================================================
 
-⚠️ **Argument Comparison:** Use `.toString()` for robust matching
-```codeql
-// ✅ CORRECT (handles literals AND variables):
-call1.getArgument(1).toString() != call2.getArgument(1).toString()
+Context: the enhanced "never freed" query contains:
+  not leakFiltered(alloc)
 
-// ❌ LIMITED (only works for literals):
-idx1.(Literal).getValue() != idx2.(Literal).getValue()
-```
+So your plugin must have signature:
+  predicate <PluginName>(AllocationExpr alloc)
 
-**4. What to Check:**
-Identify pairs of calls to `{name}` where:
-- Both calls operate on the same object/pointer (same base address)
-- The calls are safe due to the function's special semantics
-- For index-based: Different index arguments (use toString() comparison)
-- For refcounted: Any pair is safe (refcount handles it)
-- For conditional: State checking makes it idempotent
+Example:
 
-**5. Allowed CodeQL Constructs:**
-✅ ALLOWED:
-- `import cpp`
-- Basic AST: `FunctionCall`, `Expr`, `Literal`, `Variable`, `IfStmt`
-- Comparisons: `toString()`, `getName()`
-- Location info: `.getLocation().getStartLine()`
-- Function context: `.getEnclosingFunction()`
+predicate leakNeverFreedFilterExample_{name}(AllocationExpr alloc) {{{{
+  exists(FunctionCall c, ReturnStmt ret |
+    // allocation originates from calling a special allocator {name}
+    c = alloc and
+    c.getTarget().getName() = "{name}" and
 
-❌ FORBIDDEN:
-- `DataFlow` or `TaintTracking` imports
-- `semmle.code.cpp.dataflow.*`
-- Path-problem queries
+    // Example safe-suppression condition: ownership is transferred out via return
+    ret.getEnclosingFunction() = c.getEnclosingFunction() and
+    ret.getExpr() = c
+  )
+}}}}
 
-========================================
-EXAMPLE FILTER QUERY (Index-Based Pattern)
-========================================
+use_expr example:
+leakNeverFreedFilterExample_{name}(alloc)
 
-For a function like `_dictClear(dict *d, int htidx)` that clears `d->ht[htidx]`:
+==================================================
+EXAMPLE WHEN GENERATING A MEMORY MAY NOT BE FREED FILTER
+(SINGLE-PREDICATE PLUGIN, NO HELPER PREDICATES)
+==================================================
 
-```codeql
-/**
- * @name Safe double call - {name}
- * @description Identifies safe pairs of calls to {name} where different indices prevent conflicts
- * @kind problem
- * @id cpp/custom-safe-{name}
- * @problem.severity recommendation
- */
+Context: the enhanced "may not be freed" query contains:
+  not mayNotBeFreedFiltered(def)
+where `def` is a ControlFlowNode (allocation definition point).
 
-import cpp
+So your plugin must have signature:
+  predicate <PluginName>(ControlFlowNode def)
 
-from FunctionCall call1, FunctionCall call2
-where
-  // Both calls target our function
-  call1.getTarget().getName() = "{name}" and
-  call2.getTarget().getName() = "{name}" and
-  
-  // In the same function, second call comes after first
-  call1.getEnclosingFunction() = call2.getEnclosingFunction() and
-  call1.getLocation().getStartLine() < call2.getLocation().getStartLine() and
-  
-  // Both calls operate on the same base pointer (argument 0)
-  // Use toString() for comparison - handles variables, expressions, etc.
-  call1.getArgument(0).toString() = call2.getArgument(0).toString() and
-  
-  // SAFE CONDITION: Different index arguments (argument 1)
-  // Use toString() to handle both literals (0, 1) and variables (ht0, ht1)
-  call1.getArgument(1).toString() != call2.getArgument(1).toString()
-  
-select call2, 
-  "SAFE_PAIR: Index-selected cleanup with different indices (" + 
-  call1.getArgument(1).toString() + " vs " + call2.getArgument(1).toString() + 
-  ") (second call at line " + call2.getLocation().getStartLine().toString() + ")"
-```
+Example:
 
-**CRITICAL CODEQL SYNTAX REQUIREMENTS:**
+predicate leakMayNotBeFreedFilterExample_{name}(ControlFlowNode def) {{{{
+  exists(Expr e, FunctionCall c, Assignment a |
+    // bind the definition node to an expression that is a call to the special function {name}
+    e = def.(AnalysedExpr).getExpr() and
+    c = e and
+    c.getTarget().getName() = "{name}" and
 
-1. **String Conversion:** Always use `.toString()` when concatenating with strings
-   - ✅ Correct: `call2.getLocation().getStartLine().toString()`
-   - ❌ Wrong: `call2.getLocation().getStartLine()` (int, not string)
+    // Example safe-suppression condition: allocation escapes to a field/global
+    a.getRValue() = c and
+    not a.getLValue().(VariableAccess).getTarget() instanceof StackVariable
+  )
+}}}}
 
-2. **Function Name Matching:** Use `getName() = "..."` not `hasName(...)`
-   - ✅ Correct: `call1.getTarget().getName() = "{name}"`
-   - ❌ Wrong: `call1.getTarget().hasName("{name}")` (predicate, harder to use)
+use_expr example:
+leakMayNotBeFreedFilterExample_{name}(def)
 
-3. **Argument Comparison:** Use `toString()` for robust matching
-   - Handles literals: `0` vs `1`
-   - Handles variables: `ht0` vs `ht1`
-   - Handles expressions: `i*2` vs `i*2+1`
-
-4. **Message Format (MANDATORY):**
-   - Must contain: `SAFE_PAIR`
-   - Must contain: `second call at line ` followed by the line number
-   - Line number MUST be converted to string with `.toString()`
-
-**Key points:**
-- Checks that both calls target the same object (argument 0)
-- Verifies index arguments (argument 1) have different values using toString()
-- Works for both literal values (0, 1) and variables (ht0, ht1)
-- Emits structured message with `SAFE_PAIR` and line number for pipeline parsing
-- Only reports when we can prove it's safe (different indices)
-
-========================================
-OUTPUT FORMAT
-========================================
+==================================================
+OUTPUT FORMAT (STRICT JSON)
+==================================================
 
 Return ONLY a valid JSON object with these exact fields:
 
-```json
-{{
+{{{{
   "is_special": boolean,
   "reason": "Clear explanation of why this function is/isn't special, based on the actual code and hints",
-  "query_code": "Complete CodeQL filter query (empty string if is_special=false)"
-}}
-```
 
-**Reasoning Guidelines:**
-- Explain your decision based on the actual function behavior
-- Reference specific code patterns or hint information
-- For special functions: explain what false positives will occur and why
-- For regular functions: explain why standard queries handle it correctly
-- For filter queries: explain what pattern you're detecting as safe
+  "double_free_filter": {{{{
+    "predicates_code": "ONLY predicate definitions for dfFiltered(...) plugins (no imports, no select, no metadata, no aggregator). Empty string if not needed.",
+    "use_expr": "A single boolean expression like dfFilterXxx(srcDealloc, sinkNode, sinkFreedExpr), or empty string",
+    "query_code": ""
+  }}}},
 
-**Examples of good reasoning:**
+  "use_after_free_filter": {{{{
+    "predicates_code": "ONLY predicate definitions for uafFiltered(...) plugins. Empty string if not needed.",
+    "use_expr": "A single boolean expression like uafFilterXxx(dealloc, sinkNode), or empty string",
+    "query_code": ""
+  }}}},
 
-✅ "This function is special because it performs index-selected cleanup. The `htidx` parameter selects which internal hash table to clear (d->ht[0] or d->ht[1]). Multiple calls with different indices are safe, but CodeQL will flag them as double-free. Filter query checks for different literal index values."
+  "memory_never_freed_filter": {{{{
+    "predicates_code": "ONLY predicate definitions for leakFiltered(alloc) plugins. Empty string if not needed.",
+    "use_expr": "A single boolean expression like leakFilterXxx(alloc), or empty string",
+    "query_code": ""
+  }}}},
 
-✅ "Not special - this is a straightforward deallocator that frees the entire object. Multiple calls would be a genuine double-free. No filter needed."
+  "memory_may_not_be_freed_filter": {{{{
+    "predicates_code": "ONLY predicate definitions for mayNotBeFreedFiltered(def) plugins. Empty string if not needed.",
+    "use_expr": "A single boolean expression like mayNotBeFreedFilterXxx(def), or empty string",
+    "query_code": ""
+  }}}}
+}}}}
 
-✅ "This function is special due to reference counting. It only frees when refcount reaches zero. Multiple calls are expected and safe, but CodeQL doesn't understand refcount semantics and will report false positive double-free warnings."
+GUIDELINES:
+- If the function is not special, set is_special=false and leave all predicates_code/use_expr as empty strings.
+- If special only for some bug types, fill only those blocks.
+- For each non-empty block:
+  - predicates_code MUST contain ONLY predicate definitions (no imports, no select, no metadata, no aggregator).
+  - use_expr MUST call your predicate using ONLY in-scope pipeline parameters.
+  - query_code MUST be "".
 
-Now analyze the function and respond with JSON."""
+==================================================
+SELF-CHECK BEFORE RETURNING JSON
+==================================================
+
+Before output:
+- Ensure NO getExpr/getASubExpression/getEnclosingFunctionCall appears.
+- Ensure you did NOT redefine dfFiltered/uafFiltered/leakFiltered/mayNotBeFreedFiltered.
+- Ensure your use_expr contains ONLY the pipeline parameters (no call1/call2).
+- Ensure any local variables are bound within exists(...).
+- Ensure JSON is valid and contains only the required fields.
+
+Now analyze the function and respond with JSON only.
+'''
+        
+        return PROMPT
     
     # -------------------------------------------------------------------------
     # Validation and fixing
     # -------------------------------------------------------------------------
+    
+    def _build_filter_wrapper_query(
+        self,
+        filter_type: str,
+        predicates_code: str,
+        use_expr: str,
+    ) -> str:
+        """
+        Build a validation query by inserting the filter into the actual production template.
+        
+        This mirrors how adapters.py merges filters into templates, ensuring validation
+        happens with the exact same structure that will be used in production.
+        """
+        if filter_type == "double_free_filter":
+            template = ENHANCED_DOUBLE_FREE_FILTERED_TEMPLATE
+            # Merge predicates_code and build dfFiltered aggregator (same as adapters.py)
+            preds_part = predicates_code if predicates_code else ""
+            body = use_expr if use_expr else "false"
+            df_agg = (
+                "predicate dfFiltered(DeallocationExpr srcDealloc, "
+                "DataFlow::Node sinkNode, Expr sinkFreedExpr) {\n"
+                f"  {body}\n"
+                "}\n"
+            )
+            merged = template
+            if preds_part:
+                merged += "\n\n" + preds_part
+            merged += "\n\n" + df_agg
+            return merged
+            
+        elif filter_type == "use_after_free_filter":
+            template = ENHANCED_USE_AFTER_FREE_FILTERED_TEMPLATE
+            # Merge predicates_code and build uafFiltered aggregator
+            preds_part = predicates_code if predicates_code else ""
+            body = use_expr if use_expr else "false"
+            uaf_agg = (
+                "predicate uafFiltered(DeallocationExpr dealloc, DataFlow::Node sinkNode) {\n"
+                f"  {body}\n"
+                "}\n"
+            )
+            merged = template
+            if preds_part:
+                merged += "\n\n" + preds_part
+            merged += "\n\n" + uaf_agg
+            return merged
+            
+        elif filter_type == "memory_never_freed_filter":
+            # Memory never freed filter (uses leakFiltered(AllocationExpr alloc))
+            template = ENHANCED_MEMORY_NEVER_FREED_FILTERED_TEMPLATE
+            preds_part = predicates_code if predicates_code else ""
+            body = use_expr if use_expr else "false"
+            leak_agg = (
+                "predicate leakFiltered(AllocationExpr alloc) {\n"
+                f"  {body}\n"
+                "}\n"
+            )
+            merged = template
+            if preds_part:
+                merged += "\n\n" + preds_part
+            merged += "\n\n" + leak_agg
+            return merged
+            
+        elif filter_type == "memory_may_not_be_freed_filter":
+            # Memory may not be freed filter (uses mayNotBeFreedFiltered(ControlFlowNode def))
+            template = ENHANCED_MEMORY_MAY_NOT_BE_FREED_FILTERED_TEMPLATE
+            preds_part = predicates_code if predicates_code else ""
+            body = use_expr if use_expr else "false"
+            may_not_be_freed_agg = (
+                "predicate mayNotBeFreedFiltered(ControlFlowNode def) {\n"
+                f"  {body}\n"
+                "}\n"
+            )
+            merged = template
+            if preds_part:
+                merged += "\n\n" + preds_part
+            merged += "\n\n" + may_not_be_freed_agg
+            return merged
+            
+        else:
+            raise ValueError(f"Unknown filter_type: {filter_type}")
+    
+    def _validate_and_fix_filter_block(
+        self,
+        func_name: str,
+        filter_type: str,
+        block: Dict[str, Any],
+        original_prompt: str,
+    ) -> Dict[str, Any]:
+        """
+        Validate a filter block (predicates_code + use_expr) and fix if needed.
+        
+        Returns:
+            Updated block dict with validated/corrected predicates_code and use_expr.
+        """
+        predicates_code = (block.get("predicates_code") or "").strip()
+        use_expr = (block.get("use_expr") or "").strip()
+        
+        if not predicates_code and not use_expr:
+            # Empty block, nothing to validate
+            return block
+        
+        # Build wrapper query for validation
+        wrapper_query = self._build_filter_wrapper_query(filter_type, predicates_code, use_expr)
+        
+        # Log the full query being validated
+        logger.info(
+            "Validating filter block '%s' for '%s' with merged query:\n%s",
+            filter_type,
+            func_name,
+            wrapper_query
+        )
+        
+        # Validate the wrapper query
+        is_valid, error_msg = self._validate_codeql_query(wrapper_query)
+        
+        if is_valid:
+            logger.info(
+                "Filter block '%s' for '%s' passed validation",
+                filter_type,
+                func_name
+            )
+            return {
+                **block,
+                "validated": True,
+                "validation_error": "",
+            }
+        
+        logger.warning(
+            "Filter block '%s' for '%s' failed validation: %s. Attempting LLM fix...",
+            filter_type,
+            func_name,
+            error_msg[:200]
+        )
+        
+        # Try to fix with LLM (up to 2 attempts)
+        for attempt in range(2):
+            fix_prompt = f"""You previously generated a CodeQL filter for the function '{func_name}' (filter type: {filter_type}), but it has a compilation error when inserted into the production template.
+
+**ERROR:**
+{error_msg[:500]}
+
+**CURRENT FILTER CODE:**
+```codeql
+{predicates_code}
+```
+
+**USE EXPRESSION:**
+```codeql
+{use_expr}
+```
+
+**FULL QUERY (production template with your filter inserted):**
+```codeql
+{wrapper_query[:1500]}...
+```
+
+Please fix ONLY the predicates_code and/or use_expr to resolve the compilation error. The fix must work when inserted into the production template shown above. Return the corrected filter in JSON format:
+{{
+  "predicates_code": "corrected predicate definitions here",
+  "use_expr": "corrected use expression here"
+}}"""
+            
+            result = self.llm.query(fix_prompt) or {}
+            content = result.get("content", {}) or {}
+            
+            new_predicates = (content.get("predicates_code") or predicates_code).strip()
+            new_use_expr = (content.get("use_expr") or use_expr).strip()
+            
+            if not new_predicates and not new_use_expr:
+                logger.warning("LLM did not return corrected filter code in attempt %d/2", attempt + 1)
+                continue
+            
+            # Rebuild wrapper and validate again
+            new_wrapper = self._build_filter_wrapper_query(filter_type, new_predicates, new_use_expr)
+            
+            # Log the fixed query being validated
+            logger.info(
+                "Validating fixed filter block '%s' for '%s' (attempt %d/2) with merged query:\n%s",
+                filter_type,
+                func_name,
+                attempt + 1,
+                new_wrapper
+            )
+            
+            is_valid, error_msg = self._validate_codeql_query(new_wrapper)
+            
+            if is_valid:
+                logger.info(
+                    "✓ Fixed filter block '%s' for '%s' passed validation",
+                    filter_type,
+                    func_name
+                )
+                return {
+                    **block,
+                    "predicates_code": new_predicates,
+                    "use_expr": new_use_expr,
+                    "validated": True,
+                    "validation_error": "",
+                }
+            
+            logger.warning(
+                "Fix attempt %d/2 for '%s' still has error: %s",
+                attempt + 1,
+                filter_type,
+                error_msg[:200]
+            )
+        
+        # All attempts failed
+        logger.error(
+            "Failed to fix filter block '%s' for '%s' after 3 attempts. Last error: %s",
+            filter_type,
+            func_name,
+            error_msg[:200]
+        )
+        return {
+            **block,
+            "validated": False,
+            "validation_error": f"Validation failed after 3 attempts: {error_msg[:200]}",
+        }
     
     def _validate_and_fix_query(
         self,

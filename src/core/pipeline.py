@@ -21,10 +21,11 @@ from tqdm import tqdm
 
 from src.core.models import (
     FunctionInfo, Hint, HintType, HintSet,
-    Warning, Evidence, AnalysisResult, MemoryIssueType
+    Warning, Evidence, AnalysisResult, MemoryIssueType,
+    CustomQuery, CustomQuerySet
 )
 from src.tree_sitter_parser import CodeParser
-from src.llm_client import HintGenerator, LLMClient
+from src.llm_client import HintGenerator, LLMClient, CustomQueryGenerator
 from src.symbolic.z3_solver import HintValidator, WarningValidator
 from src.analyzer.adapters import CodeQLAnalyzer
 
@@ -82,12 +83,16 @@ class Pipeline:
             MemoryIssueType.MEMORY_LEAK,
             MemoryIssueType.DOUBLE_FREE,
             MemoryIssueType.USE_AFTER_FREE,
+            MemoryIssueType.MEMORY_LEAK_FILTERED,
+            MemoryIssueType.USE_AFTER_FREE_FILTERED,
+            MemoryIssueType.DOUBLE_FREE_FILTERED,
         ]
 
         # State
         self.functions: dict[str, FunctionInfo] = {}
         self.macro_names: set[str] = set()  # Track which function names are from macros
         self.hints = HintSet()
+        self.custom_queries = CustomQuerySet()  # Custom queries for special functions
         self.conflicts: list[str] = []
         self.validated_hints_count: int = 0  # Track number of hints that passed Z3 validation
         # Track function/macro replacements due to duplicate names (for later analysis/LLM reuse)
@@ -466,6 +471,7 @@ class Pipeline:
         if self.skip_hint_injection:
             logger.info("Hint injection disabled: skipping hint generation/validation (phases 2-3).")
             self.hints = HintSet()
+            self.custom_queries = CustomQuerySet()
             self.validated_hints_count = 0
             # Export empty cost file
             self._export_costs(output_dir)
@@ -477,6 +483,26 @@ class Pipeline:
                 self.hints = self._load_hints(hints_file)
                 # Count validated hints from cached hints (approximate - all cached hints are considered validated)
                 self.validated_hints_count = sum(len(hints) for hints in self.hints.hints.values())
+                
+                # Try to load cached custom queries
+                custom_queries_file = output_dir / "custom_queries.json"
+                if custom_queries_file.exists():
+                    logger.info(f"  Loading cached custom queries from {custom_queries_file}")
+                    self.custom_queries = self._load_custom_queries(custom_queries_file)
+                    logger.info(f"  {self.custom_queries.summary()}")
+                    if len(self.custom_queries) > 0:
+                        logger.info(f"  Special functions: {', '.join(sorted(self.custom_queries.queries.keys()))}")
+                else:
+                    # Custom queries not cached, generate them from validated hints
+                    logger.info(f"  Custom queries not cached, generating from validated hints...")
+                    self.custom_queries = self._generate_custom_queries_iteratively(
+                        self.functions,
+                        self.hints,
+                    )
+                    # Save generated custom queries
+                    custom_queries_file = output_dir / "custom_queries.json"
+                    self._save_custom_queries(custom_queries_file)
+                
                 # Export cost file (will show zeros since no LLM calls were made)
                 self._export_costs(output_dir)
             else:
@@ -587,20 +613,41 @@ class Pipeline:
                 # Save validated hints
                 self._save_hints(hints_file)
                 
+                # =================================================================
+                # Phase 2b: Generate custom queries for special functions (after Z3 validation)
+                # =================================================================
+                logger.info("Phase 2b: Generating custom queries for validated hints (one by one)...")
+                self.custom_queries = self._generate_custom_queries_iteratively(
+                    self.functions,
+                    self.hints,
+                )
+                logger.info(f"  {self.custom_queries.summary()}")
+                if len(self.custom_queries) > 0:
+                    logger.info(f"  Special functions: {', '.join(sorted(self.custom_queries.queries.keys()))}")
+                
+                # Save custom queries
+                custom_queries_file = output_dir / "custom_queries.json"
+                self._save_custom_queries(custom_queries_file)
+                
                 # Export cost information right after hint generation completes
                 self._export_costs(output_dir)
 
         # =====================================================================
-        # Phase 4: CodeQL analysis with hints
+        # Phase 4: CodeQL analysis with hints and custom queries
         # =====================================================================
-        logger.info("Phase 4: Running CodeQL with hint-based models...")
+        logger.info("Phase 4: Running CodeQL with hint-based models and custom queries...")
 
-        # Run CodeQL
+        # 所有函数（包括 special 的）都注入 allocator/deallocator 模型，
+        # special 函数额外还有它们自己的 custom queries。
+        hints_for_codeql = self.hints
+
+        # Run CodeQL with custom queries if available
         warnings = self.analyzer.analyze(
             project_path,
-            self.hints,
+            hints_for_codeql,
             self.issue_types,
             use_enhanced_queries=self.use_enhanced_queries,
+            custom_queries=self.custom_queries if hasattr(self, 'custom_queries') else None,
         )
         logger.info(f"  CodeQL found {len(warnings)} warnings")
 
@@ -610,18 +657,6 @@ class Pipeline:
             json.dump([w.to_dict() for w in warnings], f, indent=2)
 
         logger.info(f"  Saved CodeQL warnings to {warning_dump_path}")
-
-        
-        # =====================================================================
-        # Phase 4: Load CodeQL warnings directly (skip CodeQL analysis)
-        # =====================================================================
-        # warning_dump_path = output_dir / "codeql_warnings.json"
-        # logger.info("Phase 4: Loading stored CodeQL warnings...")
-
-        # with open(warning_dump_path) as f:
-        #     warnings = [Warning.from_dict(w) for w in json.load(f)]
-
-        # logger.info(f"  Loaded {len(warnings)} warnings")
 
 
         # =====================================================================
@@ -673,6 +708,17 @@ class Pipeline:
     def _save_hints(self, file_path: Path) -> None:
         """Save hints to JSON file."""
         file_path.write_text(json.dumps(self.hints.to_json(), indent=2))
+    
+    def _load_custom_queries(self, file_path: Path) -> CustomQuerySet:
+        """Load custom queries from JSON file."""
+        data = json.loads(file_path.read_text())
+        return CustomQuerySet.from_json(data)
+    
+    def _save_custom_queries(self, file_path: Path) -> None:
+        """Save custom queries to JSON file."""
+        file_path.write_text(json.dumps(self.custom_queries.to_json(), indent=2))
+        if len(self.custom_queries) > 0:
+            logger.info(f"  Custom queries saved to {file_path}")
 
     def _export_results(
         self,
@@ -692,6 +738,7 @@ class Pipeline:
                 "file": bug.warning.file_path,
                 "line": bug.warning.line_number,
                 "function": bug.warning.function_name,
+                "warning_type": bug.warning.warning_type,
                 "type": bug.warning.issue_type.name,
                 "message": bug.warning.message,
                 "allocation_site": bug.warning.allocation_site,
@@ -712,9 +759,11 @@ class Pipeline:
                 "file": w.file_path,
                 "line": w.line_number,
                 "function": w.function_name,
+                "warning_type": w.warning_type,
                 "message": w.message,
                 "allocation_site": w.allocation_site,
                 "trace": w.trace,
+                "reason": w.reason,
             })
         filtered_file = output_dir / "filtered_warnings.json"
         filtered_file.write_text(json.dumps(filtered_data, indent=2))
@@ -729,12 +778,19 @@ class Pipeline:
                 "file": w.file_path,
                 "line": w.line_number,
                 "function": w.function_name,
+                "warning_type": w.warning_type,
                 "message": w.message,
                 "allocation_site": w.allocation_site,
                 "trace": w.trace,
             })
         unconfirmed_file = output_dir / "unconfirmed_warnings.json"
         unconfirmed_file.write_text(json.dumps(unconfirmed_data, indent=2))
+        
+        # Custom queries (if any)
+        if len(self.custom_queries) > 0:
+            custom_queries_file = output_dir / "custom_queries.json"
+            custom_queries_file.write_text(json.dumps(self.custom_queries.to_json(), indent=2))
+            logger.info(f"  Custom queries saved to {custom_queries_file}")
 
         # Conflicts log
         if self.conflicts:
@@ -896,5 +952,70 @@ class Pipeline:
             MemoryIssueType.MEMORY_LEAK: "Free allocated memory before function exit",
             MemoryIssueType.DOUBLE_FREE: "Remove duplicate free() or add null guard",
             MemoryIssueType.USE_AFTER_FREE: "Use memory before freeing, not after",
+            MemoryIssueType.MEMORY_LEAK_FILTERED: "Free allocated memory before function exit",
+            MemoryIssueType.USE_AFTER_FREE_FILTERED: "Use memory before freeing, not after",
+            MemoryIssueType.DOUBLE_FREE_FILTERED: "Remove duplicate free() or add null guard",
         }
         return fixes.get(warning.issue_type, "Review memory safety issue")
+
+    def _generate_custom_queries_iteratively(
+        self,
+        functions: dict[str, FunctionInfo],
+        hints: HintSet,
+    ) -> CustomQuerySet:
+        """Generate custom CodeQL queries for validated hints iteratively (one by one).
+        
+        After Z3 validation confirms the hints, evaluate each function that has validated
+        hints to determine if it needs a custom query. Process them one by one with logging.
+        
+        All evaluated functions are stored in CustomQuerySet with their decisions:
+        - Special functions: includes generated query_code and reasoning
+        - Non-special functions: includes reasoning for why no query was needed
+        
+        Args:
+            functions: Dict of all functions
+            hints: The validated hints (after Z3 validation)
+            
+        Returns:
+            CustomQuerySet with evaluation results for all validated functions
+        """
+        custom_queries = CustomQuerySet()
+        
+        # 如果没有 LLM 客户端，直接返回空集
+        if not self.hint_generator.llm:
+            logger.warning("No LLM client available for custom query generation")
+            return custom_queries
+        
+        # 为此次迭代创建一个专用的 CustomQueryGenerator
+        cq_generator = CustomQueryGenerator(
+            llm=self.hint_generator.llm,
+            codeql_validator=None,  # Validation handled internally in llm_client
+        )
+        
+        # Get functions with validated hints
+        functions_with_hints = list(hints.hints.keys())
+        total_functions_with_hints = len(functions_with_hints)
+        
+        logger.info(f"Processing {total_functions_with_hints} function(s) with validated hints...")
+        
+        # Process each function with validated hints one by one
+        for idx, func_name in enumerate(functions_with_hints, 1):
+            if func_name not in functions:
+                logger.warning(f"  [{idx}/{total_functions_with_hints}] Function '{func_name}' not found in parsed functions, skipping")
+                continue
+            
+            func = functions[func_name]
+            func_hints = hints.hints[func_name]
+            
+            logger.info(f"  [{idx}/{total_functions_with_hints}] Evaluating '{func_name}' for custom query ({len(func_hints)} hint(s))")
+            
+            # Evaluate and generate custom query for this function
+            query = cq_generator.generate_custom_query_for_function(func, func_hints)
+            if query:
+                custom_queries.add(query)
+                if query.is_special:
+                    logger.debug(f"      ✓ Custom query generated for '{func_name}'")
+                else:
+                    logger.debug(f"      - No custom query needed for '{func_name}': {query.reason}")
+        
+        return custom_queries
