@@ -803,71 +803,51 @@ class CodeQLValidator:
             )
     
     def validate_query(self, query_code: str) -> Tuple[bool, str]:
-        """
-        Validate a CodeQL query by writing it to a temp file and running codeql query compile.
-        
-        Args:
-            query_code: The CodeQL query code to validate
-        
-        Returns:
-            Tuple of (is_valid, error_message)
-        """
         if not query_code or not query_code.strip():
             return False, "Query code is empty"
-        
-        # Create a temporary directory for the query file (needed for qlpack context)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            query_dir = Path(temp_dir)
-            query_file = query_dir / "query.ql"
-            
+
+        query_dir = Path("/home/huihuihuang/Hint/codeql/qlpacks/codeql/cpp-queries/1.5.8/Critical")
+        query_file = query_dir / "tmp.ql"
+
+        try:
+            query_file.write_text(query_code)
+
+            cmd = [self.codeql_binary, "query", "compile", "--check-only", str(query_file)]
+
+            env = os.environ.copy()
+            if self.codeql_dir:
+                env["CODEQL_HOME"] = str(self.codeql_dir)
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                env=env,
+                cwd=str(query_dir),
+            )
+
+            if result.returncode == 0:
+                logger.info("CodeQL query validation passed successfully")
+                return True, ""
+
+            error_msg = result.stderr.strip() or result.stdout.strip()
+            if not error_msg:
+                error_msg = f"CodeQL query compile failed with return code {result.returncode}"
+
+            error_msg = error_msg.replace(str(query_file), "tmp.ql")
+            error_msg = error_msg.replace(str(query_dir), "")
+
+            return False, error_msg
+
+        except Exception as e:
+            return False, f"Validation error: {str(e)}"
+
+        finally:
             try:
-                # Write query to file
-                query_file.write_text(query_code)
-                
-                # Create qlpack.yml with required library dependencies
-                qlpack_file = query_dir / "qlpack.yml"
-                qlpack_content = """name: temp-query-pack
-version: 1.0.0
-libraryPathDependencies: codeql/cpp-all
-"""
-                qlpack_file.write_text(qlpack_content)
-                
-                # Run codeql query compile to validate the query
-                # Note: query compile validates syntax without needing a database
-                # The libraryPathDependencies in qlpack.yml provides the dbscheme
-                cmd = [self.codeql_binary, "query", "compile", "--check-only", str(query_file)]
-                
-                # Set environment if codeql_dir is provided
-                env = os.environ.copy()
-                if self.codeql_dir:
-                    env["CODEQL_HOME"] = str(self.codeql_dir)
-                
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout,
-                    env=env,
-                    cwd=str(query_dir),
-                )
-                
-                if result.returncode == 0:
-                    logger.info("CodeQL query validation passed successfully")
-                    return True, ""
-                else:
-                    # Return the error message - LLM will use this to fix the query
-                    error_msg = result.stderr.strip() or result.stdout.strip()
-                    if not error_msg:
-                        error_msg = f"CodeQL query compile failed with return code {result.returncode}"
-                    
-                    # Clean up error message - remove temp file paths
-                    error_msg = error_msg.replace(str(query_file), "query.ql")
-                    error_msg = error_msg.replace(str(query_dir), "")
-                    
-                    return False, error_msg
-                    
-            except Exception as e:
-                return False, f"Validation error: {str(e)}"
+                query_file.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 class CustomQueryGenerator:
@@ -931,7 +911,7 @@ class CustomQueryGenerator:
             return None
         
         hints_text, arg_semantics_text = self._format_hints_and_mad(func, hints)
-        prompt = self._build_query_generation_prompt(func, hints_text, arg_semantics_text)
+        prompt = self._build_query_generation_prompt(func, hints_text, arg_semantics_text, hints)
         
         logger.debug(
             "Generating custom query for function: %s",
@@ -946,6 +926,21 @@ class CustomQueryGenerator:
         
         is_special = bool(content.get("is_special", False))
         reason = (content.get("reason", "") or "LLM determined function needs custom filters").strip()
+        
+        # Log the special status and reason
+        func_name = getattr(func, "name", "")
+        if is_special:
+            logger.info(
+                "Function '%s' is SPECIAL: %s",
+                func_name,
+                reason
+            )
+        else:
+            logger.info(
+                "Function '%s' is NOT special: %s",
+                func_name,
+                reason
+            )
 
         # New-style per-bug-type filters
         df_block = content.get("double_free_filter") or {}
@@ -1095,7 +1090,8 @@ class CustomQueryGenerator:
         self,
         func: Any,
         hints_text: str,
-        arg_semantics_text: str
+        arg_semantics_text: str,
+        hints: Optional[List[Any]] = None
     ) -> str:
         """
         Build the LLM prompt for deciding specialness and generating a query.
@@ -1113,6 +1109,37 @@ class CustomQueryGenerator:
             [f"{t} {n}" for t, n in zip(arg_types, arg_names)]
         ) if arg_names else "void"
         
+        # Extract allocator/deallocator information from hints
+        is_allocator = False
+        is_deallocator = False
+        allocator_targets = []
+        deallocator_targets = []
+        
+        if hints:
+            for hint in hints:
+                hint_type = getattr(hint, "hint_type", None)
+                if hint_type:
+                    hint_type_name = getattr(hint_type, "name", str(hint_type))
+                    target = getattr(hint, "target", "")
+                    
+                    if hint_type_name == "ALLOCATOR":
+                        is_allocator = True
+                        allocator_targets.append(target)
+                    elif hint_type_name == "DEALLOCATOR":
+                        is_deallocator = True
+                        deallocator_targets.append(target)
+        
+        # Build semantic description
+        semantic_parts = []
+        if is_allocator:
+            targets_str = ", ".join(allocator_targets) if allocator_targets else "return value"
+            semantic_parts.append(f"ALLOCATOR (on {targets_str})")
+        if is_deallocator:
+            targets_str = ", ".join(deallocator_targets) if deallocator_targets else "arguments"
+            semantic_parts.append(f"DEALLOCATOR (on {targets_str})")
+        
+        semantic_info = " | ".join(semantic_parts) if semantic_parts else "Neither allocator nor deallocator"
+        
         PROMPT = f'''You are an expert CodeQL query generator specializing in C/C++ memory safety analysis.
 
 Your task has TWO parts:
@@ -1123,9 +1150,18 @@ IMPORTANT:
 - You are generating ONLY predicate definitions that will be inserted into an existing CodeQL query pack.
 - DO NOT generate full queries.
 - DO NOT generate metadata headers (no @name/@id/...).
-- DO NOT generate import statements.
 - DO NOT generate select clauses.
 - DO NOT redefine aggregator predicates like dfFiltered/uafFiltered/leakFiltered/mayNotBeFreedFiltered.
+
+- DO NOT write import statements inside predicates_code.
+- If your predicates require additional CodeQL modules (e.g., DataFlow, IR, StackVariableReachability, etc.),
+  you MUST declare them in a separate field called "required_imports".
+- "required_imports" must be a list of import lines WITHOUT the word "import".
+  Example:
+      "required_imports": ["semmle.code.cpp.dataflow.new.DataFlow", "semmle.code.cpp.ir.IR"]
+- DO NOT include "cpp" in required_imports (it is already imported).
+- Only list modules that are actually used in your predicates_code.
+
 
 ==================================================
 FUNCTION ANALYSIS
@@ -1134,6 +1170,7 @@ FUNCTION ANALYSIS
 Function Name: `{name}`
 Return Type: `{ret}`
 Parameters: `{params_str}`
+Memory Semantics: {semantic_info}
 
 Source Code:
 ```c
@@ -1163,6 +1200,44 @@ Your goal is to generate FILTER PLUGIN PREDICATES that identify SAFE cases for:
 - MEMORY LEAK (never freed / may not be freed)
 
 If the function is NOT special, return is_special=false and leave all filters empty.
+
+==================================================
+REAL FILTER REQUIREMENT (NO BLANKET SUPPRESSION)
+==================================================
+
+A filter MUST identify a *provably safe* pattern. It is NOT allowed to suppress warnings
+just because the allocation/free/use comes from function `{name}`.
+
+❌ FORBIDDEN (NOT A FILTER):
+Any predicate that returns true using only "target name is `{name}`" (or wrappers)
+without any additional safety proof.
+
+Examples that are FORBIDDEN:
+- exists(FunctionCall c | c = alloc and c.getTarget().getName() = "{name}")
+- exists(FunctionCall c | c = alloc and c.getTarget().hasGlobalName("{name}")
+- exists(FunctionCall c | c = dealloc and c.getTarget().getName() = "{name}")
+- Any leak/UAF/DF filter whose only condition is matching `{name}`
+
+Why forbidden:
+- `{name}` may be an allocator-like function that returns owned memory to the caller.
+  Blanket suppression would hide real leaks in callers.
+
+✅ REQUIRED (WHAT A REAL FILTER MUST PROVE):
+
+For MEMORY NEVER FREED filters (AllocationExpr alloc):
+You MUST prove ownership transfer or safe escape, e.g. at least ONE of:
+- The call result is returned by the enclosing function
+- The call result is assigned/stored into a field/global/pointer-deref (heap escape)
+- The call result is passed into an owner-taking API (ONLY if such API is explicitly named in hints)
+
+If you cannot prove a concrete ownership transfer/escape, leave the memory_never_freed_filter empty.
+
+For MEMORY MAY NOT BE FREED filters (ControlFlowNode def):
+You MUST bind def to an allocation expression and prove escape/return/ownership transfer.
+
+For DOUBLE FREE / USE AFTER FREE filters:
+You MUST prove the second event is safe due to semantics (different index/flag, idempotence, refcount, etc.).
+Never suppress based only on function name.
 
 ==================================================
 PIPELINE SIGNATURE RULE (MANDATORY)
@@ -1206,9 +1281,14 @@ HARD BAN LIST (COMPILATION FAILURES)
 - Casting FunctionCall to DeallocationExpr
 - Redefining aggregator predicates
 - Any use_expr that references undefined variables (e.g., call1/call2; or srcDealloc/sinkFreedExpr inside UAF)
+- For memory_may_not_be_freed_filter: def.(ExprCfgNode).getExpr() [ExprCfgNode does not exist]
+- For memory_may_not_be_freed_filter: DataFlow::node(def) [ControlFlowNode is not compatible with DataFlow::Node]
+- For memory_may_not_be_freed_filter: def.getExpr() [must use def.(AnalysedExpr).getExpr() instead]
 
 Note: If the MAIN query already uses sinkNode.asExpr(), you may also use sinkNode.asExpr() in plugins.
 Otherwise, do not invent new conversions.
+
+For memory_may_not_be_freed_filter: ALWAYS use def.(AnalysedExpr).getExpr() to extract expressions from ControlFlowNode.
 
 ==================================================
 SCOPING RULE (MANDATORY)
@@ -1327,11 +1407,19 @@ where `def` is a ControlFlowNode (allocation definition point).
 So your plugin must have signature:
   predicate <PluginName>(ControlFlowNode def)
 
+CRITICAL: To extract an expression from a ControlFlowNode, you MUST use:
+  e = def.(AnalysedExpr).getExpr()
+
+DO NOT use:
+  - def.(ExprCfgNode).getExpr()  [ExprCfgNode does not exist]
+  - DataFlow::node(def).asExpr()  [ControlFlowNode is not compatible with DataFlow::Node]
+  - def.getExpr()  [ControlFlowNode does not have getExpr() directly]
+
 Example:
 
 predicate leakMayNotBeFreedFilterExample_{name}(ControlFlowNode def) {{{{
   exists(Expr e, FunctionCall c, Assignment a |
-    // bind the definition node to an expression that is a call to the special function {name}
+    // CRITICAL: Use def.(AnalysedExpr).getExpr() to extract expression from ControlFlowNode
     e = def.(AnalysedExpr).getExpr() and
     c = e and
     c.getTarget().getName() = "{name}" and
@@ -1350,29 +1438,32 @@ OUTPUT FORMAT (STRICT JSON)
 ==================================================
 
 Return ONLY a valid JSON object with these exact fields:
-
 {{{{
   "is_special": boolean,
-  "reason": "Clear explanation of why this function is/isn't special, based on the actual code and hints",
+  "reason": "Clear explanation of why this function is/isn't special",
 
   "double_free_filter": {{{{
-    "predicates_code": "ONLY predicate definitions for dfFiltered(...) plugins (no imports, no select, no metadata, no aggregator). Empty string if not needed.",
-    "use_expr": "A single boolean expression like dfFilterXxx(srcDealloc, sinkNode, sinkFreedExpr), or empty string"
+    "required_imports": ["module.path.IfNeeded"],
+    "predicates_code": "ONLY predicate definitions (no imports, no select, no metadata, no aggregator). Empty string if not needed.",
+    "use_expr": "Single boolean expression or empty string"
   }}}},
 
   "use_after_free_filter": {{{{
-    "predicates_code": "ONLY predicate definitions for uafFiltered(...) plugins. Empty string if not needed.",
-    "use_expr": "A single boolean expression like uafFilterXxx(dealloc, sinkNode), or empty string"
+    "required_imports": ["module.path.IfNeeded"],
+    "predicates_code": "ONLY predicate definitions or empty string",
+    "use_expr": "Single boolean expression or empty string"
   }}}},
 
   "memory_never_freed_filter": {{{{
-    "predicates_code": "ONLY predicate definitions for leakFiltered(alloc) plugins. Empty string if not needed.",
-    "use_expr": "A single boolean expression like leakFilterXxx(alloc), or empty string"
+    "required_imports": ["module.path.IfNeeded"],
+    "predicates_code": "ONLY predicate definitions or empty string",
+    "use_expr": "Single boolean expression or empty string"
   }}}},
 
   "memory_may_not_be_freed_filter": {{{{
-    "predicates_code": "ONLY predicate definitions for mayNotBeFreedFiltered(def) plugins. Empty string if not needed.",
-    "use_expr": "A single boolean expression like mayNotBeFreedFilterXxx(def), or empty string"
+    "required_imports": ["module.path.IfNeeded"],
+    "predicates_code": "ONLY predicate definitions or empty string",
+    "use_expr": "Single boolean expression or empty string"
   }}}}
 }}}}
 
@@ -1390,9 +1481,12 @@ SELF-CHECK BEFORE RETURNING JSON
 Before output:
 - Ensure NO getExpr/getASubExpression/getEnclosingFunctionCall appears.
 - Ensure you did NOT redefine dfFiltered/uafFiltered/leakFiltered/mayNotBeFreedFiltered.
-- Ensure your use_expr contains ONLY the pipeline parameters (no call1/call2).
-- Ensure any local variables are bound within exists(...).
+- Ensure your use_expr contains ONLY the pipeline parameters.
+- Ensure any local variables are bound inside exists(...).
+- Ensure required_imports lists ONLY modules actually used.
+- Ensure you did NOT include "import" keyword in required_imports.
 - Ensure JSON is valid and contains only the required fields.
+
 
 Now analyze the function and respond with JSON only.
 '''
@@ -1403,11 +1497,74 @@ Now analyze the function and respond with JSON only.
     # Validation and fixing
     # -------------------------------------------------------------------------
     
+    def _insert_imports_into_template(self, template: str, required_imports: set[str]) -> str:
+        """
+        Insert additional imports into a CodeQL query template.
+        
+        Args:
+            template: The CodeQL query template string
+            required_imports: Set of import module paths (without 'import' keyword)
+        
+        Returns:
+            Template with imports inserted after existing imports
+        """
+        if not required_imports:
+            return template
+        
+        # Sort imports for consistent output
+        import_lines = sorted(required_imports)
+        additional_imports = "\n".join(f"import {imp}" for imp in import_lines)
+        
+        # Find the last import statement in the template
+        # Look for common import patterns
+        last_import_pos = -1
+        last_import_end = -1
+        
+        # Try to find the last import line
+        import_patterns = [
+            "import semmle.code.cpp.dataflow.new.DataFlow",
+            "import semmle.code.cpp.controlflow.StackVariableReachability",
+            "import MemoryFreed",
+            "import cpp",
+        ]
+        
+        for pattern in import_patterns:
+            pos = template.rfind(pattern)
+            if pos != -1:
+                # Find the end of this import line
+                end_pos = template.find("\n", pos)
+                if end_pos != -1:
+                    if pos > last_import_pos:
+                        last_import_pos = pos
+                        last_import_end = end_pos
+        
+        if last_import_pos != -1 and last_import_end != -1:
+            # Find the blank line after imports (if any)
+            blank_line_pos = template.find("\n\n", last_import_end)
+            if blank_line_pos != -1:
+                # Insert after the blank line
+                return (
+                    template[:blank_line_pos + 1] +
+                    additional_imports + "\n" +
+                    template[blank_line_pos + 1:]
+                )
+            else:
+                # No blank line, insert after the last import with a newline
+                return (
+                    template[:last_import_end] +
+                    "\n" + additional_imports + "\n" +
+                    template[last_import_end:]
+                )
+        
+        # Fallback: prepend imports (shouldn't happen with proper templates)
+        return additional_imports + "\n\n" + template
+
     def _build_filter_wrapper_query(
         self,
         filter_type: str,
         predicates_code: str,
         use_expr: str,
+        required_imports: Optional[set[str]] = None,
     ) -> str:
         """
         Build a validation query by inserting the filter into the actual production template.
@@ -1415,6 +1572,9 @@ Now analyze the function and respond with JSON only.
         This mirrors how adapters.py merges filters into templates, ensuring validation
         happens with the exact same structure that will be used in production.
         """
+        if required_imports is None:
+            required_imports = set()
+        
         if filter_type == "double_free_filter":
             template = ENHANCED_DOUBLE_FREE_FILTERED_TEMPLATE
             # Merge predicates_code and build dfFiltered aggregator (same as adapters.py)
@@ -1427,6 +1587,8 @@ Now analyze the function and respond with JSON only.
                 "}\n"
             )
             merged = template
+            # Insert additional imports if any
+            merged = self._insert_imports_into_template(merged, required_imports)
             if preds_part:
                 merged += "\n\n" + preds_part
             merged += "\n\n" + df_agg
@@ -1443,6 +1605,8 @@ Now analyze the function and respond with JSON only.
                 "}\n"
             )
             merged = template
+            # Insert additional imports if any
+            merged = self._insert_imports_into_template(merged, required_imports)
             if preds_part:
                 merged += "\n\n" + preds_part
             merged += "\n\n" + uaf_agg
@@ -1459,6 +1623,8 @@ Now analyze the function and respond with JSON only.
                 "}\n"
             )
             merged = template
+            # Insert additional imports if any
+            merged = self._insert_imports_into_template(merged, required_imports)
             if preds_part:
                 merged += "\n\n" + preds_part
             merged += "\n\n" + leak_agg
@@ -1475,6 +1641,8 @@ Now analyze the function and respond with JSON only.
                 "}\n"
             )
             merged = template
+            # Insert additional imports if any
+            merged = self._insert_imports_into_template(merged, required_imports)
             if preds_part:
                 merged += "\n\n" + preds_part
             merged += "\n\n" + may_not_be_freed_agg
@@ -1499,12 +1667,20 @@ Now analyze the function and respond with JSON only.
         predicates_code = (block.get("predicates_code") or "").strip()
         use_expr = (block.get("use_expr") or "").strip()
         
+        # Collect required imports (use set to avoid duplicates)
+        required_imports: set[str] = set()
+        imports = block.get("required_imports", [])
+        if isinstance(imports, list):
+            for imp in imports:
+                if isinstance(imp, str) and imp.strip():
+                    required_imports.add(imp.strip())
+        
         if not predicates_code and not use_expr:
             # Empty block, nothing to validate
             return block
         
         # Build wrapper query for validation
-        wrapper_query = self._build_filter_wrapper_query(filter_type, predicates_code, use_expr)
+        wrapper_query = self._build_filter_wrapper_query(filter_type, predicates_code, use_expr, required_imports)
         
         # Log the full query being validated
         logger.info(
@@ -1538,11 +1714,29 @@ Now analyze the function and respond with JSON only.
         
         # Try to fix with LLM (up to 2 attempts)
         for attempt in range(2):
+            # Add specific guidance for memory_may_not_be_freed_filter errors
+            specific_guidance = ""
+            if filter_type == "memory_may_not_be_freed_filter":
+                if "ExprCfgNode" in error_msg or "DataFlow::node" in error_msg or "ControlFlowNode" in error_msg:
+                    specific_guidance = """
+
+**CRITICAL FIX GUIDANCE FOR memory_may_not_be_freed_filter:**
+The parameter `def` is a ControlFlowNode. To extract an expression from it, you MUST use:
+  e = def.(AnalysedExpr).getExpr()
+
+DO NOT use:
+  - def.(ExprCfgNode).getExpr()  [ExprCfgNode does not exist]
+  - DataFlow::node(def).asExpr()  [ControlFlowNode is not compatible with DataFlow::Node]
+  - def.getExpr()  [ControlFlowNode does not have getExpr() directly]
+
+If your code uses any of these incorrect patterns, replace them with def.(AnalysedExpr).getExpr().
+"""
+            
             fix_prompt = f"""You previously generated a CodeQL filter for the function '{func_name}' (filter type: {filter_type}), but it has a compilation error when inserted into the production template.
 
 **ERROR:**
 {error_msg}
-
+{specific_guidance}
 **CURRENT FILTER CODE:**
 ```codeql
 {predicates_code}
@@ -1576,8 +1770,8 @@ Return the corrected filter in JSON format:
                 logger.warning("LLM did not return corrected filter code in attempt %d/2", attempt + 1)
                 continue
             
-            # Rebuild wrapper and validate again
-            new_wrapper = self._build_filter_wrapper_query(filter_type, new_predicates, new_use_expr)
+            # Rebuild wrapper and validate again (preserve required_imports from original block)
+            new_wrapper = self._build_filter_wrapper_query(filter_type, new_predicates, new_use_expr, required_imports)
             
             # Log the fixed query being validated
             logger.info(

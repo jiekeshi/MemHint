@@ -1003,6 +1003,68 @@ class CodeQLAnalyzer:
     # Custom query writing (unchanged except: ignore entries that are "suppression-only")
     # -------------------------------------------------------------------------
 
+    def _insert_imports_into_template(self, template: str, required_imports: set[str]) -> str:
+        """
+        Insert additional imports into a CodeQL query template.
+        
+        Args:
+            template: The CodeQL query template string
+            required_imports: Set of import module paths (without 'import' keyword)
+        
+        Returns:
+            Template with imports inserted after existing imports
+        """
+        if not required_imports:
+            return template
+        
+        # Sort imports for consistent output
+        import_lines = sorted(required_imports)
+        additional_imports = "\n".join(f"import {imp}" for imp in import_lines)
+        
+        # Find the last import statement in the template
+        # Look for common import patterns
+        last_import_pos = -1
+        last_import_end = -1
+        
+        # Try to find the last import line
+        import_patterns = [
+            "import semmle.code.cpp.dataflow.new.DataFlow",
+            "import semmle.code.cpp.controlflow.StackVariableReachability",
+            "import MemoryFreed",
+            "import cpp",
+        ]
+        
+        for pattern in import_patterns:
+            pos = template.rfind(pattern)
+            if pos != -1:
+                # Find the end of this import line
+                end_pos = template.find("\n", pos)
+                if end_pos != -1:
+                    if pos > last_import_pos:
+                        last_import_pos = pos
+                        last_import_end = end_pos
+        
+        if last_import_pos != -1 and last_import_end != -1:
+            # Find the blank line after imports (if any)
+            blank_line_pos = template.find("\n\n", last_import_end)
+            if blank_line_pos != -1:
+                # Insert after the blank line
+                return (
+                    template[:blank_line_pos + 1] +
+                    additional_imports + "\n" +
+                    template[blank_line_pos + 1:]
+                )
+            else:
+                # No blank line, insert after the last import with a newline
+                return (
+                    template[:last_import_end] +
+                    "\n" + additional_imports + "\n" +
+                    template[last_import_end:]
+                )
+        
+        # Fallback: prepend imports (shouldn't happen with proper templates)
+        return additional_imports + "\n\n" + template
+
     def _write_custom_queries(self, custom_queries: CustomQuerySet) -> tuple[list[Path], list[Path]]:
         """
         Legacy method - no longer writes custom queries since query_code is removed.
@@ -1035,6 +1097,7 @@ class CodeQLAnalyzer:
         """
         predicates_snippets: list[str] = []
         use_exprs: list[str] = []
+        required_imports: set[str] = set()
 
         cq_json = custom_queries.to_json()
         for func_name, qinfo in (cq_json.get("queries") or {}).items():
@@ -1046,6 +1109,13 @@ class CodeQLAnalyzer:
 
             predicates_code = (df_block.get("predicates_code", "") or "").strip()
             use_expr = (df_block.get("use_expr", "") or "").strip()
+            
+            # Collect required imports (use set to avoid duplicates)
+            imports = df_block.get("required_imports", [])
+            if isinstance(imports, list):
+                for imp in imports:
+                    if isinstance(imp, str) and imp.strip():
+                        required_imports.add(imp.strip())
             
             # Skip if validation failed or block is empty
             validated = df_block.get("validated")
@@ -1073,6 +1143,8 @@ class CodeQLAnalyzer:
                 "}\n"
             )
             merged = ENHANCED_DOUBLE_FREE_FILTERED_TEMPLATE
+            # Insert additional imports if any
+            merged = self._insert_imports_into_template(merged, required_imports)
             if preds_part:
                 merged += "\n\n" + preds_part
             merged += "\n\n" + df_agg
@@ -1092,6 +1164,7 @@ class CodeQLAnalyzer:
         """
         predicates_snippets: list[str] = []
         use_exprs: list[str] = []
+        required_imports: set[str] = set()
 
         cq_json = custom_queries.to_json()
         for func_name, qinfo in (cq_json.get("queries") or {}).items():
@@ -1104,6 +1177,13 @@ class CodeQLAnalyzer:
 
             predicates_code = (leak_block.get("predicates_code", "") or "").strip()
             use_expr = (leak_block.get("use_expr", "") or "").strip()
+            
+            # Collect required imports (use set to avoid duplicates)
+            imports = leak_block.get("required_imports", [])
+            if isinstance(imports, list):
+                for imp in imports:
+                    if isinstance(imp, str) and imp.strip():
+                        required_imports.add(imp.strip())
             
             # Skip if validation failed or block is empty
             validated = leak_block.get("validated")
@@ -1129,6 +1209,9 @@ class CodeQLAnalyzer:
                 "}\n"
             )
             merged = ENHANCED_MEMORY_NEVER_FREED_FILTERED_TEMPLATE
+            # Insert additional imports if any
+            merged = self._insert_imports_into_template(merged, required_imports)
+            
             if preds_part:
                 merged += "\n\n" + preds_part
             merged += "\n\n" + leak_agg
@@ -1148,6 +1231,7 @@ class CodeQLAnalyzer:
         """
         predicates_snippets: list[str] = []
         use_exprs: list[str] = []
+        required_imports: set[str] = set()
 
         cq_json = custom_queries.to_json()
         for func_name, qinfo in (cq_json.get("queries") or {}).items():
@@ -1160,6 +1244,13 @@ class CodeQLAnalyzer:
 
             predicates_code = (leak_block.get("predicates_code", "") or "").strip()
             use_expr = (leak_block.get("use_expr", "") or "").strip()
+            
+            # Collect required imports (use set to avoid duplicates)
+            imports = leak_block.get("required_imports", [])
+            if isinstance(imports, list):
+                for imp in imports:
+                    if isinstance(imp, str) and imp.strip():
+                        required_imports.add(imp.strip())
             
             # Skip if validation failed or block is empty
             validated = leak_block.get("validated")
@@ -1185,6 +1276,9 @@ class CodeQLAnalyzer:
                 "}\n"
             )
             merged = ENHANCED_MEMORY_MAY_NOT_BE_FREED_FILTERED_TEMPLATE
+            # Insert additional imports if any
+            merged = self._insert_imports_into_template(merged, required_imports)
+            
             if preds_part:
                 merged += "\n\n" + preds_part
             merged += "\n\n" + leak_agg
@@ -1204,6 +1298,7 @@ class CodeQLAnalyzer:
         """
         predicates_snippets: list[str] = []
         use_exprs: list[str] = []
+        required_imports: set[str] = set()
 
         cq_json = custom_queries.to_json()
         for func_name, qinfo in (cq_json.get("queries") or {}).items():
@@ -1215,6 +1310,13 @@ class CodeQLAnalyzer:
 
             predicates_code = (uaf_block.get("predicates_code", "") or "").strip()
             use_expr = (uaf_block.get("use_expr", "") or "").strip()
+            
+            # Collect required imports (use set to avoid duplicates)
+            imports = uaf_block.get("required_imports", [])
+            if isinstance(imports, list):
+                for imp in imports:
+                    if isinstance(imp, str) and imp.strip():
+                        required_imports.add(imp.strip())
             
             # Skip if validation failed or block is empty
             validated = uaf_block.get("validated")
@@ -1240,6 +1342,8 @@ class CodeQLAnalyzer:
                 "}\n"
             )
             merged = ENHANCED_USE_AFTER_FREE_FILTERED_TEMPLATE
+            # Insert additional imports if any
+            merged = self._insert_imports_into_template(merged, required_imports)
             if preds_part:
                 merged += "\n\n" + preds_part
             merged += "\n\n" + uaf_agg
