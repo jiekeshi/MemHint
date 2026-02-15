@@ -91,13 +91,7 @@ class CodeParser:
         def _unwrap_typedef_declarator(decl_node):
             if decl_node is None:
                 return None
-            if decl_node.type == "parenthesized_declarator":
-                inner = decl_node.child_by_field_name("declarator")
-                return _unwrap_typedef_declarator(inner) if inner is not None else decl_node
-            if decl_node.type == "function_declarator":
-                inner = decl_node.child_by_field_name("declarator")
-                return _unwrap_typedef_declarator(inner) if inner is not None else decl_node
-            if decl_node.type == "init_declarator":
+            if decl_node.type == "parenthesized_declarator" or decl_node.type == "function_declarator":
                 inner = decl_node.child_by_field_name("declarator")
                 return _unwrap_typedef_declarator(inner) if inner is not None else decl_node
             return decl_node
