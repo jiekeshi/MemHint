@@ -85,16 +85,34 @@ class CodeParser:
         - typedef some_type *client;
         - typedef char* sds;              (IMPORTANT: '*' on type side, not declarator side)
         - typedef const char *cstring;
+        - typedef struct {} pointer1, *pointer2;  (multiple aliases in one typedef)
         - avoids false capture from function pointer typedef parameter names
         """
 
         def _unwrap_typedef_declarator(decl_node):
             if decl_node is None:
                 return None
-            if decl_node.type == "parenthesized_declarator" or decl_node.type == "function_declarator":
+            if decl_node.type in ("parenthesized_declarator", "function_declarator"):
                 inner = decl_node.child_by_field_name("declarator")
                 return _unwrap_typedef_declarator(inner) if inner is not None else decl_node
             return decl_node
+
+        def _iter_typedef_alias_declarators(type_def_node):
+            """
+            Yield all alias declarator nodes in this typedef:
+            - the main 'declarator' field (often the first alias)
+            - every init_declarator's declarator (covers comma-separated aliases)
+            """
+            main_decl = _unwrap_typedef_declarator(type_def_node.child_by_field_name("declarator"))
+            if main_decl is not None:
+                yield main_decl
+
+            # Case: typedef struct {} a, *b;
+            for child in type_def_node.children:
+                if child.type == "init_declarator":
+                    alias_decl = _unwrap_typedef_declarator(child.child_by_field_name("declarator"))
+                    if alias_decl is not None:
+                        yield alias_decl
 
         aliases: set[str] = set()
 
@@ -102,42 +120,30 @@ class CodeParser:
             if node.type != "type_definition":
                 continue
 
-            # The typedef's main declarator (authoritative; not inside parameter_list)
-            decl_field_raw = node.child_by_field_name("declarator")
-            decl_field = _unwrap_typedef_declarator(decl_field_raw)
-
-            # Try to get alias name even if it's not a pointer_declarator
-            alias_name = ""
-            if decl_field is not None:
-                alias_name = self._extract_declarator_name_only(decl_field, source)
-
-            pointer_decl = None
-            if decl_field is not None and decl_field.type == "pointer_declarator":
-                pointer_decl = decl_field
-
-            # Case B: typedef ... init_declarator;
-            if pointer_decl is None:
-                for child in node.children:
-                    if child.type == "init_declarator":
-                        alias_decl = child.child_by_field_name("declarator")
-                        alias_decl = _unwrap_typedef_declarator(alias_decl)
-                        if alias_decl is not None:
-                            if not alias_name:
-                                alias_name = self._extract_declarator_name_only(alias_decl, source)
-                            if alias_decl.type == "pointer_declarator":
-                                pointer_decl = alias_decl
-                        break
-
-            # (1) declarator-side pointer: definitely a pointer typedef
-            if pointer_decl is not None and alias_name:
-                aliases.add(alias_name)
+            # Collect all alias declarators in this typedef
+            alias_decls = list(_iter_typedef_alias_declarators(node))
+            if not alias_decls:
                 continue
 
-            # (2) type-side pointer: typedef char* sds; typedef const char *cstring;
-            #     if the "type" part contains '*', treat alias as pointer-like typedef
-            if alias_name and decl_field_raw is not None:
-                type_text = source[node.start_byte:decl_field_raw.start_byte].decode(errors="ignore")
-                if "*" in type_text:
+            # Compute base-type text ONCE: from typedef start to first declarator start.
+            # This avoids pollution by later comma-separated declarators (e.g., "*pointer2").
+            first_decl_start = min(d.start_byte for d in alias_decls)
+            base_type_text = source[node.start_byte:first_decl_start].decode(errors="ignore")
+
+            # For each alias, decide pointer-typedef or not
+            for decl in alias_decls:
+                alias_name = self._extract_declarator_name_only(decl, source)
+                if not alias_name:
+                    continue
+
+                # (1) declarator-side pointer: definitely a pointer typedef
+                if decl.type == "pointer_declarator":
+                    aliases.add(alias_name)
+                    continue
+
+                # (2) type-side pointer: typedef char* sds; typedef const char *cstring;
+                #     if base type contains '*', treat alias as pointer-like typedef
+                if "*" in base_type_text:
                     aliases.add(alias_name)
                     continue
 
@@ -751,9 +757,6 @@ class CodeParser:
             text = text.split("->")[-1]
         if "." in text:
             text = text.split(".")[-1]
-        # Handle qualified names: ns::func()
-        if "::" in text:
-            text = text.split("::")[-1]
         # Remove template arguments: func<T>()
         if "<" in text:
             text = text.split("<")[0]
