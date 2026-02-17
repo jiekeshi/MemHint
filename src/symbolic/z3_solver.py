@@ -1710,7 +1710,7 @@ class WarningValidator:
         return False
     
     def _dump_cfg(self, cfg: dict[int, CFGNode], func_name: str, alloc_line: int = -1, exit_line: int = -1):
-        logger.info("=== CFG dump for %s (nodes=%d) ===", func_name, len(cfg))
+        logger.debug("=== CFG dump for %s (nodes=%d) ===", func_name, len(cfg))
 
         # show node list
         for n in sorted(cfg.values(), key=lambda x: (x.line, x.id)):
@@ -1719,7 +1719,7 @@ class WarningValidator:
                 mark += " [ALLOC_LINE]"
             if exit_line > 0 and n.line == exit_line and n.node_type in (NodeType.RETURN, NodeType.EXIT):
                 mark += " [EXIT_LINE]"
-            logger.info(
+            logger.debug(
                 "id=%d line=%d type=%s preds=%s succs=%s%s | %s",
                 n.id, n.line, n.node_type.name,
                 n.predecessors, n.successors, mark,
@@ -1788,6 +1788,49 @@ class WarningValidator:
                 )
 
         return confirmed, filtered, unconfirmed
+    
+    def _add_single_path_encoding(
+        self,
+        solver: Solver,
+        cfg: dict[int, CFGNode],
+    ) -> tuple[dict[int, BoolRef], dict[tuple[int, int], BoolRef], CFGNode]:
+        """
+        Enforce a single modeled path through the CFG:
+        - For each node, choose at most one incoming edge (AtMost).
+        - reach[node] iff some chosen incoming edge reaches it (except ENTRY).
+        """
+        reach = {n.id: Bool(f"reach_{n.id}") for n in cfg.values()}
+        entry = next(n for n in cfg.values() if n.node_type == NodeType.ENTRY)
+        solver.add(reach[entry.id] == True)
+
+        edge: dict[tuple[int, int], BoolRef] = {}
+        for n in cfg.values():
+            for p in n.predecessors:
+                edge[(p, n.id)] = Bool(f"edge_{p}_{n.id}")
+
+        for node in cfg.values():
+            if node.id == entry.id:
+                continue
+
+            preds = node.predecessors
+            if not preds:
+                solver.add(reach[node.id] == False)
+                continue
+
+            incoming = [edge[(p, node.id)] for p in preds]
+
+            # <= 1 predecessor chosen into this node on the modeled path
+            solver.add(AtMost(*incoming, 1))
+
+            # if chosen, predecessor must be reachable
+            for p in preds:
+                solver.add(Implies(edge[(p, node.id)], reach[p]))
+
+            # node reachable iff some incoming edge chosen
+            solver.add(reach[node.id] == Or(*incoming))
+
+        return reach, edge, entry
+
 
     def _check_feasibility(
         self,
@@ -1815,11 +1858,11 @@ class WarningValidator:
             logger.info(f"dump")    
             self._dump_cfg(cfg, warning.function_name, alloc_line, exit_line)
 
-            if warning.issue_type == MemoryIssueType.MEMORY_LEAK:
+            if warning.issue_type == MemoryIssueType.MEMORY_LEAK or warning.issue_type == MemoryIssueType.MEMORY_LEAK_FILTERED:
                 return self._check_leak_feasibility(cfg, warning)
-            elif warning.issue_type == MemoryIssueType.DOUBLE_FREE:
+            elif warning.issue_type == MemoryIssueType.DOUBLE_FREE or warning.issue_type == MemoryIssueType.DOUBLE_FREE_FILTERED:
                 return self._check_double_free_feasibility(cfg, warning)
-            elif warning.issue_type == MemoryIssueType.USE_AFTER_FREE:
+            elif warning.issue_type == MemoryIssueType.USE_AFTER_FREE or warning.issue_type == MemoryIssueType.USE_AFTER_FREE_FILTERED:
                 return self._check_uaf_feasibility(cfg, warning)
             else:
                 return PathFeasibilityResult(is_feasible=False, reason="unsupported bug type in validator")
@@ -2093,9 +2136,9 @@ class WarningValidator:
 
     def _check_double_free_feasibility(
         self,
-            cfg: dict[int, CFGNode],
-            warning: Warning,
-        ) -> PathFeasibilityResult:
+        cfg: dict[int, CFGNode],
+        warning: Warning,
+    ) -> PathFeasibilityResult:
         """Check if double-free is feasible (per-object expression).
 
         Double-free is feasible iff there exists a reachable FREE(obj) such that
@@ -2107,7 +2150,6 @@ class WarningValidator:
         """
         solver = Solver()
 
-        # Use full expression identity
         free_nodes = [n for n in cfg.values() if n.node_type == NodeType.FREE and (n.obj or "").strip()]
         if len(free_nodes) < 2:
             return PathFeasibilityResult(is_feasible=False, reason="less than 2 free calls")
@@ -2116,22 +2158,16 @@ class WarningValidator:
         if not objs_freed:
             return PathFeasibilityResult(is_feasible=False, reason="no free object extracted")
 
-        # Reachability boolean per node
-        reach = {n.id: Bool(f"reach_{n.id}") for n in cfg.values()}
-        entry = next(n for n in cfg.values() if n.node_type == NodeType.ENTRY)
-        solver.add(reach[entry.id] == True)
+        # --- NEW: single-path encoding (AtMost) ---
+        reach, edge, entry = self._add_single_path_encoding(solver, cfg)
 
-        # Reachability propagation
-        for node in cfg.values():
-            if node.node_type == NodeType.ENTRY:
-                continue
-            preds = node.predecessors
-            if preds:
-                solver.add(reach[node.id] == Or(*[reach[p] for p in preds]))
-            else:
-                solver.add(reach[node.id] == False)
+        # Optional: enforce CodeQL trace reachability like leak (recommended)
+        trace_lines = self._parse_trace_lines(warning)
+        for tl in trace_lines:
+            matching = [n for n in cfg.values() if n.line == tl]
+            if matching:
+                solver.add(Or(*[reach[n.id] for n in matching]))
 
-        # Per-object "freed already before this node" and "freed up to this node"
         freed_in: dict[str, dict[int, BoolRef]] = {}
         freed: dict[str, dict[int, BoolRef]] = {}
 
@@ -2142,35 +2178,33 @@ class WarningValidator:
             solver.add(freed_in[o][entry.id] == False)
             solver.add(freed[o][entry.id] == False)
 
-        # Propagate + event updates
         for node in cfg.values():
-            if node.node_type == NodeType.ENTRY:
+            if node.id == entry.id:
                 continue
 
             preds = node.predecessors
-
-            for o in objs_freed:
-                # freed_in[o][node] = OR freed[o][pred]
-                if preds:
-                    solver.add(freed_in[o][node.id] == Or(*[freed[o][p] for p in preds]))
-                else:
+            if not preds:
+                for o in objs_freed:
                     solver.add(freed_in[o][node.id] == False)
+                    solver.add(freed[o][node.id] == False)
+                continue
 
-                # If this node frees o on a reachable path, then freed[o] becomes true
+            # propagate ONLY from the chosen predecessor edge
+            for o in objs_freed:
+                freed_from = Or(*[And(edge[(p, node.id)], freed[o][p]) for p in preds])
+                solver.add(freed_in[o][node.id] == freed_from)
+
+                # If this node frees o, update freed[o] on this path
                 if node.node_type == NodeType.FREE and (node.obj or "").strip() == o:
-                    # freed[o][node] = freed_in[o][node] OR reach[node]
                     solver.add(freed[o][node.id] == Or(freed_in[o][node.id], reach[node.id]))
                 else:
                     solver.add(freed[o][node.id] == freed_in[o][node.id])
 
-        # Double-free exists if there is a FREE(o) node where freed_in[o] is already true
+        # Double-free exists if there is a FREE(o) node where o was already freed on that same path
         df_conditions = []
         for node in free_nodes:
             o = (node.obj or "").strip()
             df_conditions.append(And(reach[node.id], freed_in[o][node.id]))
-
-        if not df_conditions:
-            return PathFeasibilityResult(is_feasible=False, reason="no candidate double-free nodes")
 
         solver.add(Or(*df_conditions))
 
@@ -2178,7 +2212,7 @@ class WarningValidator:
         if result == sat:
             return PathFeasibilityResult(is_feasible=True, reason="double-free path exists")
         return PathFeasibilityResult(is_feasible=False, reason="no reachable double-free")
-    
+
     def _check_uaf_feasibility(
         self,
         cfg: dict[int, CFGNode],
@@ -2208,21 +2242,16 @@ class WarningValidator:
         if not objs_of_interest:
             return PathFeasibilityResult(is_feasible=False, reason="no objects extracted")
 
-        reach = {n.id: Bool(f"reach_{n.id}") for n in cfg.values()}
-        entry = next(n for n in cfg.values() if n.node_type == NodeType.ENTRY)
-        solver.add(reach[entry.id] == True)
+        # --- NEW: single-path encoding (AtMost) ---
+        reach, edge, entry = self._add_single_path_encoding(solver, cfg)
 
-        # Reachability propagation
-        for node in cfg.values():
-            if node.node_type == NodeType.ENTRY:
-                continue
-            preds = node.predecessors
-            if preds:
-                solver.add(reach[node.id] == Or(*[reach[p] for p in preds]))
-            else:
-                solver.add(reach[node.id] == False)
+        # Optional: enforce CodeQL trace reachability like leak (recommended)
+        trace_lines = self._parse_trace_lines(warning)
+        for tl in trace_lines:
+            matching = [n for n in cfg.values() if n.line == tl]
+            if matching:
+                solver.add(Or(*[reach[n.id] for n in matching]))
 
-        # Track freed status per object
         freed_in: dict[str, dict[int, BoolRef]] = {}
         freed: dict[str, dict[int, BoolRef]] = {}
 
@@ -2234,25 +2263,26 @@ class WarningValidator:
             solver.add(freed[o][entry.id] == False)
 
         for node in cfg.values():
-            if node.node_type == NodeType.ENTRY:
+            if node.id == entry.id:
                 continue
 
             preds = node.predecessors
+            if not preds:
+                for o in objs_of_interest:
+                    solver.add(freed_in[o][node.id] == False)
+                    solver.add(freed[o][node.id] == False)
+                continue
 
             for o in objs_of_interest:
-                # freed_in[o][node] = OR freed[o][pred]
-                if preds:
-                    solver.add(freed_in[o][node.id] == Or(*[freed[o][p] for p in preds]))
-                else:
-                    solver.add(freed_in[o][node.id] == False)
+                freed_from = Or(*[And(edge[(p, node.id)], freed[o][p]) for p in preds])
+                solver.add(freed_in[o][node.id] == freed_from)
 
-                # FREE(o) makes freed[o] true
                 if node.node_type == NodeType.FREE and (node.obj or "").strip() == o:
                     solver.add(freed[o][node.id] == Or(freed_in[o][node.id], reach[node.id]))
                 else:
                     solver.add(freed[o][node.id] == freed_in[o][node.id])
 
-        # UAF exists if DEREF(o) reachable AND o was freed before
+        # UAF exists if DEREF(o) reachable AND o was freed before on the same modeled path
         uaf_conditions = []
         for node in deref_nodes:
             o = (node.obj or "").strip()
@@ -2264,4 +2294,3 @@ class WarningValidator:
         if result == sat:
             return PathFeasibilityResult(is_feasible=True, reason="uaf path exists")
         return PathFeasibilityResult(is_feasible=False, reason="no reachable use-after-free")
-
