@@ -1691,7 +1691,10 @@ Now analyze the function and respond with JSON only.
         )
         
         # Validate the wrapper query
-        is_valid, error_msg = self._validate_codeql_query(wrapper_query)
+        if self.codeql_validator:
+            is_valid, error_msg = self.codeql_validator.validate_query(wrapper_query)
+        else:
+            is_valid, error_msg = False, "No CodeQL validator available - cannot validate query"
         
         if is_valid:
             logger.info(
@@ -1712,8 +1715,8 @@ Now analyze the function and respond with JSON only.
             error_msg[:200]
         )
         
-        # Try to fix with LLM (up to 2 attempts)
-        for attempt in range(2):
+        # Try to fix with LLM (up to 3 attempts)
+        for attempt in range(3):
             # Add specific guidance for memory_may_not_be_freed_filter errors
             specific_guidance = ""
             if filter_type == "memory_may_not_be_freed_filter":
@@ -1767,7 +1770,7 @@ Return the corrected filter in JSON format:
             new_use_expr = (content.get("use_expr") or use_expr).strip()
             
             if not new_predicates and not new_use_expr:
-                logger.warning("LLM did not return corrected filter code in attempt %d/2", attempt + 1)
+                logger.warning("LLM did not return corrected filter code in attempt %d/3", attempt + 1)
                 continue
             
             # Rebuild wrapper and validate again (preserve required_imports from original block)
@@ -1775,14 +1778,17 @@ Return the corrected filter in JSON format:
             
             # Log the fixed query being validated
             logger.info(
-                "Validating fixed filter block '%s' for '%s' (attempt %d/2) with merged query:\n%s",
+                "Validating fixed filter block '%s' for '%s' (attempt %d/3) with merged query:\n%s",
                 filter_type,
                 func_name,
                 attempt + 1,
                 new_wrapper
             )
             
-            is_valid, error_msg = self._validate_codeql_query(new_wrapper)
+            if self.codeql_validator:
+                is_valid, error_msg = self.codeql_validator.validate_query(new_wrapper)
+            else:
+                is_valid, error_msg = False, "No CodeQL validator available - cannot validate query"
             
             if is_valid:
                 logger.info(
@@ -1799,7 +1805,7 @@ Return the corrected filter in JSON format:
                 }
             
             logger.warning(
-                "Fix attempt %d/2 for '%s' still has error: %s",
+                "Fix attempt %d/3 for '%s' still has error: %s",
                 attempt + 1,
                 filter_type,
                 error_msg[:200]
@@ -1807,7 +1813,7 @@ Return the corrected filter in JSON format:
         
         # All attempts failed
         logger.error(
-            "Failed to fix filter block '%s' for '%s' after 3 attempts. Last error: %s",
+            "Failed to fix filter block '%s' for '%s' after 3 fix attempts. Last error: %s",
             filter_type,
             func_name,
             error_msg[:200]
@@ -1815,7 +1821,7 @@ Return the corrected filter in JSON format:
         return {
             **block,
             "validated": False,
-            "validation_error": f"Validation failed after 3 attempts: {error_msg[:200]}",
+            "validation_error": f"Validation failed after 3 fix attempts: {error_msg[:200]}",
         }
     
     # -------------------------------------------------------------------------
@@ -1867,20 +1873,6 @@ Return the corrected filter in JSON format:
         
         return True, ""
     
-    def _validate_codeql_query(self, query_code: str) -> Tuple[bool, str]:
-        """
-        Validate the query using the CodeQL validator if available.
-        
-        Returns:
-            Tuple of (is_valid, error_message)
-        """
-        if not self.codeql_validator:
-            # No validator configured -> perform enhanced quick validation
-            # This catches common CodeQL syntax errors that quick lint misses
-            return self._enhanced_quick_validation(query_code)
-        
-        return self.codeql_validator.validate_query(query_code)
-    
     @staticmethod
     def create_codeql_validator(codeql_binary: str = "codeql", codeql_dir: Path | None = None) -> Optional[Any]:
         """
@@ -1898,88 +1890,6 @@ Return the corrected filter in JSON format:
         except Exception as e:
             logger.warning(f"Failed to create CodeQL validator: {e}")
             return None
-    
-    def _enhanced_quick_validation(self, query_code: str) -> Tuple[bool, str]:
-        """
-        Enhanced validation that catches common CodeQL syntax errors when
-        no full validator is available.
-        
-        This addresses the issue where validation was completely skipped when
-        codeql_validator was None. Previously, _validate_codeql_query would
-        return True, "" without any checks, allowing invalid queries to pass.
-        
-        This enhanced validation catches:
-        - hasGlobalOrInstantiatedName() misuse on Function type
-        - Common method name errors (getFunctionName, getMethodName)
-        - Incorrect FunctionCall usage (calling methods directly instead of via getTarget())
-        - Missing imports
-        
-        Note: This is better than nothing, but a real CodeQL validator that
-        can compile queries is preferred for comprehensive validation.
-        """
-        # Check for common CodeQL API misuse patterns
-        # Pattern 1: hasGlobalOrInstantiatedName on wrong type
-        # This method doesn't exist on Function, only on Variable, etc.
-        if "hasGlobalOrInstantiatedName" in query_code:
-            # Check if it's being called on Function (common mistake)
-            lines = query_code.split('\n')
-            for i, line in enumerate(lines, 1):
-                if "hasGlobalOrInstantiatedName" in line and ("Function" in line or ".getTarget()" in line):
-                    return False, (
-                        f"Line {i}: hasGlobalOrInstantiatedName() cannot be used on Function type. "
-                        "Use getName() or getQualifiedName() instead. "
-                        "Example: call.getTarget().getName() = \"function_name\""
-                    )
-        
-        # Pattern 1b: hasGlobalOrStdName might not exist on Function either
-        # Check if it's being used incorrectly
-        if "hasGlobalOrStdName" in query_code:
-            lines = query_code.split('\n')
-            for i, line in enumerate(lines, 1):
-                if "hasGlobalOrStdName" in line and (".getTarget()" in line or "Function" in line):
-                    # This might be valid, but if it fails, suggest alternatives
-                    # We'll let it pass here but note it might need getName() instead
-                    pass  # Allow it, but the actual CodeQL compiler will catch if invalid
-        
-        # Pattern 2: Common method name errors
-        method_errors = {
-            "getFunctionName()": "Function doesn't have getFunctionName(). Use getName() or getQualifiedName()",
-            "getMethodName()": "Function doesn't have getMethodName(). Use getName() or getQualifiedName()",
-        }
-        for bad_method, suggestion in method_errors.items():
-            if bad_method in query_code:
-                return False, f"Invalid method: {bad_method}. {suggestion}"
-        
-        # Pattern 3: Check for proper FunctionCall usage
-        # If using FunctionCall, should use getTarget() to get Function
-        if "FunctionCall" in query_code and "getTarget()" not in query_code:
-            # This might be okay, but warn if they're trying to call methods directly
-            if ".getName()" in query_code or ".getQualifiedName()" in query_code:
-                # Check if it's being called on FunctionCall directly (wrong)
-                lines = query_code.split('\n')
-                for i, line in enumerate(lines, 1):
-                    if "FunctionCall" in line and any(m in line for m in [".getName()", ".getQualifiedName()"]):
-                        if "getTarget()" not in line:
-                            return False, (
-                                f"Line {i}: Cannot call getName()/getQualifiedName() directly on FunctionCall. "
-                                "Use call.getTarget().getName() instead."
-                            )
-        
-        # Pattern 4: Check for proper Literal usage
-        # getValue() returns a string, should compare with strings
-        if "Literal" in query_code and "getValue()" in query_code:
-            # Check if comparing with non-string (common mistake)
-            if "getValue() != " in query_code or "getValue() = " in query_code:
-                # This is usually okay, but check for obvious type mismatches
-                pass  # Hard to detect without full parsing
-        
-        # Pattern 5: Check for missing imports that are commonly needed
-        # If using certain types, need specific imports
-        if "FunctionCall" in query_code and "import cpp" not in query_code:
-            return False, "Missing 'import cpp' - required for FunctionCall"
-        
-        # All checks passed
-        return True, ""
     
     # -------------------------------------------------------------------------
     # Cost tracking
