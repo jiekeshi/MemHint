@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from src.core.models import FunctionInfo
+
 logger = logging.getLogger(__name__)
 
 # Lazy initialization of parsers
@@ -37,22 +39,6 @@ def _get_cpp_parser():
         from tree_sitter import Language, Parser
         _cpp_parser = Parser(Language(tscpp.language()))
     return _cpp_parser
-
-
-@dataclass
-class FunctionInfo:
-    """Function information extracted from source code."""
-    name: str
-    code: str
-    file_path: str = ""
-    start_line: int = 0
-    end_line: int = 0
-    return_type: str = ""
-    arg_names: list[str] = field(default_factory=list)
-    arg_types: list[str] = field(default_factory=list)
-    callees: set[str] = field(default_factory=set)
-    callers: set[str] = field(default_factory=set)
-    return_expressions: set[str] = field(default_factory=set)
 
 
 @dataclass
