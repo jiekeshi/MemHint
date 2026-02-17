@@ -171,6 +171,27 @@ class LLMClient:
                 "GOOGLE_APPLICATION_CREDENTIALS must point to a service account JSON file."
             )
         
+        # Initialize Vertex AI once during initialization for better performance
+        if VERTEX_AI_AVAILABLE:
+            project_id = self.explicit_project
+            if not project_id:
+                try:
+                    with open(self.credentials_path, "r", encoding="utf-8") as f:
+                        creds_data = json.load(f)
+                    project_id = creds_data.get("project_id")
+                except Exception as exc:
+                    raise ValueError(
+                        f"Failed to read project_id from service account file: {exc}"
+                    ) from exc
+            
+            if not project_id:
+                raise ValueError("GCP project_id not found. Set GOOGLE_CLOUD_PROJECT or include in key.")
+            
+            vertexai.init(project=project_id, location=self.location)
+            self.model = GenerativeModel(self.model_name)
+        else:
+            self.model = None
+        
         # Cost tracking
         # Pricing per million tokens (approximate, update based on actual Gemini pricing)
         # Default pricing for Gemini models (adjust as needed)
@@ -210,33 +231,12 @@ class LLMClient:
                 "Install it with: pip install google-cloud-aiplatform>=1.38"
             )
 
-        if not os.path.exists(self.credentials_path):
-            raise FileNotFoundError(
-                f"Service account key file not found: {self.credentials_path}\n"
-                "Please check the path and try again."
-            )
-
-        project_id = self.explicit_project
-        if not project_id:
-            try:
-                with open(self.credentials_path, "r", encoding="utf-8") as f:
-                    creds_data = json.load(f)
-                project_id = creds_data.get("project_id")
-            except Exception as exc:  # pragma: no cover
-                raise ValueError(
-                    f"Failed to read project_id from service account file: {exc}"
-                ) from exc
-
-        if not project_id:
-            raise ValueError("GCP project_id not found. Set GOOGLE_CLOUD_PROJECT or include in key.")
-
-        # Initialize Vertex AI for every call to ensure fresh config if env changes.
-        vertexai.init(project=project_id, location=self.location)
-        model = GenerativeModel(self.model_name)
+        if not self.model:
+            raise RuntimeError("Vertex AI model not initialized. Check initialization errors.")
 
         for attempt in range(self.max_retries):
             try:
-                response = model.generate_content(
+                response = self.model.generate_content(
                     prompt,
                     generation_config={
                         "response_mime_type": "application/json",
