@@ -489,7 +489,7 @@ class CodeParser:
                     return_type = tr
                 break
 
-        name, arg_names, arg_types = self._parse_declarator(declarator_node, source)
+        name, arg_names, arg_types = self._parse_declarator(declarator_node, source, node, source)
         if not name:
             return None
 
@@ -523,13 +523,19 @@ class CodeParser:
         )
 
 
-    def _parse_declarator(self, node, source: bytes) -> tuple[str, list[str], list[str]]:
+    def _parse_declarator(self, node, source: bytes, function_node=None, full_source: bytes=None) -> tuple[str, list[str], list[str]]:
         """Parse declarator to extract function name and parameters.
 
         Handles:
         - function_declarator: foo(int x, char* y)
         - pointer_declarator: *foo(int x) for pointer return
         - reference_declarator: &foo() for reference return (rare)
+        
+        Args:
+            node: The declarator node
+            source: Source bytes for the declarator region
+            function_node: The full function_definition node (for getting class context)
+            full_source: Full source bytes (for getting class context)
         """
         # Unwrap pointer/reference declarators to find function_declarator
         func_decl = self._find_function_declarator(node)
@@ -538,17 +544,28 @@ class CodeParser:
 
         # Extract function name (first identifier in function_declarator)
         name = ""
+        is_field_identifier = False
         for child in func_decl.children:
             if child.type == "identifier":
                 name = source[child.start_byte:child.end_byte].decode()
                 break
             elif child.type in ("field_identifier", "destructor_name"):
+                # For C++ member functions defined inside class, field_identifier only contains method name
+                # We need to check if this is inside a class and get the class name
                 name = source[child.start_byte:child.end_byte].decode()
+                is_field_identifier = True
                 break
             elif child.type == "scoped_identifier":
-                # Class::method - extract method name
+                # Class::method - extract full qualified name (Class::method)
                 name = source[child.start_byte:child.end_byte].decode()
                 break
+
+        # If we got a field_identifier (class member function), try to get the class name
+        if is_field_identifier and function_node is not None and full_source is not None:
+            class_name = self._get_containing_class_name(function_node, full_source)
+            if class_name:
+                # Prepend class name to create qualified name: Class::method
+                name = f"{class_name}::{name}"
 
         # Extract parameters from parameter_list
         arg_names = []
@@ -771,6 +788,31 @@ class CodeParser:
             if child.type not in ("return", ";"):
                 return source[child.start_byte:child.end_byte].decode().strip()
         return ""
+
+    def _get_containing_class_name(self, node, source: bytes) -> Optional[str]:
+        """Get the name of the class that contains this function definition.
+        
+        Walks up the AST from the function_definition node to find the containing
+        class_specifier or struct_specifier.
+        
+        Args:
+            node: The function_definition node
+            source: Full source bytes
+            
+        Returns:
+            Class name if found, None otherwise
+        """
+        current = node.parent
+        while current is not None:
+            if current.type in ("class_specifier", "struct_specifier"):
+                # Find the class name (usually the first type_identifier child)
+                for child in current.children:
+                    if child.type == "type_identifier":
+                        return source[child.start_byte:child.end_byte].decode()
+                # If no type_identifier, might be anonymous or have a different structure
+                break
+            current = current.parent
+        return None
 
     def _extract_macro(self, node, source: bytes, file_path: str) -> Optional[MacroInfo]:
         """Extract MacroInfo from a preproc_def or preproc_function_def node.
