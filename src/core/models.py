@@ -47,6 +47,7 @@ class MemoryIssueType(Enum):
     MEMORY_LEAK_FILTERED = auto() # Allocated memory never freed with a filtered condition
     USE_AFTER_FREE_FILTERED = auto() # Accessing freed memory with a filtered condition
     DOUBLE_FREE_FILTERED = auto() # Freeing already freed memory with a filtered condition
+    OTHER = auto()              # Non-memory-safety issues (e.g., uninitialized values, null dereference, etc.)
 
 
 # Mapping: Which hints help detect which bugs

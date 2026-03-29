@@ -27,7 +27,7 @@ from src.core.models import (
 from src.tree_sitter_parser import CodeParser
 from src.llm_client import HintGenerator, LLMClient, CustomQueryGenerator
 from src.symbolic.z3_solver import HintValidator, WarningValidator
-from src.analyzer.adapters import CodeQLAnalyzer
+from src.analyzer.adapters import CodeQLAnalyzer, InferAnalyzer
 
 logger = logging.getLogger(__name__)
 
@@ -73,9 +73,16 @@ class Pipeline:
         self.hint_generator = HintGenerator(self.llm_client)
         self.hint_validator = HintValidator()
         self.warning_validator = None  # Initialized with known allocators
-        self.analyzer = CodeQLAnalyzer(codeql_dir=codeql_dir, cpp_queries_dir=cpp_queries_dir, reuse_db=reuse_db)
+        
+        # Select analyzer based on analyzer_type
+        if analyzer_type == "infer":
+            self.analyzer = InferAnalyzer(reuse_db=reuse_db)
+        else:
+            # Default to CodeQL
+            self.analyzer = CodeQLAnalyzer(codeql_dir=codeql_dir, cpp_queries_dir=cpp_queries_dir, reuse_db=reuse_db)
 
         # Configuration
+        self.analyzer_type = analyzer_type
         self.use_merge = use_merge
         self.skip_hint_injection = skip_hint_injection
         self.use_enhanced_queries = use_enhanced_queries
@@ -476,16 +483,29 @@ class Pipeline:
             # Export empty cost file
             self._export_costs(output_dir)
         else:
-            # Check for cached hints
-            hints_file = output_dir / "hints.json"
-            if hints_file.exists():
+            # Check for cached hints with fallback logic:
+            # 1. First check current analyzer's output directory
+            # 2. If Infer and not found, copy from CodeQL's equivalent directory
+            current_hints_file = output_dir / "hints.json"
+            hints_file = self._find_hints_file(output_dir)
+            
+            if hints_file and hints_file.exists():
                 logger.info(f"  Loading cached hints from {hints_file}")
                 self.hints = self._load_hints(hints_file)
+                
+                # If hints were loaded from CodeQL directory, copy them to current directory
+                if hints_file != current_hints_file:
+                    logger.info(f"  Copying hints from CodeQL directory to current directory: {current_hints_file}")
+                    import shutil
+                    shutil.copy2(hints_file, current_hints_file)
+                
                 # Count validated hints from cached hints (approximate - all cached hints are considered validated)
                 self.validated_hints_count = sum(len(hints) for hints in self.hints.hints.values())
                 
-                # Try to load cached custom queries
-                custom_queries_file = output_dir / "custom_queries.json"
+                # Try to load cached custom queries (analyzer-specific)
+                # Custom queries are analyzer-specific, so use analyzer-specific filename
+                analyzer_suffix = f"_{self.analyzer_type}" if self.analyzer_type != "codeql" else ""
+                custom_queries_file = output_dir / f"custom_queries{analyzer_suffix}.json"
                 if custom_queries_file.exists():
                     logger.info(f"  Loading cached custom queries from {custom_queries_file}")
                     self.custom_queries = self._load_custom_queries(custom_queries_file)
@@ -493,14 +513,13 @@ class Pipeline:
                     if len(self.custom_queries) > 0:
                         logger.info(f"  Special functions: {', '.join(sorted(self.custom_queries.queries.keys()))}")
                 else:
-                    # Custom queries not cached, generate them from validated hints
-                    logger.info(f"  Custom queries not cached, generating from validated hints...")
+                    # Custom queries not cached, generate them from validated hints (analyzer-specific)
+                    logger.info(f"  Custom queries not cached, generating from validated hints for {self.analyzer_type}...")
                     self.custom_queries = self._generate_custom_queries_iteratively(
                         self.functions,
                         self.hints,
                     )
-                    # Save generated custom queries
-                    custom_queries_file = output_dir / "custom_queries.json"
+                    # Save generated custom queries with analyzer-specific filename
                     self._save_custom_queries(custom_queries_file)
                 
                 # Export cost file (will show zeros since no LLM calls were made)
@@ -610,13 +629,15 @@ class Pipeline:
 
                 self.conflicts.extend(all_conflicts)
 
-                # Save validated hints
-                self._save_hints(hints_file)
+                # Save validated hints to current output directory (even if loaded from CodeQL directory)
+                current_hints_file = output_dir / "hints.json"
+                self._save_hints(current_hints_file)
                 
                 # =================================================================
                 # Phase 2b: Generate custom queries for special functions (after Z3 validation)
+                # Note: Custom queries are analyzer-specific (CodeQL queries vs Infer models)
                 # =================================================================
-                logger.info("Phase 2b: Generating custom queries for validated hints (one by one)...")
+                logger.info(f"Phase 2b: Generating custom queries for {self.analyzer_type} (one by one)...")
                 self.custom_queries = self._generate_custom_queries_iteratively(
                     self.functions,
                     self.hints,
@@ -625,38 +646,53 @@ class Pipeline:
                 if len(self.custom_queries) > 0:
                     logger.info(f"  Special functions: {', '.join(sorted(self.custom_queries.queries.keys()))}")
                 
-                # Save custom queries
-                custom_queries_file = output_dir / "custom_queries.json"
+                # Save custom queries with analyzer-specific filename
+                analyzer_suffix = f"_{self.analyzer_type}" if self.analyzer_type != "codeql" else ""
+                custom_queries_file = output_dir / f"custom_queries{analyzer_suffix}.json"
                 self._save_custom_queries(custom_queries_file)
                 
                 # Export cost information right after hint generation completes
                 self._export_costs(output_dir)
 
         # =====================================================================
-        # Phase 4: CodeQL analysis with hints and custom queries
+        # Phase 4: Static analysis with hints and custom queries
         # =====================================================================
-        logger.info("Phase 4: Running CodeQL with hint-based models and custom queries...")
+        analyzer_name = "Infer" if self.analyzer_type == "infer" else "CodeQL"
+        logger.info(f"Phase 4: Running {analyzer_name} with hint-based models and custom queries...")
 
-        # 所有函数（包括 special 的）都注入 allocator/deallocator 模型，
-        # special 函数额外还有它们自己的 custom queries。
-        hints_for_codeql = self.hints
+        # Hints are SHARED between analyzers (same LLM-generated memory semantics)
+        # Custom queries are analyzer-specific (CodeQL queries vs Infer models)
+        # All functions (including special ones) get allocator/deallocator models from hints
+        # Special functions additionally get analyzer-specific custom queries
+        hints_for_analyzer = self.hints
 
-        # Run CodeQL with custom queries if available
+        # Run analyzer with shared hints and analyzer-specific custom queries
         warnings = self.analyzer.analyze(
             project_path,
-            hints_for_codeql,
+            hints_for_analyzer,  # Shared hints (same for CodeQL and Infer)
             self.issue_types,
             use_enhanced_queries=self.use_enhanced_queries,
-            custom_queries=self.custom_queries if hasattr(self, 'custom_queries') else None,
+            custom_queries=self.custom_queries if hasattr(self, 'custom_queries') else None,  # Analyzer-specific
         )
-        logger.info(f"  CodeQL found {len(warnings)} warnings")
+        logger.info(f"  {analyzer_name} found {len(warnings)} warnings")
 
-        warning_dump_path = output_dir / "codeql_warnings.json"
+        analyzer_lower = analyzer_name.lower()
+        warning_dump_path = output_dir / f"{analyzer_lower}_warnings.json"
 
         with open(warning_dump_path, "w") as f:
             json.dump([w.to_dict() for w in warnings], f, indent=2)
 
-        logger.info(f"  Saved CodeQL warnings to {warning_dump_path}")
+        logger.info(f"  Saved {analyzer_name} warnings to {warning_dump_path}")
+        
+        # Get and save irrelevant warnings from Infer immediately (non-memory-safety issues)
+        # This happens right after parsing, same as the main warnings file
+        if self.analyzer_type == "infer" and hasattr(self.analyzer, 'get_irrelevant_warnings'):
+            irrelevant_warnings = self.analyzer.get_irrelevant_warnings()
+            if irrelevant_warnings:
+                irrelevant_path = output_dir / f"{analyzer_lower}_irrelevant_warnings.json"
+                with open(irrelevant_path, "w") as f:
+                    json.dump([w.to_dict() for w in irrelevant_warnings], f, indent=2)
+                logger.info(f"  Saved {len(irrelevant_warnings)} non-memory-safety warnings to {irrelevant_path} (saved immediately after parsing)")
 
 
         # =====================================================================
@@ -700,6 +736,54 @@ class Pipeline:
             spurious_filtered=len(filtered_warnings),
         )
 
+    def _find_hints_file(self, output_dir: Path) -> Path | None:
+        """Find hints.json file with fallback logic.
+        
+        For Infer: checks its own directory first, then falls back to CodeQL's equivalent directory.
+        For CodeQL: checks its own directory only.
+        
+        Args:
+            output_dir: Current analyzer's output directory
+            
+        Returns:
+            Path to hints.json if found, None otherwise
+        """
+        # First, check current analyzer's output directory
+        hints_file = output_dir / "hints.json"
+        if hints_file.exists():
+            return hints_file
+        
+        # If using Infer and hints not found, try to find CodeQL's equivalent directory
+        if self.analyzer_type == "infer":
+            # Infer output dirs typically have "_infer" suffix
+            # Try to find the CodeQL equivalent by removing "_infer" suffix
+            output_str = str(output_dir)
+            if "_infer" in output_str:
+                # Replace "_infer" with empty string to get CodeQL equivalent
+                codeql_output_str = output_str.replace("_infer", "")
+                codeql_output_dir = Path(codeql_output_str)
+                codeql_hints_file = codeql_output_dir / "hints.json"
+                if codeql_hints_file.exists():
+                    logger.info(f"  Hints not found in Infer directory ({output_dir}), checking CodeQL equivalent: {codeql_hints_file}")
+                    return codeql_hints_file
+                else:
+                    logger.debug(f"  CodeQL equivalent directory not found: {codeql_output_dir}")
+            
+            # Also try looking in parent directory for sibling CodeQL directories
+            parent_dir = output_dir.parent
+            if parent_dir.exists():
+                # Look for directories that match the pattern but without "_infer"
+                base_name = output_dir.name
+                if "_infer" in base_name:
+                    codeql_base_name = base_name.replace("_infer", "")
+                    codeql_output_dir = parent_dir / codeql_base_name
+                    codeql_hints_file = codeql_output_dir / "hints.json"
+                    if codeql_hints_file.exists():
+                        logger.info(f"  Hints not found in Infer directory, checking CodeQL sibling: {codeql_hints_file}")
+                        return codeql_hints_file
+        
+        return None
+    
     def _load_hints(self, file_path: Path) -> HintSet:
         """Load hints from JSON file."""
         data = json.loads(file_path.read_text())
@@ -785,9 +869,10 @@ class Pipeline:
         unconfirmed_file = output_dir / "unconfirmed_warnings.json"
         unconfirmed_file.write_text(json.dumps(unconfirmed_data, indent=2))
         
-        # Custom queries (if any)
+        # Custom queries (if any) - save with analyzer-specific filename
         if len(self.custom_queries) > 0:
-            custom_queries_file = output_dir / "custom_queries.json"
+            analyzer_suffix = f"_{self.analyzer_type}" if self.analyzer_type != "codeql" else ""
+            custom_queries_file = output_dir / f"custom_queries{analyzer_suffix}.json"
             custom_queries_file.write_text(json.dumps(self.custom_queries.to_json(), indent=2))
             logger.info(f"  Custom queries saved to {custom_queries_file}")
 
@@ -962,7 +1047,11 @@ class Pipeline:
         functions: dict[str, FunctionInfo],
         hints: HintSet,
     ) -> CustomQuerySet:
-        """Generate custom CodeQL queries for validated hints iteratively (one by one).
+        """Generate custom queries for validated hints iteratively (one by one).
+        
+        This is analyzer-specific:
+        - For CodeQL: generates CodeQL filter queries
+        - For Infer: generates Infer-specific models/annotations (or skips if not needed)
         
         After Z3 validation confirms the hints, evaluate each function that has validated
         hints to determine if it needs a custom query. Process them one by one with logging.
@@ -973,19 +1062,24 @@ class Pipeline:
         
         Args:
             functions: Dict of all functions
-            hints: The validated hints (after Z3 validation)
+            hints: The validated hints (after Z3 validation) - SHARED between analyzers
             
         Returns:
             CustomQuerySet with evaluation results for all validated functions
         """
         custom_queries = CustomQuerySet()
         
-        # 如果没有 LLM 客户端，直接返回空集
+        # For Infer, custom query generation is not needed (models are injected directly from hints)
+        if self.analyzer_type == "infer":
+            logger.info("  Infer uses direct model injection from hints; skipping custom query generation")
+            return custom_queries
+        
+        # For CodeQL, generate custom filter queries
         if not self.hint_generator.llm:
             logger.warning("No LLM client available for custom query generation")
             return custom_queries
         
-        # 为此次迭代创建一个专用的 CustomQueryGenerator
+        # Create CodeQL-specific custom query generator
         cq_generator = CustomQueryGenerator(
             llm=self.hint_generator.llm,
             codeql_validator=None,  # Validation handled internally in llm_client
@@ -1006,7 +1100,7 @@ class Pipeline:
             func = functions[func_name]
             func_hints = hints.hints[func_name]
             
-            logger.info(f"  [{idx}/{total_functions_with_hints}] Evaluating '{func_name}' for custom query ({len(func_hints)} hint(s))")
+            logger.info(f"  [{idx}/{total_functions_with_hints}] Evaluating '{func_name}' for custom CodeQL query ({len(func_hints)} hint(s))")
             
             # Evaluate and generate custom query for this function
             query = cq_generator.generate_custom_query_for_function(func, func_hints)

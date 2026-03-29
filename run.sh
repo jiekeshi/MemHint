@@ -1,5 +1,6 @@
 export GOOGLE_APPLICATION_CREDENTIALS=/home/huihuihuang/Hint/huihui-472807-b8069b88637c.json
 export PATH=/home/huihuihuang/Hint/codeql:$PATH
+export PATH=/home/huihuihuang/Hint/infer/infer/bin:$PATH
 CPP_QUERIES_DIR="/home/huihuihuang/Hint/codeql/qlpacks/codeql/cpp-queries"
 
 # CASE selection:
@@ -7,14 +8,29 @@ CPP_QUERIES_DIR="/home/huihuihuang/Hint/codeql/qlpacks/codeql/cpp-queries"
 # - Or set RUN_ALL=false and list desired case names in RUN_CASES.
 #   Example: RUN_CASES=("redis" "zstd_issue4112")
 RUN_ALL=false
-RUN_CASES=("redis-8_6-rc1")
+# RUN_CASES=("tmux_issue3940")
 # MODE options:
 #   single_with_hints  - use --single-source hints✅ enhanced query✅
 #   full_with_hints    - analyze full project with hints✅ enhanced query✅
 #   full_no_hints      - analyze full project without hints❌ enhanced query✅
 #   full_with_hints_no_enhanced_queries - analyze full project with hints✅ enhanced query❌
 #   full_no_hints_no_enhanced_queries - analyze full project without hints❌ enhanced query❌
+# MODE="single_with_hints"
+# ANALYZER options:
+#   codeql  - use CodeQL static analyzer (default)
+#   infer   - use Infer static analyzer
+# Note: Hints are SHARED between analyzers (same LLM-generated memory semantics)
+#       Only custom queries and evidence extraction are analyzer-specific
+
+# ANALYZER="codeql"
+ANALYZER="infer"
+
+# RUN_CASES=("tmux_issue3940")
+# MODE="single_with_hints"
+
+RUN_CASES=("redis-8_6-rc1")
 MODE="full_with_hints"
+
 
 case "$MODE" in
   single_with_hints)
@@ -81,6 +97,11 @@ adjust_output_path() {
   if [ "$USE_ENHANCED_QUERIES" = false ]; then
     out="${out}${ENHANCED_QUERIES_NAME}"
   fi
+  
+  # Add analyzer name to output path
+  if [ "$ANALYZER" != "codeql" ]; then
+    out="${out}_${ANALYZER}"
+  fi
 
   echo "$out"
 }
@@ -126,8 +147,18 @@ run_case() {
     local output_path="$2"
     shift 2
 
-    python main.py --no-reuse-db --project "$project_path" --output "$output_path" \
-        --cpp-queries-dir "$CPP_QUERIES_DIR" \
+    # Build analyzer flag
+    ANALYZER_FLAG="--analyzer $ANALYZER"
+    
+    # CodeQL-specific flags (only add if using CodeQL)
+    CODEQL_FLAGS=""
+    if [ "$ANALYZER" = "codeql" ]; then
+        CODEQL_FLAGS="--cpp-queries-dir $CPP_QUERIES_DIR"
+    fi
+
+    python main.py --project "$project_path" --output "$output_path" \
+        $ANALYZER_FLAG \
+        $CODEQL_FLAGS \
         $SKIP_HINTS_FLAG \
         $ENHANCED_QUERIES_FLAG \
         --source-root "$project_path" \

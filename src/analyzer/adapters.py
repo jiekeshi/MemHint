@@ -8,6 +8,7 @@ This module provides:
 
 import json
 import logging
+import os
 import subprocess
 import tempfile
 import shutil
@@ -1149,3 +1150,643 @@ class CodeQLAnalyzer:
                 seen.add(x)
                 out.append(x)
         return out
+
+
+# =============================================================================
+# Infer Analyzer (Microsoft Infer / Facebook Infer)
+# =============================================================================
+
+# Mapping from Infer issue types to MemoryIssueType
+# Based on Infer documentation: https://fbinfer.com/docs/all-categories/
+INFER_ISSUE_MAP = {
+    # Memory Leak / Resource Leak (Resource leak category)
+    "MEMORY_LEAK": MemoryIssueType.MEMORY_LEAK,
+    "MEMORY_LEAK_C": MemoryIssueType.MEMORY_LEAK,
+    "MEMORY_LEAK_CPP": MemoryIssueType.MEMORY_LEAK,
+    "BIABDUCTION_MEMORY_LEAK": MemoryIssueType.MEMORY_LEAK,
+    "PULSE_RESOURCE_LEAK": MemoryIssueType.MEMORY_LEAK,
+    "RESOURCE_LEAK": MemoryIssueType.MEMORY_LEAK,
+    "BIABDUCTION_RETAIN_CYCLE": MemoryIssueType.MEMORY_LEAK,
+    "RETAIN_CYCLE": MemoryIssueType.MEMORY_LEAK,
+    "RETAIN_CYCLE_NO_WEAK_INFO": MemoryIssueType.MEMORY_LEAK,
+    "CAPTURED_STRONG_SELF": MemoryIssueType.MEMORY_LEAK,
+    "MIXED_SELF_WEAKSELF": MemoryIssueType.MEMORY_LEAK,
+    "CHECKERS_FRAGMENT_RETAINS_VIEW": MemoryIssueType.MEMORY_LEAK,
+    "PULSE_UNAWAITED_AWAITABLE": MemoryIssueType.MEMORY_LEAK,
+    
+    # Use After Free (Memory error category)
+    "USE_AFTER_FREE": MemoryIssueType.USE_AFTER_FREE,
+    "USE_AFTER_FREE_LATENT": MemoryIssueType.USE_AFTER_FREE,
+    "USE_AFTER_DELETE": MemoryIssueType.USE_AFTER_FREE,
+    "USE_AFTER_DELETE_LATENT": MemoryIssueType.USE_AFTER_FREE,
+    "USE_AFTER_LIFETIME": MemoryIssueType.USE_AFTER_FREE,
+    "USE_AFTER_LIFETIME_LATENT": MemoryIssueType.USE_AFTER_FREE,
+    "PULSE_REFERENCE_STABILITY": MemoryIssueType.USE_AFTER_FREE,
+    "VECTOR_INVALIDATION": MemoryIssueType.USE_AFTER_FREE,
+    "VECTOR_INVALIDATION_LATENT": MemoryIssueType.USE_AFTER_FREE,
+    
+    # Note: Infer does not have a DOUBLE_FREE issue type
+    # Double-free bugs may be detected indirectly through other issue types
+}
+
+
+class InferAnalyzer:
+    """Infer analyzer with model injection and hint support.
+    
+    Infer (Facebook Infer / Microsoft Infer) is a static analysis tool
+    that detects memory safety issues in C/C++ code.
+    """
+
+    def __init__(
+        self,
+        binary: str = "infer",
+        timeout: int = 600,
+        infer_dir: Path | None = None,
+        reuse_db: bool = True,
+    ):
+        """Initialize Infer analyzer.
+        
+        Args:
+            binary: Path to infer binary (default: "infer")
+            timeout: Timeout for infer commands in seconds
+            infer_dir: Optional custom Infer installation directory
+            reuse_db: Whether to reuse existing Infer results (default: True)
+        """
+        self.binary = binary
+        self.timeout = timeout
+        self.infer_dir = infer_dir
+        self.reuse_db = reuse_db
+        self._injected_files: list[Path] = []
+        self._irrelevant_warnings: list[Warning] = []  # Warnings not related to memory safety
+
+    def analyze(
+        self,
+        project_path: Path,
+        hints: HintSet | None = None,
+        issue_types: list[MemoryIssueType] | None = None,
+        use_enhanced_queries: bool = True,  # Kept for compatibility, not used by Infer
+        custom_queries: CustomQuerySet | None = None,  # Kept for compatibility, not used by Infer
+    ) -> list[Warning]:
+        """
+        Run Infer analysis.
+
+        Args:
+            project_path: Project to analyze
+            hints: Allocator/deallocator hints
+            issue_types: Which issue types to map/return
+            use_enhanced_queries: Not used by Infer (kept for compatibility)
+            custom_queries: Not used by Infer (kept for compatibility)
+        """
+        output_dir = Path(tempfile.mkdtemp())
+        results_path = output_dir / "infer_results.json"
+
+        try:
+            # Step 1: Inject models from hints
+            if hints and getattr(hints, "hints", None):
+                logger.info("Step 1: Injecting custom memory models for Infer...")
+                self._inject_models(hints, project_path)
+
+            # Step 2: Run Infer analysis
+            logger.info("Step 2: Running Infer analysis...")
+            success = self._run_infer(project_path, results_path, hints)
+
+            if not success:
+                return []
+
+            # Step 3: Parse Infer results
+            warnings = self._parse_infer_results(results_path, project_path, issue_types)
+            # _parse_infer_results already stores irrelevant warnings in self._irrelevant_warnings
+            return warnings
+
+        except Exception as e:
+            logger.error(f"Infer analysis failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+        finally:
+            self._cleanup_models()
+
+    def _inject_models(self, hints: HintSet, project_path: Path) -> None:
+        """Inject custom memory models into Infer's models directory.
+        
+        Infer uses .models files in a models subdirectory or .infer directory.
+        We create models for allocators and deallocators.
+        """
+        # Infer looks for models in models/ subdirectory or .infer/models/
+        models_dir = project_path / "models"
+        models_dir.mkdir(exist_ok=True)
+        
+        allocators = hints.get_allocators() or []
+        deallocators = hints.get_deallocators() or []
+        
+        # Normalize allocators: convert to list of (name, idx) tuples
+        alloc_list: list[tuple[str, int]] = []
+        for a in allocators:
+            if isinstance(a, (list, tuple)) and len(a) == 2:
+                alloc_list.append((str(a[0]), int(a[1])))
+            else:
+                alloc_list.append((str(a), -1))  # -1 means return value
+        
+        # Normalize deallocators: convert to list of (name, idx) tuples
+        dealloc_list: list[tuple[str, int]] = []
+        for d in deallocators:
+            if isinstance(d, (list, tuple)) and len(d) == 2:
+                dealloc_list.append((str(d[0]), int(d[1])))
+            else:
+                # Default: assume first argument is freed
+                dealloc_list.append((str(d), 0) if isinstance(d, str) else (str(d[0]), 0))
+        
+        # Write allocator models (Infer format: function_name followed by properties)
+        if alloc_list:
+            alloc_file = models_dir / "hint_allocators.models"
+            with open(alloc_file, "w") as f:
+                for name, idx in alloc_list:
+                    if idx == -1:
+                        # Return value allocator
+                        f.write(f"{name}\n")
+                        f.write("  alloc: true\n")
+                        f.write("  alloc_return: true\n")
+                    else:
+                        # Output parameter allocator
+                        f.write(f"{name}\n")
+                        f.write("  alloc: true\n")
+                        f.write(f"  alloc_index: {idx}\n")
+            self._injected_files.append(alloc_file)
+            logger.info(f"Injected {len(alloc_list)} allocator models to {alloc_file}")
+        
+        # Write deallocator models
+        if dealloc_list:
+            dealloc_file = models_dir / "hint_deallocators.models"
+            with open(dealloc_file, "w") as f:
+                for name, idx in dealloc_list:
+                    f.write(f"{name}\n")
+                    f.write("  free: true\n")
+                    f.write(f"  free_index: {idx}\n")
+            self._injected_files.append(dealloc_file)
+            logger.info(f"Injected {len(dealloc_list)} deallocator models to {dealloc_file}")
+
+    def _load_build_config(self, project_path: Path) -> Optional[dict]:
+        """Load Infer-specific build configuration from proj_build_command_infer.json."""
+        config_file = Path(__file__).parent.parent.parent / "proj_build_command_infer.json"
+        if not config_file.exists():
+            return None
+        try:
+            with open(config_file) as f:
+                return json.load(f).get(project_path.name)
+        except Exception:
+            return None
+
+    def _run_commands(self, cwd: Path, commands) -> None:
+        """Run prepare_for_build commands."""
+        if isinstance(commands, str):
+            commands = [{"command": c.strip(), "can_error": True} for c in commands.split("&&")]
+        elif isinstance(commands, list):
+            commands = [
+                {"command": c.get("command", c) if isinstance(c, dict) else c,
+                 "can_error": c.get("can_error", True) if isinstance(c, dict) else True}
+                for c in commands
+            ]
+
+        for cmd_info in commands:
+            if cmd_info["command"]:
+                subprocess.run(cmd_info["command"], shell=True, cwd=str(cwd),
+                               timeout=self.timeout, capture_output=True)
+
+    def _run_infer(self, project_path: Path, results_path: Path, hints: HintSet | None = None) -> bool:
+        """Run Infer analysis on the project.
+        
+        Args:
+            project_path: Path to project
+            results_path: Path to save JSON results
+            hints: Optional hints for custom allocator/deallocator patterns
+            
+        Returns:
+            True if analysis succeeded, False otherwise
+        """
+        # Always clean previous Infer results to ensure fresh analysis
+        infer_out_dir = project_path / "infer-out"
+        if infer_out_dir.exists():
+            logger.info(f"Removing existing infer-out directory: {infer_out_dir}")
+            shutil.rmtree(infer_out_dir, ignore_errors=True)
+        
+        # Load Infer-specific build configuration
+        config = self._load_build_config(project_path)
+        
+        # Run prepare_for_build commands if configured
+        if config and "prepare_for_build" in config:
+            prepare_commands = config["prepare_for_build"]
+            if prepare_commands:
+                logger.info("Running prepare_for_build commands for Infer...")
+                self._run_commands(project_path, prepare_commands)
+        
+        # Build pulse-model patterns from hints for custom allocators/deallocators
+        # These flags tell Infer to recognize custom allocation/deallocation functions
+        pulse_flags = []
+        if hints:
+            allocators = hints.get_allocators() or []
+            deallocators = hints.get_deallocators() or []
+            
+            # Extract function names (ignore arg_index for patterns)
+            alloc_names = [name for name, _ in allocators if name not in ("main", "_main", "")]
+            dealloc_names = [name for name, _ in deallocators if name not in ("main", "_main", "")]
+            
+            # Build regex patterns: ^function_name$ for exact match
+            # Escape special regex characters in function names (but not underscores, letters, digits)
+            import re
+            def escape_regex_special(name: str) -> str:
+                """Escape only special regex characters that could cause issues."""
+                # Characters that need escaping in regex: . ^ $ * + ? { } [ ] \ | ( )
+                # We'll escape them, but keep normal function name characters as-is
+                special_chars = r'.^$*+?{}[]\|()'
+                escaped = ""
+                for char in name:
+                    if char in special_chars:
+                        escaped += "\\" + char
+                    else:
+                        escaped += char
+                return escaped
+            
+            # Combine multiple functions with | inside parentheses
+            # Format: --pulse-model-malloc-pattern=^(func1|func2|func3)$
+            # Note: No quotes needed - subprocess.run() with list handles arguments correctly
+            if alloc_names:
+                escaped_names = [escape_regex_special(name) for name in alloc_names]
+                alloc_pattern = f"^({'|'.join(escaped_names)})$"
+                pulse_flags.append(f"--pulse-model-malloc-pattern={alloc_pattern}")
+                logger.info(f"Adding pulse-model-malloc-pattern for: {', '.join(alloc_names)}")
+            
+            if dealloc_names:
+                escaped_names = [escape_regex_special(name) for name in dealloc_names]
+                dealloc_pattern = f"^({'|'.join(escaped_names)})$"
+                pulse_flags.append(f"--pulse-model-free-pattern={dealloc_pattern}")
+                logger.info(f"Adding pulse-model-free-pattern for: {', '.join(dealloc_names)}")
+        
+        # Use infer run -- [command] which combines capture and analyze
+        # This is the recommended approach per Infer documentation
+        # See: https://fbinfer.com/docs/hello-world
+        compile_commands = project_path / "compile_commands.json"
+        if compile_commands.exists():
+            logger.info("Using compile_commands.json for Infer")
+            # For compile_commands.json, use capture with --compilation-database
+            # then run analyze separately (infer run doesn't support --compilation-database directly)
+            capture_cmd = [
+                self.binary, "capture",
+                "--compilation-database", str(compile_commands),
+            ]
+            
+            logger.info(f"Running Infer capture command: {' '.join(capture_cmd)}")
+            result = subprocess.run(
+                capture_cmd,
+                cwd=str(project_path),
+                timeout=self.timeout,
+                capture_output=True,
+                text=True,
+            )
+            
+            if result.returncode != 0:
+                logger.warning(f"Infer capture failed: {result.stderr[:500] if result.stderr else 'No error message'}")
+                logger.debug(f"Capture stdout: {result.stdout[:500] if result.stdout else 'No output'}")
+            else:
+                logger.info("Infer capture completed successfully")
+                # Check if infer-out directory was created and has files
+                if infer_out_dir.exists():
+                    files_count = len(list(infer_out_dir.rglob("*")))
+                    logger.debug(f"Infer-out directory contains {files_count} files/directories")
+                else:
+                    logger.warning(f"Infer-out directory not found at {infer_out_dir} after capture")
+            
+            # Run analyze separately with pulse-model flags
+            analyze_cmd = [self.binary, "analyze"] + pulse_flags
+            logger.info(f"Running Infer analyze command: {' '.join(analyze_cmd)}")
+            result = subprocess.run(
+                analyze_cmd,
+                cwd=str(project_path),
+                timeout=self.timeout,
+                capture_output=True,
+                text=True,
+            )
+            
+            if result.returncode != 0:
+                logger.warning(f"Infer analyze failed: {result.stderr[:500] if result.stderr else 'No error message'}")
+                logger.debug(f"Analyze stdout: {result.stdout[:500] if result.stdout else 'No output'}")
+            else:
+                logger.info("Infer analyze completed successfully")
+        else:
+            # Get build command from config or detect it
+            build_cmd = None
+            infer_flags = []
+            
+            if config and "build_command" in config:
+                bc = config["build_command"]
+                if isinstance(bc, dict):
+                    build_cmd = bc.get("command")
+                    # Support infer_flags in build_command config
+                    infer_flags = bc.get("infer_flags", [])
+                    if isinstance(infer_flags, str):
+                        infer_flags = [infer_flags]
+                else:
+                    build_cmd = bc
+            
+            if not build_cmd:
+                build_cmd = self._detect_build_command(project_path)
+            
+            if not build_cmd:
+                logger.error("Could not determine build command for Infer")
+                return False
+            
+            # Use infer run -- [command] which is equivalent to capture + analyze
+            # This is the recommended approach per Infer documentation
+            # Support Infer-specific flags like --keep-going, --pulse-only, etc.
+            # Pulse-model flags are added from hints (already built above)
+            logger.info(f"Running Infer with build command: {build_cmd}")
+            if infer_flags:
+                logger.info(f"Using Infer flags: {infer_flags}")
+            if pulse_flags:
+                logger.info(f"Using pulse-model flags from hints")
+            
+            # Build the command - split build_cmd to match how Infer expects it
+            # Infer's -- separator expects the build command as separate arguments
+            build_cmd_parts = build_cmd.split() if isinstance(build_cmd, str) else build_cmd
+            run_cmd_parts = [
+                self.binary, "run",
+            ] + infer_flags + pulse_flags + [
+                "--"
+            ] + build_cmd_parts
+            
+            # Log the command as it would appear in terminal
+            logger.info(f"Running Infer command: {' '.join(run_cmd_parts)}")
+            logger.info(f"Working directory: {project_path}")
+            logger.debug(f"Full command list: {run_cmd_parts}")
+            
+            # Execute Infer with environment variables passed through
+            # This matches how the command is run manually in terminal
+            result = subprocess.run(
+                run_cmd_parts,
+                cwd=str(project_path),
+                timeout=self.timeout,
+                capture_output=True,
+                text=True,
+                shell=False,  # Use list format, not shell
+                env=os.environ.copy(),  # Pass through environment variables (PATH, etc.)
+            )
+            
+            # Infer writes compilation output to stderr, which is normal
+            # Check if infer-out was created to determine success
+            if not infer_out_dir.exists():
+                logger.error("Infer-out directory not created - analysis may have failed")
+                if result.returncode != 0:
+                    logger.error(f"Infer run failed with return code {result.returncode}")
+                    logger.debug(f"Stderr: {result.stderr[:1000] if result.stderr else 'No stderr'}")
+                return False
+            else:
+                logger.info("Infer run completed - infer-out directory created")
+                # Check if infer-out directory has files
+                files_count = len(list(infer_out_dir.rglob("*")))
+                logger.debug(f"Infer-out directory contains {files_count} files/directories")
+        
+        # Check for report.json in the project's infer-out directory
+        # This is where Infer writes the report by default
+        report_json = infer_out_dir / "report.json"
+        if report_json.exists():
+            logger.info(f"Found report.json at {report_json}")
+            shutil.copy(report_json, results_path)
+            # Validate JSON format
+            try:
+                json_text = results_path.read_text()
+                json_data = json.loads(json_text)
+                issue_count = len(json_data) if isinstance(json_data, list) else len(json_data.get("bugs", [])) if isinstance(json_data, dict) else 0
+                logger.info(f"Infer analysis found {issue_count} issues")
+                return True
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in report.json: {e}")
+                return False
+        
+        # If report.json doesn't exist, try to generate it using infer report --json
+        logger.info(f"report.json not found in {infer_out_dir}, generating JSON report...")
+        report_cmd = [
+            self.binary, "report",
+            "--json",
+        ]
+        
+        logger.info(f"Running Infer report command: {' '.join(report_cmd)}")
+        result = subprocess.run(
+            report_cmd,
+            cwd=str(project_path),
+            timeout=self.timeout,
+            capture_output=True,
+            text=True,
+        )
+        
+        if result.returncode != 0:
+            logger.warning(f"Infer report failed: {result.stderr[:500] if result.stderr else 'No error message'}")
+            return False
+        
+        # Write stdout to results file
+        if result.stdout:
+            try:
+                # Validate JSON format
+                json_data = json.loads(result.stdout)
+                results_path.write_text(result.stdout)
+                issue_count = len(json_data) if isinstance(json_data, list) else len(json_data.get("bugs", [])) if isinstance(json_data, dict) else 0
+                logger.info(f"Infer report generated: {issue_count} issues found")
+                return True
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON from infer report: {e}")
+                logger.debug(f"JSON output (first 500 chars): {result.stdout[:500]}")
+                return False
+        else:
+            logger.warning("Infer report produced no output")
+            return False
+
+    def _detect_build_command(self, project_path: Path) -> Optional[str]:
+        """Detect build command for the project."""
+        # Check for Makefile
+        if (project_path / "Makefile").exists() and which("make"):
+            return "make"
+        
+        # Check for CMake
+        if (project_path / "CMakeLists.txt").exists() and which("cmake"):
+            build_dir = project_path / "build"
+            build_dir.mkdir(exist_ok=True)
+            subprocess.run(["cmake", ".."], cwd=str(build_dir), capture_output=True, timeout=120)
+            if (build_dir / "Makefile").exists():
+                return "make -C build"
+        
+        # Fallback: try to compile some source files
+        sources = list(project_path.rglob("*.c")) + list(project_path.rglob("*.cpp"))
+        if sources:
+            files = " ".join(str(f.relative_to(project_path)) for f in sources[:10])
+            return f"clang -I. -c {files}"
+        
+        return None
+
+    def _parse_infer_results(self, results_path: Path, project_path: Path, issue_types: list[MemoryIssueType] | None) -> list[Warning]:
+        """Parse Infer JSON results into Warning objects.
+        
+        Args:
+            results_path: Path to Infer JSON report
+            project_path: Project root path
+            issue_types: Optional filter for issue types
+            
+        Returns:
+            List of Warning objects
+        """
+        if not results_path.exists():
+            return []
+        
+        warnings: list[Warning] = []
+        try:
+            json_text = results_path.read_text()
+            if not json_text.strip():
+                logger.warning(f"Infer results file is empty: {results_path}")
+                return []
+            
+            data = json.loads(json_text)
+            
+            # Infer JSON format: array of bug reports
+            # Handle both array format and object with "bugs" key
+            if isinstance(data, dict):
+                # Some Infer versions output {"bugs": [...]}
+                bugs = data.get("bugs", [])
+                if not bugs and "bug_type" in data:
+                    # Single bug object
+                    bugs = [data]
+            elif isinstance(data, list):
+                bugs = data
+            else:
+                logger.warning(f"Unexpected Infer JSON format: {type(data)}")
+                return []
+            
+            if not bugs:
+                logger.info("Infer found no issues")
+                return []
+            
+            logger.info(f"Parsing {len(bugs)} Infer bug reports")
+            
+            unmapped_types = set()
+            filtered_count = 0
+            irrelevant_warnings_list = []
+            
+            for bug in bugs:
+                bug_type = bug.get("bug_type", "").upper()
+                
+                # Map Infer bug types to our issue types
+                issue_type = INFER_ISSUE_MAP.get(bug_type)
+                if not issue_type:
+                    # Try substring matching
+                    for key, val in INFER_ISSUE_MAP.items():
+                        if key in bug_type:
+                            issue_type = val
+                            break
+                
+                # Check if this is a memory safety related issue
+                is_memory_safety_related = issue_type is not None
+                
+                # If not memory safety related, we'll store it separately
+                if not is_memory_safety_related:
+                    unmapped_types.add(bug_type)
+                    # Use OTHER for non-memory-safety issues
+                    issue_type = MemoryIssueType.OTHER
+                    logger.debug(f"Non-memory-safety bug type '{bug_type}' will be saved to separate file")
+                else:
+                    # Filter by issue_types if specified (only for memory safety related)
+                    if issue_types and issue_type not in issue_types:
+                        filtered_count += 1
+                        logger.debug(f"Filtered out bug type '{bug_type}' (mapped to {issue_type.name}) - not in requested types")
+                        continue
+                
+                # Extract location information directly from bug object
+                file_path = bug.get("file", "")
+                line = bug.get("line", 0)
+                function_name = bug.get("procedure", "")
+                
+                # Extract message
+                message = bug.get("qualifier", "") or bug.get("description", "") or bug.get("bug_type_hum", "") or bug_type
+                
+                # Build trace from bug_trace array
+                bug_trace = bug.get("bug_trace", [])
+                trace = []
+                allocation_site = ""
+                
+                if bug_trace:
+                    # Primary location is the last entry in trace (where the bug occurs)
+                    primary_loc = bug_trace[-1] if bug_trace else {}
+                    if not file_path:
+                        file_path = primary_loc.get("filename", "")
+                    if not line:
+                        line = primary_loc.get("line_number", 0)
+                    
+                    # Build trace from all trace elements
+                    for trace_elem in bug_trace:
+                        trace_file = trace_elem.get("filename", "")
+                        trace_line = trace_elem.get("line_number", 0)
+                        if trace_file and trace_line:
+                            trace.append(f"{trace_file}:{trace_line}")
+                    
+                    # Allocation site is typically the first entry in trace
+                    if bug_trace:
+                        first_loc = bug_trace[0]
+                        alloc_file = first_loc.get("filename", "")
+                        alloc_line = first_loc.get("line_number", 0)
+                        if alloc_file and alloc_line:
+                            allocation_site = f"{alloc_file}:{alloc_line}"
+                
+                # If no trace, use direct file/line from bug object
+                if not trace and file_path and line:
+                    trace.append(f"{file_path}:{line}")
+                    allocation_site = f"{file_path}:{line}"
+                
+                warning = Warning(
+                    file_path=file_path,
+                    line_number=line,
+                    function_name=function_name,
+                    warning_type=bug_type,
+                    message=message,
+                    issue_type=issue_type,
+                    allocation_site=allocation_site,
+                    trace=trace,
+                )
+                
+                # Store in appropriate list
+                if is_memory_safety_related:
+                    warnings.append(warning)
+                else:
+                    irrelevant_warnings_list.append(warning)
+            
+            # Store irrelevant warnings in instance variable
+            self._irrelevant_warnings = irrelevant_warnings_list
+            
+            # Log summary
+            if unmapped_types:
+                logger.info(f"Found {len(unmapped_types)} non-memory-safety bug type(s): {', '.join(sorted(unmapped_types))} (saved to separate file)")
+            if filtered_count > 0:
+                logger.info(f"Filtered out {filtered_count} bug(s) based on issue_types filter")
+            if warnings:
+                logger.info(f"Successfully parsed {len(warnings)} memory-safety warning(s) from Infer results")
+            if irrelevant_warnings_list:
+                logger.info(f"Found {len(irrelevant_warnings_list)} non-memory-safety warning(s) (will be saved separately)")
+        
+        except Exception as e:
+            logger.error(f"Failed to parse Infer results: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return warnings
+
+    def get_irrelevant_warnings(self) -> list[Warning]:
+        """Get warnings that are not related to memory safety (leak, UAF, double-free).
+        
+        Returns:
+            List of Warning objects for non-memory-safety issues
+        """
+        return self._irrelevant_warnings.copy()
+    
+    def _cleanup_models(self) -> None:
+        """Clean up injected model files."""
+        for f in self._injected_files:
+            try:
+                if f.exists():
+                    f.unlink()
+            except Exception:
+                pass
+        self._injected_files.clear()

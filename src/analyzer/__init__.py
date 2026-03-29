@@ -1,3 +1,3 @@
-from src.analyzer.adapters import CodeQLAnalyzer
+from src.analyzer.adapters import CodeQLAnalyzer, InferAnalyzer
 
-__all__ = ['CodeQLAnalyzer']
+__all__ = ['CodeQLAnalyzer', 'InferAnalyzer']
