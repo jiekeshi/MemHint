@@ -1,0 +1,28 @@
+# Ignore everything by default
+*
+
+# Track only the files needed to run the tool and replicate the paper
+!.gitignore
+!LICENSE
+!README.md
+!main.py
+!run.sh
+!requirements.txt
+!proj_build_command.json
+!proj_build_command_infer.json
+
+# Source code
+!src/
+!src/**/__init__.py
+!src/llm_client.py
+!src/tree_sitter_parser.py
+!src/verify_bugs_llm.py
+!src/core/
+!src/core/models.py
+!src/core/pipeline.py
+!src/analyzer/
+!src/analyzer/adapters.py
+!src/analyzer/queries/
+!src/analyzer/queries/*.ql
+!src/symbolic/
+!src/symbolic/z3_solver.py

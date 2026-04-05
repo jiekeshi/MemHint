@@ -1,0 +1,48 @@
+{
+    "vim_9_2_0015": {
+        "prepare_for_build": [
+            {"command": "make clean", "can_error": true}
+        ],
+        "build_command": {"command": "make", "can_error": false}
+    },
+    "tmux_3_6_a": {
+        "prepare_for_build": [
+            {"command": "make clean", "can_error": true},
+            {"command": "sh autogen.sh", "can_error": false},
+            {"command": "./configure", "can_error": false}
+        ],
+        "build_command": {"command": "make", "can_error": false}
+    },
+    "openssl_3_6_1": {
+        "prepare_for_build": [
+            {"command": "make clean", "can_error": true}
+        ],
+        "build_command": {"command": "make -k", "can_error": false}
+    },
+    "redis-8_6-rc1": {
+        "prepare_for_build": [
+            {"command": "make clean", "can_error": true}
+        ],
+        "build_command": {"command": "make", "can_error": false}
+    },
+    "FreeRDP_3_23_0": {
+        "prepare_for_build": [
+            {"command": "rm -rf build-codeql", "can_error": true},
+            {"command": "cmake -S . -B build-codeql -DCMAKE_BUILD_TYPE=Release -DWITH_CLIENT=OFF -DWITH_SERVER=OFF -DWITH_CHANNELS=OFF -DWITH_FFMPEG=OFF -DWITH_DSP_FFMPEG=OFF -DWITH_VIDEO_FFMPEG=OFF -DWITH_SWSCALE=OFF -DWITH_CAIRO=OFF -DWITH_OPUS=OFF -DWITH_CUPS=OFF -DWITH_PCSC=OFF -DWITH_FUSE=OFF", "can_error": false}
+        ],
+        "build_command": {"command": "cmake --build build-codeql", "can_error": false}
+    },
+    "curl_rc-8_19_0-3": {
+        "prepare_for_build": [
+            {"command": "make clean", "can_error": true}
+        ],
+        "build_command": {"command": "make", "can_error": false}
+    },
+    "FFmpeg_n_8_1_dev": {
+        "prepare_for_build": [
+            {"command": "make distclean", "can_error": true},
+            {"command": "./configure --disable-x86asm --disable-doc --disable-programs --disable-everything --enable-avcodec --enable-avformat --enable-avutil --enable-swscale --enable-swresample", "can_error": false}
+        ],
+        "build_command": {"command": "make", "can_error": false}
+    }
+}
