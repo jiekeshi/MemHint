@@ -1,0 +1,14 @@
+# Subject checkouts, run output and local environments are not part of the repository.
+experiment/subjects/
+experiment/output/
+experiment/output_*/
+results/
+output/
+.venv/
+.env
+__pycache__/
+*.pyc
+*.log
+infer-out/
+.codeql-db/
+.inferconfig

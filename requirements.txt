@@ -1,0 +1,11 @@
+# Same versions as pyproject.toml / uv.lock, for a pip install without uv.
+# Python 3.11 or newer. Z3 decides which summaries and which warnings survive,
+# so its version is the one the paper names.
+z3-solver==4.15.4.0
+tree-sitter==0.25.2
+tree-sitter-c==0.24.1
+tree-sitter-cpp==0.23.4
+google-cloud-aiplatform==1.133.0
+requests==2.28.1
+pyyaml==6.0.3
+tqdm==4.67.1

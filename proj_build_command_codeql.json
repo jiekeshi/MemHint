@@ -1,0 +1,150 @@
+{
+  "vim_9_2_0015": {
+    "prepare_for_build": [
+      {
+        "command": "make clean",
+        "can_error": true
+      }
+    ],
+    "build_command": {
+      "command": "make",
+      "can_error": false
+    }
+  },
+  "tmux_3_6_a": {
+    "prepare_for_build": [
+      {
+        "command": "make clean",
+        "can_error": true
+      },
+      {
+        "command": "sh autogen.sh",
+        "can_error": false
+      },
+      {
+        "command": "./configure",
+        "can_error": false
+      }
+    ],
+    "build_command": {
+      "command": "make",
+      "can_error": false
+    }
+  },
+  "openssl_3_6_1": {
+    "prepare_for_build": [
+      {
+        "command": "make clean",
+        "can_error": true
+      },
+      {
+        "command": "./config no-tests",
+        "can_error": false
+      }
+    ],
+    "build_command": {
+      "command": "make",
+      "can_error": false
+    }
+  },
+  "redis-8_6-rc1": {
+    "prepare_for_build": [
+      {
+        "command": "make clean",
+        "can_error": true
+      }
+    ],
+    "build_command": {
+      "command": "make",
+      "can_error": false
+    }
+  },
+  "FreeRDP_3_23_0": {
+    "prepare_for_build": [
+      {
+        "command": "rm -rf build-codeql",
+        "can_error": true
+      },
+      {
+        "command": "cmake -S . -B build-codeql",
+        "can_error": false
+      }
+    ],
+    "build_command": {
+      "command": "cmake --build build-codeql",
+      "can_error": false
+    }
+  },
+  "curl_rc-8_19_0-3": {
+    "prepare_for_build": [
+      {
+        "command": "make clean",
+        "can_error": true
+      },
+      {
+        "command": "autoreconf -fi",
+        "can_error": true
+      },
+      {
+        "command": "./configure --with-openssl",
+        "can_error": false
+      }
+    ],
+    "build_command": {
+      "command": "make",
+      "can_error": false
+    }
+  },
+  "FFmpeg_n_8_1_dev": {
+    "prepare_for_build": [
+      {
+        "command": "make distclean",
+        "can_error": true
+      },
+      {
+        "command": "./configure",
+        "can_error": false
+      }
+    ],
+    "build_command": {
+      "command": "make",
+      "can_error": false
+    }
+  },
+  "linux_v7_0-rc1": {
+    "prepare_for_build": [
+      {
+        "command": "make CC=clang-17 clean",
+        "can_error": true
+      },
+      {
+        "command": "make CC=clang-17 mrproper",
+        "can_error": false
+      },
+      {
+        "command": "make CC=clang-17 allmodconfig",
+        "can_error": false
+      },
+      {
+        "command": "sed -i 's#^CONFIG_SYSTEM_TRUSTED_KEYS=.*#CONFIG_SYSTEM_TRUSTED_KEYS=\"\"#' .config",
+        "can_error": false
+      },
+      {
+        "command": "sed -i 's#^CONFIG_SYSTEM_REVOCATION_KEYS=.*#CONFIG_SYSTEM_REVOCATION_KEYS=\"\"#' .config",
+        "can_error": false
+      },
+      {
+        "command": "make CC=clang-17 olddefconfig",
+        "can_error": false
+      },
+      {
+        "command": "make CC=clang-17 modules_prepare",
+        "can_error": false
+      }
+    ],
+    "build_command": {
+      "command": "make CC=clang-17 drivers/staging/ -k",
+      "can_error": false
+    }
+  }
+}
